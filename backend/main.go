@@ -66,10 +66,13 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	// If REDIS_PASSWORD is not set, it defaults to empty string (no authentication)
+
 	redisClient = redis.NewClient(&redis.Options{
 		Addr:     redisAddr,
-		Password: "", // no password set
-		DB:       0,  // use default DB
+		Password: redisPassword,
+		DB:       0, // use default DB
 	})
 
 	// Start server
