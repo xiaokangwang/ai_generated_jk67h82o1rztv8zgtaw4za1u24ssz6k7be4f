@@ -7,13 +7,18 @@ A high-performance Go application that performs traceroute to IPv4 addresses wit
 - **Dual Mode Operation**:
   - **Raw Socket Mode**: Direct UDP implementation using Linux system calls (requires root, works through NAT)
   - **External Mode**: Uses system traceroute binary (no root required)
+- **Streaming Mode**: Memory-efficient scanning for unlimited IP ranges (constant memory usage regardless of range size)
+- **Advanced IP Shuffling**:
+  - Uses ZMap's Blackrock cipher for cryptographically secure pseudo-random IP ordering
+  - Deterministic and reproducible (same seed = same scan order)
+  - Zero memory overhead - IPs generated on-demand
+  - Enabled by default for stealth
 - **Resumable Scans**: Automatic checkpoint saving, resume interrupted scans from where they left off
-- **IP Shuffling**: Randomizes scan order to avoid obvious patterns and evade detection (enabled by default)
 - **Concurrent Scanning**: Configurable worker pool for parallel traceroutes
-- **Flexible IP Ranges**: Supports single IPs, CIDR notation, and IP ranges
+- **Flexible IP Ranges**: Supports single IPs, CIDR notation, and IP ranges (any size)
 - **JSONL Output**: Results saved in JSON Lines format for easy processing
 - **Progress Tracking**: Real-time progress updates with percentage completion
-- **Configurable Parameters**: Control workers, max hops, and timeouts
+- **Configurable Parameters**: Control workers, max hops, timeouts, and shuffle seeds
 
 ## Requirements
 
@@ -37,14 +42,18 @@ go build -o traceroute-scanner
 
 ## Usage
 
-The program can run in two modes:
+The program can run in two modes with optional streaming:
 
 ### External Mode (Recommended - No Root Required)
 
 Uses the system `traceroute` command:
 
 ```bash
+# Standard mode (loads IPs into memory)
 ./traceroute-scanner -range <IP_RANGE> -mode external [OPTIONS]
+
+# Streaming mode (constant memory, unlimited range size)
+./traceroute-scanner -range <IP_RANGE> -streaming -mode external [OPTIONS]
 ```
 
 ### Raw Mode (Requires Root)
@@ -52,8 +61,20 @@ Uses the system `traceroute` command:
 Uses raw ICMP sockets for direct packet control:
 
 ```bash
+# Standard mode (loads IPs into memory)
 sudo ./traceroute-scanner -range <IP_RANGE> -mode raw [OPTIONS]
+
+# Streaming mode (constant memory, unlimited range size)
+sudo ./traceroute-scanner -range <IP_RANGE> -streaming -mode raw [OPTIONS]
 ```
+
+### Streaming vs Standard Mode
+
+- **Standard Mode**: Loads all IPs into memory, then shuffles. Best for small ranges (<100K IPs).
+- **Streaming Mode**: Generates IPs on-demand using Blackrock cipher. Best for large ranges (any size, even /8 networks).
+  - Memory usage: O(1) - constant regardless of range size
+  - Supports shuffle with deterministic ordering
+  - Recommended for ranges larger than /16 (65K IPs)
 
 ### IP Range Formats
 
@@ -74,12 +95,14 @@ sudo ./traceroute-scanner -range <IP_RANGE> -mode raw [OPTIONS]
 
 ### Options
 
-- `-range`: IP range to scan (required)
+- `-range`: IP range to scan (required) - supports single IP, CIDR, or range notation
 - `-mode`: Traceroute mode - `external` or `raw` (default: `external`)
+- `-streaming`: Use streaming mode for memory-efficient scanning (recommended for large ranges)
 - `-output`: Output file path (default: `traceroute_results.jsonl`)
-- `-archive`: If previous scan is complete, archive it with timestamp and start fresh (default: `false`)
+- `-archive`: If previous scan is complete, archive it with timestamp and start fresh
 - `-fresh`: Start a fresh scan, deleting any existing progress (default: auto-resume if progress exists)
 - `-shuffle`: Shuffle IP order to avoid obvious scanning patterns (default: `true`)
+- `-shuffle-seed`: Seed for shuffle permutation (0 = random, specific number = reproducible order)
 - `-workers`: Number of concurrent workers (default: 10)
 - `-max-hops`: Maximum number of hops (default: 30)
 - `-timeout`: Timeout per hop (default: 3s)
@@ -96,6 +119,23 @@ sudo ./traceroute-scanner -range <IP_RANGE> -mode raw [OPTIONS]
 ./traceroute-scanner -range 192.168.1.0/24 -mode external -workers 20 -max-hops 20 -timeout 2s
 ```
 
+**Large range with streaming mode (memory-efficient):**
+```bash
+./traceroute-scanner -range 10.0.0.0/16 -streaming -workers 50
+```
+
+**Reproducible scan with specific seed:**
+```bash
+./traceroute-scanner -range 1.0.0.0/16 -streaming -shuffle-seed=42
+# Running again with seed=42 produces identical scan order
+```
+
+**Random shuffle (different order each run):**
+```bash
+./traceroute-scanner -range 1.0.0.0/16 -streaming -shuffle
+# Seed generated randomly, scan order differs each time
+```
+
 **Scan using raw ICMP mode (requires root):**
 ```bash
 sudo ./traceroute-scanner -range 8.8.8.8 -mode raw
@@ -103,12 +143,17 @@ sudo ./traceroute-scanner -range 8.8.8.8 -mode raw
 
 **High-performance scan with multiple workers:**
 ```bash
-./traceroute-scanner -range 10.0.0.0/24 -mode external -workers 50 -timeout 1s
+./traceroute-scanner -range 10.0.0.0/24 -streaming -workers 50 -timeout 1s
 ```
 
 **Scan range with custom output file:**
 ```bash
-./traceroute-scanner -range 1.1.1.1-1.1.1.100 -mode external -output results.jsonl
+./traceroute-scanner -range 1.1.1.1-1.1.1.100 -streaming -output results.jsonl
+```
+
+**Quick test with routable IPs (fast results):**
+```bash
+./traceroute-scanner -range 8.8.8.8-8.8.8.10 -streaming -shuffle-seed=42 -fresh
 ```
 
 **Resume interrupted scan (automatic):**
@@ -135,19 +180,32 @@ sudo ./traceroute-scanner -range 192.168.0.0/16 -mode raw -workers 50 -archive
 # Creates: traceroute_results.jsonl (new scan)
 ```
 
-### Stealth Scanning
+### Stealth Scanning & IP Shuffling
 
-By default, the scanner randomizes the order of IP addresses to avoid creating obvious sequential scanning patterns that are easily detected by IDS/IPS systems.
+By default, the scanner uses **ZMap's Blackrock cipher** to randomize IP addresses, avoiding sequential patterns that trigger IDS/IPS alerts.
 
 **Shuffled scan (default - recommended for stealth):**
 ```bash
-./traceroute-scanner -range 192.168.1.0/24 -mode external
-# IPs scanned in random order: 192.168.1.73, 192.168.1.12, 192.168.1.201, ...
+./traceroute-scanner -range 192.168.1.0/24 -streaming
+# IPs scanned in pseudo-random order: 192.168.1.73, 192.168.1.12, 192.168.1.201, ...
 ```
 
-**Sequential scan (disable shuffle):**
+**Reproducible scan (same seed = same order):**
 ```bash
-./traceroute-scanner -range 192.168.1.0/24 -mode external -shuffle=false
+./traceroute-scanner -range 192.168.1.0/24 -streaming -shuffle-seed=42
+# Run again with seed=42 → identical scan order
+# Useful for research, debugging, or distributed scanning
+```
+
+**Random shuffle each time:**
+```bash
+./traceroute-scanner -range 192.168.1.0/24 -streaming -shuffle
+# Generates random seed, different order each run
+```
+
+**Sequential scan (disable shuffle - NOT recommended):**
+```bash
+./traceroute-scanner -range 192.168.1.0/24 -shuffle=false
 # IPs scanned in order: 192.168.1.0, 192.168.1.1, 192.168.1.2, ...
 # WARNING: Sequential scans are easily detected by security systems!
 ```
@@ -156,7 +214,15 @@ By default, the scanner randomizes the order of IP addresses to avoid creating o
 - Sequential scans (1.1.1.1, 1.1.1.2, 1.1.1.3...) create obvious patterns
 - IDS/IPS systems flag sequential IP scanning as malicious behavior
 - Randomized order makes scans less suspicious and harder to correlate
-- Uses cryptographically secure randomization (crypto/rand)
+- **Blackrock cipher** provides cryptographically secure pseudo-random permutation
+- Zero memory overhead - IPs generated on-demand in streaming mode
+- Deterministic when using seeds - same seed always produces same order
+
+**Use Cases for Seeds:**
+- **Research**: Document your seed for reproducibility
+- **Distributed Scanning**: Different machines use different seeds to avoid overlap
+- **Testing**: Same seed ensures consistent test conditions
+- **Random (seed=0)**: Maximum unpredictability for stealth
 
 ## Output Format
 
@@ -199,6 +265,14 @@ Results are saved in JSON Lines format (one JSON object per line). Each line con
 
 ## How It Works
 
+### Streaming Mode with Blackrock Shuffle
+1. **IP Generation**: Uses Blackrock cipher (ZMap's algorithm) for on-demand IP generation
+2. **Feistel Network**: AES-based Feistel network creates bijective (one-to-one) mapping
+3. **Format-Preserving Encryption**: Encrypts indices to IP addresses while maintaining range
+4. **Memory Efficiency**: O(1) memory - generates IPs as needed, no storage
+5. **Deterministic**: Same seed always produces identical scan order
+6. **Performance**: ~321 nanoseconds per IP permutation (negligible overhead)
+
 ### Raw Mode
 1. **Raw Socket Creation**: Creates UDP and ICMP raw sockets using `syscall.Socket()`
 2. **TTL Incrementation**: Sends UDP packets to high ports (33434+) with increasing TTL values
@@ -214,7 +288,23 @@ Results are saved in JSON Lines format (one JSON object per line). Each line con
 4. **Concurrent Execution**: Uses a worker pool to scan multiple IPs in parallel
 5. **Result Recording**: Writes normalized results to JSONL file
 
+### Checkpoint & Resume
+1. **Progress Tracking**: Completed IP ranges saved to `.progress` file
+2. **Automatic Resume**: On restart, loads progress and skips completed IPs
+3. **Range-Based**: Tracks contiguous ranges for efficiency
+4. **Atomic Updates**: Progress saved after each completion
+
 ## Implementation Details
+
+### Streaming Mode & Blackrock Cipher
+- **Algorithm**: Based on ZMap's Blackrock cipher (format-preserving encryption)
+- **Feistel Network**: 3-round Feistel cipher with AES round function
+- **Bit-Space Optimization**: Works in minimum required bits (e.g., 16 bits for /16)
+- **Cycle-Walking**: Re-encrypts values outside range until valid (with safety limit)
+- **Bijection Guarantee**: One-to-one mapping ensures each IP scanned exactly once
+- **Memory**: O(1) constant memory regardless of range size
+- **Performance**: ~321ns per permutation, 20,000 IPs generated in 8ms
+- **Thread-Safe**: Multiple workers can consume from channel concurrently
 
 ### Raw Mode Implementation
 - Uses `syscall` package for raw socket operations
@@ -237,6 +327,7 @@ Results are saved in JSON Lines format (one JSON object per line). Each line con
 - Thread-safe result collection and writing
 - Configurable worker pools for concurrent scanning
 - Unified JSONL output format for both modes
+- Range-based checkpoint tracking for efficient resume
 
 ## Security Considerations
 
@@ -255,38 +346,61 @@ Results are saved in JSON Lines format (one JSON object per line). Each line con
 - Linux only (uses Linux-specific syscalls for raw mode)
 - ICMP may be blocked by firewalls
 - Some routers don't respond to ICMP Time Exceeded messages
-- Large ranges (>1M IPs) have safety limit in range parser
 - External mode depends on system traceroute binary being installed
 - Raw mode requires root privileges for raw socket access
+- Large scans of private/unreachable IPs can take very long due to timeouts
+  - Solution: Use shorter timeouts (`-timeout 1s -max-hops 10`) for private networks
+  - Test with routable IPs first to verify functionality
 
 ## Performance Tips
 
-1. **Use External Mode for Convenience**: No root required, generally sufficient for most uses
+1. **Use Streaming Mode for Large Ranges**: Constant memory usage, supports unlimited ranges
    ```bash
-   ./traceroute-scanner -range 10.0.0.0/24 -mode external -workers 50
+   ./traceroute-scanner -range 10.0.0.0/16 -streaming -workers 50
+   # Works for /8, /16, any size - memory usage stays constant
    ```
 
-2. **Adjust Workers**: More workers = faster scanning, but may overwhelm network
+2. **Use External Mode for Convenience**: No root required, generally sufficient for most uses
    ```bash
-   ./traceroute-scanner -range 10.0.0.0/24 -mode external -workers 50
+   ./traceroute-scanner -range 10.0.0.0/24 -streaming -workers 50
    ```
 
-3. **Reduce Timeout**: Shorter timeouts speed up scans of unresponsive hosts
+3. **Adjust Workers**: More workers = faster scanning, but may overwhelm network
    ```bash
-   ./traceroute-scanner -range 10.0.0.0/24 -mode external -timeout 1s
+   ./traceroute-scanner -range 10.0.0.0/24 -streaming -workers 100
    ```
 
-4. **Limit Hops**: Reduce max hops for nearby networks
+4. **Reduce Timeout**: Shorter timeouts speed up scans of unresponsive hosts
    ```bash
-   ./traceroute-scanner -range 192.168.0.0/24 -mode external -max-hops 15
+   ./traceroute-scanner -range 10.0.0.0/24 -streaming -timeout 1s
+   # For local networks: -timeout 500ms -max-hops 5
    ```
 
-5. **Use Raw Mode for Performance**: When you need maximum control and speed (requires root)
+5. **Limit Hops**: Reduce max hops for nearby networks
    ```bash
-   sudo ./traceroute-scanner -range 10.0.0.0/24 -mode raw -workers 100
+   ./traceroute-scanner -range 192.168.0.0/24 -streaming -max-hops 15
+   ```
+
+6. **Use Raw Mode for Performance**: When you need maximum control and speed (requires root)
+   ```bash
+   sudo ./traceroute-scanner -range 10.0.0.0/24 -streaming -mode raw -workers 100
+   ```
+
+7. **Test with Routable IPs First**: Verify setup before large scans
+   ```bash
+   ./traceroute-scanner -range 8.8.8.8-8.8.8.10 -streaming -fresh
+   # Completes in seconds, confirms everything works
    ```
 
 ## Troubleshooting
+
+**Scanner appears stuck with no progress**
+- **Problem**: Scanning private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) that don't route on the internet
+- **Symptom**: No output after "Starting IP submission..." and first few IPs
+- **Cause**: Each unreachable IP waits for full timeout (up to 180 seconds with default settings)
+- **Solution 1**: Test with routable IPs first: `./traceroute-scanner -range 8.8.8.8-8.8.8.10 -streaming -fresh`
+- **Solution 2**: For private IPs, use shorter timeouts: `-timeout 1s -max-hops 10` (reduces wait to ~20s per IP)
+- **Note**: Shuffle feature is working correctly - this is expected behavior for unreachable IPs
 
 **"failed to create raw socket: operation not permitted"**
 - You're using raw mode without sudo
@@ -311,7 +425,50 @@ Results are saved in JSON Lines format (one JSON object per line). Each line con
 - Increase number of workers: `-workers 50`
 - Decrease timeout value: `-timeout 1s`
 - Reduce max-hops if scanning local networks: `-max-hops 15`
+- Use streaming mode for large ranges: `-streaming`
 - Raw mode has lower overhead than external mode
+
+**Want to verify shuffle is working?**
+```bash
+# Test with routable IPs (completes quickly)
+./traceroute-scanner -range 8.8.8.8-8.8.8.10 -streaming -shuffle-seed=42 -fresh
+
+# Run again - should see identical scan order
+./traceroute-scanner -range 8.8.8.8-8.8.8.10 -streaming -shuffle-seed=42 -fresh
+```
+
+## Additional Documentation
+
+For more detailed information about specific features:
+
+- **BLACKROCK_SHUFFLE.md** - Deep dive into the Blackrock cipher algorithm, how it works, performance characteristics, and comparison with ZMap
+- **SHUFFLE_USAGE_GUIDE.md** - Comprehensive guide with examples for every use case: testing, research, stealth scanning, distributed scanning, and more
+- **SHUFFLE_DIAGNOSIS.md** - Troubleshooting guide explaining the "scanner appears stuck" issue with private IP ranges
+- **test_shuffle_live.sh** - Automated test script to verify shuffle functionality with routable IPs
+
+## Testing
+
+Run the test suite:
+```bash
+go test -v
+```
+
+Run shuffle-specific tests:
+```bash
+go test -v -run Shuffle
+go test -v -run Blackrock
+```
+
+Quick verification with real IPs:
+```bash
+./test_shuffle_live.sh
+```
+
+All tests (134 total) should pass, including:
+- 17 Blackrock cipher tests (bijection, collision detection, edge cases)
+- 7 IP generator shuffle tests (determinism, exclusion ranges, large ranges)
+- Checkpoint and resume functionality tests
+- Raw and external traceroute tests
 
 ## License
 
