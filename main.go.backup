@@ -19,27 +19,20 @@ func main() {
 	timeout := flag.Duration("timeout", 3*time.Second, "Timeout per hop")
 	mode := flag.String("mode", "external", "Traceroute mode: 'raw' (requires root) or 'external' (uses system traceroute)")
 	shuffle := flag.Bool("shuffle", true, "Shuffle IP order to avoid obvious scanning patterns (recommended for stealth)")
-	shuffleSeed := flag.Uint64("shuffle-seed", 0, "Seed for shuffle permutation (0 = random, same seed = same order)")
 	fresh := flag.Bool("fresh", false, "Start a fresh scan (default: auto-resume if progress file exists)")
 	archive := flag.Bool("archive", false, "If previous scan is complete, archive it with timestamp and start fresh")
-	streaming := flag.Bool("streaming", false, "Use streaming mode for large ranges (memory efficient, supports shuffle)")
 	flag.Parse()
 
 	if *ipRange == "" {
 		fmt.Println("Usage: ./traceroute-scanner -range <IP_RANGE> [OPTIONS]")
 		fmt.Println("\nExamples:")
-		fmt.Println("  # Small ranges (< 10M IPs, loads in memory):")
+		fmt.Println("  # Using external traceroute (no root required):")
 		fmt.Println("  ./traceroute-scanner -range 8.8.8.8 -mode external")
-		fmt.Println("  sudo ./traceroute-scanner -range 192.168.0.0/16 -mode raw")
+		fmt.Println("  ./traceroute-scanner -range 8.8.8.0/24 -mode external")
 		fmt.Println("")
-		fmt.Println("  # Large ranges (> 10M IPs, auto-streams):")
-		fmt.Println("  sudo ./traceroute-scanner -range 10.0.0.0/8 -mode raw")
-		fmt.Println("")
-		fmt.Println("  # Force streaming mode (memory efficient):")
-		fmt.Println("  sudo ./traceroute-scanner -range 192.168.0.0/16 -mode raw -streaming")
-		fmt.Println("")
-		fmt.Println("  # All IPv4 addresses (4.3 billion IPs!):")
-		fmt.Println("  sudo ./traceroute-scanner -range 0.0.0.0/0 -mode raw -streaming -workers 1000")
+		fmt.Println("  # Using raw ICMP (requires root):")
+		fmt.Println("  sudo ./traceroute-scanner -range 8.8.8.8 -mode raw")
+		fmt.Println("  sudo ./traceroute-scanner -range 1.1.1.1-1.1.1.10 -mode raw")
 		fmt.Println("\nOptions:")
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -57,23 +50,7 @@ func main() {
 		}
 	}
 
-	// Check if streaming mode should be used
-	if *streaming {
-		// Use streaming mode - delegate to streaming function
-		mainStreamingMode(ipRange, output, workers, maxHops, timeout, mode, shuffle, shuffleSeed, fresh, archive)
-		return
-	}
-
-	// Auto-detect if range is too large (> 10 million IPs)
-	iterator, err := NewIPRangeIteratorFromString(*ipRange)
-	if err == nil && iterator.Total > 10000000 {
-		fmt.Printf("⚠️  Large IP range detected (%d IPs > 10M limit)\n", iterator.Total)
-		fmt.Printf("Switching to streaming mode for memory efficiency...\n\n")
-		mainStreamingMode(ipRange, output, workers, maxHops, timeout, mode, shuffle, shuffleSeed, fresh, archive)
-		return
-	}
-
-	// Parse IP range (memory mode for small ranges)
+	// Parse IP range
 	ips, err := ParseIPRange(*ipRange)
 	if err != nil {
 		log.Fatalf("Error parsing IP range: %v", err)

@@ -46,7 +46,13 @@ func (p *WorkerPool) Start() {
 func (p *WorkerPool) worker(id int) {
 	defer p.wg.Done()
 
+	jobNum := 0
 	for job := range p.jobs {
+		jobNum++
+		if jobNum <= 3 {
+			log.Printf("Worker %d: Starting job %d for %s", id, jobNum, job.IP)
+		}
+
 		var result *TraceResult
 		var err error
 
@@ -58,7 +64,9 @@ func (p *WorkerPool) worker(id int) {
 		}
 
 		if err != nil {
-			log.Printf("Worker %d: Error tracing %s: %v", id, job.IP, err)
+			if jobNum <= 3 {
+				log.Printf("Worker %d: Error tracing %s: %v", id, job.IP, err)
+			}
 			// Send error result
 			result = &TraceResult{
 				DestIP:    job.IP.String(),
@@ -66,6 +74,10 @@ func (p *WorkerPool) worker(id int) {
 				Reached:   false,
 				Timestamp: time.Now(),
 			}
+		}
+
+		if jobNum <= 3 {
+			log.Printf("Worker %d: Completed job %d for %s", id, jobNum, job.IP)
 		}
 
 		// Send result
