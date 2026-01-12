@@ -7,10 +7,12 @@ A high-performance Go application that performs traceroute to IPv4 addresses wit
 - **Dual Mode Operation**:
   - **Raw Socket Mode**: Direct UDP implementation using Linux system calls (requires root, works through NAT)
   - **External Mode**: Uses system traceroute binary (no root required)
+- **Resumable Scans**: Automatic checkpoint saving, resume interrupted scans from where they left off
 - **IP Shuffling**: Randomizes scan order to avoid obvious patterns and evade detection (enabled by default)
 - **Concurrent Scanning**: Configurable worker pool for parallel traceroutes
 - **Flexible IP Ranges**: Supports single IPs, CIDR notation, and IP ranges
 - **JSONL Output**: Results saved in JSON Lines format for easy processing
+- **Progress Tracking**: Real-time progress updates with percentage completion
 - **Configurable Parameters**: Control workers, max hops, and timeouts
 
 ## Requirements
@@ -74,8 +76,10 @@ sudo ./traceroute-scanner -range <IP_RANGE> -mode raw [OPTIONS]
 
 - `-range`: IP range to scan (required)
 - `-mode`: Traceroute mode - `external` or `raw` (default: `external`)
-- `-shuffle`: Shuffle IP order to avoid obvious scanning patterns (default: `true`)
 - `-output`: Output file path (default: `traceroute_results.jsonl`)
+- `-archive`: If previous scan is complete, archive it with timestamp and start fresh (default: `false`)
+- `-fresh`: Start a fresh scan, deleting any existing progress (default: auto-resume if progress exists)
+- `-shuffle`: Shuffle IP order to avoid obvious scanning patterns (default: `true`)
 - `-workers`: Number of concurrent workers (default: 10)
 - `-max-hops`: Maximum number of hops (default: 30)
 - `-timeout`: Timeout per hop (default: 3s)
@@ -105,6 +109,30 @@ sudo ./traceroute-scanner -range 8.8.8.8 -mode raw
 **Scan range with custom output file:**
 ```bash
 ./traceroute-scanner -range 1.1.1.1-1.1.1.100 -mode external -output results.jsonl
+```
+
+**Resume interrupted scan (automatic):**
+```bash
+# Start a scan
+sudo ./traceroute-scanner -range 192.168.0.0/16 -mode raw -workers 50
+
+# If interrupted (Ctrl+C, network issue, etc.), just run the same command again:
+sudo ./traceroute-scanner -range 192.168.0.0/16 -mode raw -workers 50
+# Automatically resumes from where it left off!
+```
+
+**Start fresh scan (delete existing progress):**
+```bash
+# Force a fresh start even if progress file exists
+sudo ./traceroute-scanner -range 192.168.0.0/16 -mode raw -workers 50 -fresh
+```
+
+**Archive completed scan and start new one:**
+```bash
+# If previous scan is complete, archives it with timestamp
+sudo ./traceroute-scanner -range 192.168.0.0/16 -mode raw -workers 50 -archive
+# Creates: traceroute_results.jsonl.2026-01-12_18-30-45 (old scan)
+# Creates: traceroute_results.jsonl (new scan)
 ```
 
 ### Stealth Scanning

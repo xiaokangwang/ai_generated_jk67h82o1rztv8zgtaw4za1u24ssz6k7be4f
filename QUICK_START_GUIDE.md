@@ -84,6 +84,22 @@ sudo ./traceroute-scanner -range 8.8.8.8 -mode raw -output my_results.jsonl
 # Works without sudo
 ```
 
+### 9. Resume Interrupted Scan (Automatic!)
+```bash
+# Start a large scan
+sudo ./traceroute-scanner -range 10.0.0.0/16 -mode raw -workers 50
+
+# If interrupted (Ctrl+C, power loss, etc.), just run the same command:
+sudo ./traceroute-scanner -range 10.0.0.0/16 -mode raw -workers 50
+# Automatically resumes where it left off!
+```
+
+### 10. Force Fresh Start
+```bash
+# Want to start over? Use -fresh flag
+sudo ./traceroute-scanner -range 10.0.0.0/16 -mode raw -workers 50 -fresh
+```
+
 ## Output Format
 
 Results are saved in JSON Lines format (`.jsonl`):
