@@ -8,9 +8,10 @@ import (
 
 // IPRangeIterator represents an IP range that can be iterated
 type IPRangeIterator struct {
-	Start uint32
-	End   uint32
-	Total uint64
+	Start       uint32
+	End         uint32
+	Total       uint64
+	OnePer24    bool   // If true, sample only one IP per /24 block
 }
 
 // NewIPRangeIterator creates an iterator from start and end IPs
@@ -77,26 +78,48 @@ func (r *IPRangeIterator) Generate(excludeRanges []CompletedRange) <-chan net.IP
 	go func() {
 		defer close(ch)
 
-		for i := r.Start; i <= r.End; i++ {
-			// Check if this IP is in any excluded range
-			excluded := false
-			for _, excl := range excludeRanges {
-				if i >= excl.Start && i <= excl.End {
-					// Skip to end of excluded range
-					i = excl.End
-					excluded = true
-					break
+		if r.OnePer24 {
+			// Sample one IP per /24 block
+			// Start with the first /24 block containing r.Start
+			currentBlock := r.Start >> 8
+			endBlock := r.End >> 8
+
+			for currentBlock <= endBlock {
+				// Generate first IP of this /24 block
+				ip := currentBlock << 8
+
+				// Check if this IP is in the original range and not excluded
+				if ip >= r.Start && ip <= r.End {
+					if !isInExcludedRange(ip, excludeRanges) {
+						ch <- Uint32ToIP(ip)
+					}
 				}
-			}
 
-			if excluded {
-				continue
+				currentBlock++
 			}
+		} else {
+			// Normal mode: iterate through all IPs
+			for i := r.Start; i <= r.End; i++ {
+				// Check if this IP is in any excluded range
+				excluded := false
+				for _, excl := range excludeRanges {
+					if i >= excl.Start && i <= excl.End {
+						// Skip to end of excluded range
+						i = excl.End
+						excluded = true
+						break
+					}
+				}
 
-			// Convert uint32 to IP and send
-			ip := make(net.IP, 4)
-			binary.BigEndian.PutUint32(ip, i)
-			ch <- ip
+				if excluded {
+					continue
+				}
+
+				// Convert uint32 to IP and send
+				ip := make(net.IP, 4)
+				binary.BigEndian.PutUint32(ip, i)
+				ch <- ip
+			}
 		}
 	}()
 
@@ -116,27 +139,58 @@ func (r *IPRangeIterator) GenerateShuffled(excludeRanges []CompletedRange, seed 
 		br, err := NewBlackrock(r.Total, seed)
 		if err != nil {
 			// Fallback to sequential if blackrock fails
-			for i := r.Start; i <= r.End; i++ {
-				if !isInExcludedRange(i, excludeRanges) {
-					ch <- Uint32ToIP(i)
+			if r.OnePer24 {
+				currentBlock := r.Start >> 8
+				endBlock := r.End >> 8
+				for currentBlock <= endBlock {
+					ip := currentBlock << 8
+					if ip >= r.Start && ip <= r.End && !isInExcludedRange(ip, excludeRanges) {
+						ch <- Uint32ToIP(ip)
+					}
+					currentBlock++
+				}
+			} else {
+				for i := r.Start; i <= r.End; i++ {
+					if !isInExcludedRange(i, excludeRanges) {
+						ch <- Uint32ToIP(i)
+					}
 				}
 			}
 			return
 		}
 
-		// Iterate through all indices in order
-		generated := uint64(0)
-		for index := uint64(0); index < r.Total; index++ {
-			// Apply blackrock permutation to get shuffled index
-			shuffledIndex := br.Shuffle(index)
+		if r.OnePer24 {
+			// Shuffle /24 blocks instead of individual IPs
+			startBlock := r.Start >> 8
 
-			// Convert shuffled index back to IP address
-			ipInt := r.Start + uint32(shuffledIndex)
+			for index := uint64(0); index < r.Total; index++ {
+				// Apply blackrock permutation to get shuffled block index
+				shuffledIndex := br.Shuffle(index)
 
-			// Check if excluded
-			if !isInExcludedRange(ipInt, excludeRanges) {
-				ch <- Uint32ToIP(ipInt)
-				generated++
+				// Convert shuffled index to /24 block number
+				blockNum := startBlock + uint32(shuffledIndex)
+
+				// Generate first IP of this /24 block
+				ipInt := blockNum << 8
+
+				// Check if in range and not excluded
+				if ipInt >= r.Start && ipInt <= r.End && !isInExcludedRange(ipInt, excludeRanges) {
+					ch <- Uint32ToIP(ipInt)
+				}
+			}
+		} else {
+			// Normal mode: shuffle individual IPs
+			for index := uint64(0); index < r.Total; index++ {
+				// Apply blackrock permutation to get shuffled index
+				shuffledIndex := br.Shuffle(index)
+
+				// Convert shuffled index back to IP address
+				ipInt := r.Start + uint32(shuffledIndex)
+
+				// Check if excluded
+				if !isInExcludedRange(ipInt, excludeRanges) {
+					ch <- Uint32ToIP(ipInt)
+				}
 			}
 		}
 	}()
@@ -157,6 +211,26 @@ func isInExcludedRange(ipInt uint32, excludeRanges []CompletedRange) bool {
 // Count returns total number of IPs in range
 func (r *IPRangeIterator) Count() uint64 {
 	return r.Total
+}
+
+// SampleOnePer24 creates a new iterator that samples one IP per /24 block
+// This reduces the scan size by up to 256x
+func (r *IPRangeIterator) SampleOnePer24() *IPRangeIterator {
+	// Calculate the first and last /24 block
+	firstBlock := r.Start >> 8        // First /24 block number (discard last 8 bits)
+	lastBlock := r.End >> 8           // Last /24 block number
+
+	// Calculate number of /24 blocks
+	numBlocks := lastBlock - firstBlock + 1
+
+	// Keep original start/end but set sampling flag
+	// The Generate methods will handle skipping appropriately
+	return &IPRangeIterator{
+		Start:    r.Start,
+		End:      r.End,
+		Total:    uint64(numBlocks),
+		OnePer24: true,
+	}
 }
 
 // IPToUint32 converts IP to uint32

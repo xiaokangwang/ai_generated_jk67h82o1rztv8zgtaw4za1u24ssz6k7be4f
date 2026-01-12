@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func mainStreamingMode(ipRange, output *string, workers, maxHops *int, timeout *time.Duration, mode *string, shuffle *bool, shuffleSeed *uint64, fresh, archive *bool) {
+func mainStreamingMode(ipRange, output *string, workers, maxHops *int, timeout *time.Duration, mode *string, shuffle *bool, shuffleSeed *uint64, onePer24 *bool, fresh, archive *bool) {
 
 	// Create IP range iterator
 	iterator, err := NewIPRangeIteratorFromString(*ipRange)
@@ -19,10 +19,21 @@ func mainStreamingMode(ipRange, output *string, workers, maxHops *int, timeout *
 		log.Fatalf("Error parsing IP range: %v", err)
 	}
 
-	fmt.Printf("IP Range: %s to %s (%d IPs)\n",
-		Uint32ToIP(iterator.Start),
-		Uint32ToIP(iterator.End),
-		iterator.Total)
+	// Apply one-per-24 sampling if requested
+	if *onePer24 {
+		originalTotal := iterator.Total
+		iterator = iterator.SampleOnePer24()
+		fmt.Printf("IP Range: %s to %s (sampling 1 per /24: %d IPs from %d total)\n",
+			Uint32ToIP(iterator.Start),
+			Uint32ToIP(iterator.End),
+			iterator.Total,
+			originalTotal)
+	} else {
+		fmt.Printf("IP Range: %s to %s (%d IPs)\n",
+			Uint32ToIP(iterator.Start),
+			Uint32ToIP(iterator.End),
+			iterator.Total)
+	}
 
 	// Create range-based checkpoint manager
 	checkpoint, err := NewRangeCheckpoint(*output, iterator.Start, iterator.End)

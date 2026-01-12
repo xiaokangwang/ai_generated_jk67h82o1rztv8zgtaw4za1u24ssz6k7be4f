@@ -607,3 +607,136 @@ func TestIPRangeIteratorGenerateShuffledLargeRange(t *testing.T) {
 		t.Errorf("Expected 256 IPs, got %d", count)
 	}
 }
+
+// TestIPRangeIteratorOnePer24 tests the one-per-24 sampling functionality
+func TestIPRangeIteratorOnePer24(t *testing.T) {
+	start := net.ParseIP("10.0.0.0")
+	end := net.ParseIP("10.0.255.255")
+
+	iter, err := NewIPRangeIterator(start, end)
+	if err != nil {
+		t.Fatalf("Failed to create iterator: %v", err)
+	}
+
+	// Original should have 65536 IPs (/16)
+	if iter.Total != 65536 {
+		t.Errorf("Expected 65536 IPs in /16, got %d", iter.Total)
+	}
+
+	// Sample one per /24
+	sampled := iter.SampleOnePer24()
+
+	// Should have 256 IPs (one per /24 block)
+	if sampled.Total != 256 {
+		t.Errorf("Expected 256 IPs (one per /24), got %d", sampled.Total)
+	}
+
+	// Generate IPs and verify they're all .0 addresses (first of each /24)
+	ch := sampled.Generate(nil)
+	count := 0
+	for ip := range ch {
+		ipInt := IPToUint32(ip)
+		// Check that last 8 bits are 0 (first IP of /24 block)
+		if ipInt&0xFF != 0 {
+			t.Errorf("IP %s is not first of /24 block (last byte should be 0)", ip.String())
+		}
+		count++
+	}
+
+	if count != 256 {
+		t.Errorf("Expected to generate 256 IPs, got %d", count)
+	}
+}
+
+// TestIPRangeIteratorOnePer24Shuffle tests shuffling with one-per-24 sampling
+func TestIPRangeIteratorOnePer24Shuffle(t *testing.T) {
+	start := net.ParseIP("10.0.0.0")
+	end := net.ParseIP("10.0.1.255")
+
+	iter, err := NewIPRangeIterator(start, end)
+	if err != nil {
+		t.Fatalf("Failed to create iterator: %v", err)
+	}
+
+	// Original should have 512 IPs
+	if iter.Total != 512 {
+		t.Errorf("Expected 512 IPs, got %d", iter.Total)
+	}
+
+	// Sample one per /24 (should give us 2 /24 blocks)
+	sampled := iter.SampleOnePer24()
+
+	if sampled.Total != 2 {
+		t.Errorf("Expected 2 /24 blocks, got %d", sampled.Total)
+	}
+
+	// Generate with shuffle
+	ch := sampled.GenerateShuffled(nil, 42)
+	ips := []string{}
+	for ip := range ch {
+		ips = append(ips, ip.String())
+	}
+
+	// Should have exactly 2 IPs
+	if len(ips) != 2 {
+		t.Errorf("Expected 2 IPs, got %d", len(ips))
+	}
+
+	// Both should be .0 addresses
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		ipInt := IPToUint32(ip)
+		if ipInt&0xFF != 0 {
+			t.Errorf("IP %s is not first of /24 block", ipStr)
+		}
+	}
+
+	// Verify determinism - same seed should give same order
+	ch2 := sampled.GenerateShuffled(nil, 42)
+	ips2 := []string{}
+	for ip := range ch2 {
+		ips2 = append(ips2, ip.String())
+	}
+
+	if len(ips) != len(ips2) {
+		t.Errorf("Different number of IPs with same seed")
+	}
+
+	for i := range ips {
+		if ips[i] != ips2[i] {
+			t.Errorf("Different order with same seed at index %d: %s vs %s", i, ips[i], ips2[i])
+		}
+	}
+}
+
+// TestIPRangeIteratorOnePer24FullSpace tests one-per-24 on full IPv4 space
+func TestIPRangeIteratorOnePer24FullSpace(t *testing.T) {
+	start := net.ParseIP("0.0.0.0")
+	end := net.ParseIP("255.255.255.255")
+
+	iter, err := NewIPRangeIterator(start, end)
+	if err != nil {
+		t.Fatalf("Failed to create iterator: %v", err)
+	}
+
+	// Full IPv4 space: 2^32 = 4,294,967,296
+	expectedFull := uint64(4294967296)
+	if iter.Total != expectedFull {
+		t.Errorf("Expected %d IPs in full space, got %d", expectedFull, iter.Total)
+	}
+
+	// Sample one per /24
+	sampled := iter.SampleOnePer24()
+
+	// Should have 2^24 = 16,777,216 blocks (256x reduction)
+	expectedSampled := uint64(16777216)
+	if sampled.Total != expectedSampled {
+		t.Errorf("Expected %d /24 blocks, got %d", expectedSampled, sampled.Total)
+	}
+
+	// Verify reduction factor
+	reduction := float64(iter.Total) / float64(sampled.Total)
+	if reduction < 255.9 || reduction > 256.1 {
+		t.Errorf("Expected ~256x reduction, got %.2fx", reduction)
+	}
+}

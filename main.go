@@ -20,6 +20,7 @@ func main() {
 	mode := flag.String("mode", "external", "Traceroute mode: 'raw' (requires root) or 'external' (uses system traceroute)")
 	shuffle := flag.Bool("shuffle", true, "Shuffle IP order to avoid obvious scanning patterns (recommended for stealth)")
 	shuffleSeed := flag.Uint64("shuffle-seed", 0, "Seed for shuffle permutation (0 = random, same seed = same order)")
+	onePer24 := flag.Bool("one-per-24", false, "Sample only one IP per /24 block (reduces scan size by 256x)")
 	fresh := flag.Bool("fresh", false, "Start a fresh scan (default: auto-resume if progress file exists)")
 	archive := flag.Bool("archive", false, "If previous scan is complete, archive it with timestamp and start fresh")
 	streaming := flag.Bool("streaming", false, "Use streaming mode for large ranges (memory efficient, supports shuffle)")
@@ -60,7 +61,7 @@ func main() {
 	// Check if streaming mode should be used
 	if *streaming {
 		// Use streaming mode - delegate to streaming function
-		mainStreamingMode(ipRange, output, workers, maxHops, timeout, mode, shuffle, shuffleSeed, fresh, archive)
+		mainStreamingMode(ipRange, output, workers, maxHops, timeout, mode, shuffle, shuffleSeed, onePer24, fresh, archive)
 		return
 	}
 
@@ -69,7 +70,7 @@ func main() {
 	if err == nil && iterator.Total > 10000000 {
 		fmt.Printf("⚠️  Large IP range detected (%d IPs > 10M limit)\n", iterator.Total)
 		fmt.Printf("Switching to streaming mode for memory efficiency...\n\n")
-		mainStreamingMode(ipRange, output, workers, maxHops, timeout, mode, shuffle, shuffleSeed, fresh, archive)
+		mainStreamingMode(ipRange, output, workers, maxHops, timeout, mode, shuffle, shuffleSeed, onePer24, fresh, archive)
 		return
 	}
 
