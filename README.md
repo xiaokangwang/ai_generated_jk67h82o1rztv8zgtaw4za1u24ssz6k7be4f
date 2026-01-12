@@ -1,12 +1,14 @@
 # Traceroute Scanner
 
-A high-performance Go application that performs traceroute to IPv4 addresses with two modes: raw UDP sockets or external traceroute binary.
+A high-performance Go application that performs traceroute and ICMP ping scans on IPv4 addresses with multiple operational modes.
 
 ## Features
 
-- **Dual Mode Operation**:
+- **Multiple Scanning Modes**:
   - **Raw Socket Mode**: Direct UDP implementation using Linux system calls (requires root, works through NAT)
   - **External Mode**: Uses system traceroute binary (no root required)
+  - **Ping-Only Mode**: Fast ICMP ping for host discovery (10-100x faster than traceroute)
+- **Fast Sampling**: One-per-24 option to scan only one IP per /24 block (256x reduction in scan size)
 - **Streaming Mode**: Memory-efficient scanning for unlimited IP ranges (constant memory usage regardless of range size)
 - **Advanced IP Shuffling**:
   - Uses ZMap's Blackrock cipher for cryptographically secure pseudo-random IP ordering
@@ -14,7 +16,7 @@ A high-performance Go application that performs traceroute to IPv4 addresses wit
   - Zero memory overhead - IPs generated on-demand
   - Enabled by default for stealth
 - **Resumable Scans**: Automatic checkpoint saving, resume interrupted scans from where they left off
-- **Concurrent Scanning**: Configurable worker pool for parallel traceroutes
+- **Concurrent Scanning**: Configurable worker pool for parallel operations
 - **Flexible IP Ranges**: Supports single IPs, CIDR notation, and IP ranges (any size)
 - **JSONL Output**: Results saved in JSON Lines format for easy processing
 - **Progress Tracking**: Real-time progress updates with percentage completion
@@ -97,6 +99,8 @@ sudo ./traceroute-scanner -range <IP_RANGE> -streaming -mode raw [OPTIONS]
 
 - `-range`: IP range to scan (required) - supports single IP, CIDR, or range notation
 - `-mode`: Traceroute mode - `external` or `raw` (default: `external`)
+- `-ping-only`: Use ICMP ping instead of traceroute (much faster, checks reachability only)
+- `-one-per-24`: Sample only one IP per /24 block (reduces scan size by 256x)
 - `-streaming`: Use streaming mode for memory-efficient scanning (recommended for large ranges)
 - `-output`: Output file path (default: `traceroute_results.jsonl`)
 - `-archive`: If previous scan is complete, archive it with timestamp and start fresh
@@ -108,6 +112,24 @@ sudo ./traceroute-scanner -range <IP_RANGE> -streaming -mode raw [OPTIONS]
 - `-timeout`: Timeout per hop (default: 3s)
 
 ### Examples
+
+**Fast host discovery with ping-only mode:**
+```bash
+./traceroute-scanner -range 8.8.8.0/24 -ping-only -streaming
+# 10-100x faster than traceroute, checks which hosts are reachable
+```
+
+**Sample one IP per /24 block (256x faster):**
+```bash
+./traceroute-scanner -range 1.0.0.0/16 -one-per-24 -streaming
+# Scans 256 IPs instead of 65536 (samples 1.0.0.0, 1.0.1.0, 1.0.2.0, ...)
+```
+
+**Ultra-fast internet survey (ping + sampling):**
+```bash
+./traceroute-scanner -range 0.0.0.0/0 -ping-only -one-per-24 -streaming -workers 100
+# Scans entire IPv4 space: 16.7M IPs instead of 4.3B (completes in hours, not months)
+```
 
 **Basic scan using external mode (no root):**
 ```bash
@@ -224,44 +246,254 @@ By default, the scanner uses **ZMap's Blackrock cipher** to randomize IP address
 - **Testing**: Same seed ensures consistent test conditions
 - **Random (seed=0)**: Maximum unpredictability for stealth
 
-## Output Format
+## Understanding the Output
 
-Results are saved in JSON Lines format (one JSON object per line). Each line contains:
+Results are saved in **JSON Lines format** (`.jsonl`) - one JSON object per line. Each line represents the scan result for a single IP address.
+
+### Output File Format
+
+The output file contains one JSON object per line (not a JSON array). This format is:
+- **Streamable**: Can process results as they're written
+- **Appendable**: New results added without rewriting entire file
+- **Parseable**: Easy to process with `jq`, `grep`, or any JSON parser
+
+```bash
+# View results with jq
+cat results.jsonl | jq .
+
+# Count reachable hosts
+cat results.jsonl | jq 'select(.reached == true)' | wc -l
+
+# Extract just IP addresses of reachable hosts
+cat results.jsonl | jq -r 'select(.reached == true) | .dest_ip'
+
+# Find hosts with >10 hops
+cat results.jsonl | jq 'select(.hops | length > 10)'
+```
+
+### Field Reference
+
+#### Top-Level Fields
+
+- **`dest_ip`** (string): The target IP address that was scanned
+- **`hops`** (array): Ordered list of network hops from source to destination (empty if unreachable)
+- **`reached`** (boolean): `true` if destination was reached, `false` if unreachable or timed out
+- **`timestamp`** (string): ISO 8601 timestamp when the scan started
+- **`duration_ns`** (integer): Total scan duration in nanoseconds
+
+#### Hop Fields (inside `hops` array)
+
+- **`ttl`** (integer): Time-To-Live value SET in the outgoing packet (not from response)
+  - In **traceroute mode**: Starts at 1, increments each hop (1, 2, 3, ...)
+  - In **ping-only mode**: Fixed at 64 (standard ping TTL value)
+- **`ip`** (string): IP address of the router/host at this hop (empty string "" if timeout)
+- **`rtt_ns`** (integer): Round-trip time in nanoseconds (0 if timeout)
+- **`timeout`** (boolean): `true` if this hop didn't respond within timeout period
+
+### Example Outputs Explained
+
+#### 1. Successful Traceroute (Reachable Host)
 
 ```json
 {
   "dest_ip": "8.8.8.8",
   "hops": [
-    {
-      "ttl": 1,
-      "ip": "192.168.1.1",
-      "rtt_ns": 1234567,
-      "timeout": false
-    },
-    {
-      "ttl": 2,
-      "ip": "10.0.0.1",
-      "rtt_ns": 2345678,
-      "timeout": false
-    }
+    {"ttl": 1, "ip": "192.168.1.1", "rtt_ns": 2500000, "timeout": false},
+    {"ttl": 2, "ip": "10.0.0.1", "rtt_ns": 5000000, "timeout": false},
+    {"ttl": 3, "ip": "172.16.0.1", "rtt_ns": 15000000, "timeout": false},
+    {"ttl": 4, "ip": "8.8.8.8", "rtt_ns": 20000000, "timeout": false}
   ],
   "reached": true,
   "timestamp": "2026-01-12T10:30:00Z",
-  "duration_ns": 3456789
+  "duration_ns": 85000000
 }
 ```
 
-### Fields
+**What this means:**
+- Successfully traced route to Google DNS (8.8.8.8)
+- Took 4 hops to reach destination
+- **Hop 1** (2.5ms): Local gateway at 192.168.1.1
+- **Hop 2** (5ms): Next router at 10.0.0.1
+- **Hop 3** (15ms): ISP router at 172.16.0.1
+- **Hop 4** (20ms): Reached destination 8.8.8.8
+- Total scan time: 85ms
 
-- `dest_ip`: Target IP address
-- `hops`: Array of hop information
-  - `ttl`: Time To Live value
-  - `ip`: IP address of the hop (empty if timeout)
-  - `rtt_ns`: Round-trip time in nanoseconds
-  - `timeout`: Whether the hop timed out
-- `reached`: Whether the destination was reached
-- `timestamp`: When the traceroute started
-- `duration_ns`: Total duration in nanoseconds
+#### 2. Traceroute with Timeouts (Hidden Hops)
+
+```json
+{
+  "dest_ip": "1.1.1.1",
+  "hops": [
+    {"ttl": 1, "ip": "192.168.1.1", "rtt_ns": 2000000, "timeout": false},
+    {"ttl": 2, "ip": "", "rtt_ns": 0, "timeout": true},
+    {"ttl": 3, "ip": "", "rtt_ns": 0, "timeout": true},
+    {"ttl": 4, "ip": "1.1.1.1", "rtt_ns": 25000000, "timeout": false}
+  ],
+  "reached": true,
+  "timestamp": "2026-01-12T10:31:00Z",
+  "duration_ns": 9250000000
+}
+```
+
+**What this means:**
+- Successfully reached Cloudflare DNS (1.1.1.1)
+- **Hop 1** (2ms): Local gateway responded
+- **Hops 2-3**: Routers didn't respond to ICMP (common security practice)
+  - `"ip": ""` = no response
+  - `"timeout": true` = waited full timeout period
+- **Hop 4** (25ms): Destination responded
+- Total scan time: 9.25 seconds (mostly waiting for timeouts on hops 2-3)
+
+#### 3. Unreachable Host (Traceroute Mode)
+
+```json
+{
+  "dest_ip": "192.0.2.1",
+  "hops": [
+    {"ttl": 1, "ip": "192.168.1.1", "rtt_ns": 2500000, "timeout": false},
+    {"ttl": 2, "ip": "", "rtt_ns": 0, "timeout": true},
+    {"ttl": 3, "ip": "", "rtt_ns": 0, "timeout": true},
+    {"ttl": 4, "ip": "", "rtt_ns": 0, "timeout": true}
+  ],
+  "reached": false,
+  "timestamp": "2026-01-12T10:32:00Z",
+  "duration_ns": 95000000000
+}
+```
+
+**What this means:**
+- Could NOT reach 192.0.2.1 (documentation IP, not routable)
+- **Hop 1**: Local gateway responded
+- **Hops 2-4**: No responses (shows first 4 failed hops, continues up to `-max-hops`)
+- `"reached": false` = never got response from destination
+- Note: Scans of unreachable IPs take full timeout duration × max hops
+
+#### 4. Completely Unreachable (No Route)
+
+```json
+{
+  "dest_ip": "10.0.0.1",
+  "hops": [],
+  "reached": false,
+  "timestamp": "2026-01-12T10:33:00Z",
+  "duration_ns": 90000000000
+}
+```
+
+**What this means:**
+- Destination completely unreachable (no route, possibly local IP on non-local network)
+- Empty `hops` array = not even first hop responded
+- Scan waited full timeout period for each hop attempt
+
+#### 5. Ping-Only Mode (Reachable)
+
+```json
+{
+  "dest_ip": "8.8.8.8",
+  "hops": [
+    {"ttl": 64, "ip": "8.8.8.8", "rtt_ns": 12500000, "timeout": false}
+  ],
+  "reached": true,
+  "timestamp": "2026-01-12T21:32:22Z",
+  "duration_ns": 13716204
+}
+```
+
+**What this means:**
+- **Ping-only mode** (not traceroute)
+- Host is reachable (responded to ping)
+- **Single hop entry**: Represents the destination response
+  - `"ttl": 64` = TTL we SET in outgoing ping packet (not hop count)
+  - `"rtt_ns": 12500000` = 12.5ms round-trip time
+- Much faster: 13ms total vs 85ms+ for full traceroute
+
+#### 6. Ping-Only Mode (Unreachable)
+
+```json
+{
+  "dest_ip": "192.0.2.1",
+  "hops": [],
+  "reached": false,
+  "timestamp": "2026-01-12T21:32:32Z",
+  "duration_ns": 3001236372
+}
+```
+
+**What this means:**
+- Host did not respond to ping
+- Empty `hops` array in ping mode = no response
+- Waited full timeout (3 seconds in this case)
+
+### Interpreting TTL Values
+
+⚠️ **Important**: The `ttl` field has different meanings depending on the mode:
+
+**In Traceroute Mode:**
+- `ttl` = hop number (1st hop, 2nd hop, 3rd hop, etc.)
+- Starts at 1, increments for each hop
+- Represents how many routers the packet can pass through
+- Example: `"ttl": 3` means "third router in the path"
+
+**In Ping-Only Mode:**
+- `ttl` = Time-To-Live value SET in outgoing ping packet (fixed at 64)
+- Does NOT represent hop count
+- Standard value to ensure packet reaches destination
+- Example: `"ttl": 64` means "we sent ping with TTL=64"
+
+### Common Patterns
+
+**Pattern 1: Fast Local Host**
+```json
+{"dest_ip": "192.168.1.100", "hops": [{"ttl": 1, "ip": "192.168.1.100", ...}], "reached": true}
+```
+→ Host is on local network (1 hop = direct connection)
+
+**Pattern 2: Internet Host**
+```json
+{"dest_ip": "8.8.8.8", "hops": [{...}, {...}, {...}, {"ttl": 4, ...}], "reached": true}
+```
+→ Host is 4 hops away through routers
+
+**Pattern 3: Firewall Blocking**
+```json
+{"hops": [{"ttl": 1, ...}, {"ttl": 2, "ip": "", "timeout": true}, ...], "reached": false}
+```
+→ First hop works, then firewalls block ICMP Time Exceeded messages
+
+**Pattern 4: No Route**
+```json
+{"hops": [], "reached": false}
+```
+→ No routing path exists (IP not reachable from your network)
+
+### Processing Large Result Files
+
+**Count hosts by reachability:**
+```bash
+echo "Reachable: $(grep -c '"reached":true' results.jsonl)"
+echo "Unreachable: $(grep -c '"reached":false' results.jsonl)"
+```
+
+**Extract reachable IPs to text file:**
+```bash
+cat results.jsonl | jq -r 'select(.reached == true) | .dest_ip' > reachable_ips.txt
+```
+
+**Calculate average RTT for reachable hosts:**
+```bash
+cat results.jsonl | jq -r 'select(.reached == true) | .hops[-1].rtt_ns' | awk '{sum+=$1; count++} END {print sum/count/1000000 " ms"}'
+```
+
+**Find hosts with exactly N hops:**
+```bash
+cat results.jsonl | jq 'select(.hops | length == 5)' > five_hop_hosts.jsonl
+```
+
+**Convert to CSV for Excel:**
+```bash
+echo "IP,Reached,Hops,Duration_ms" > results.csv
+cat results.jsonl | jq -r '[.dest_ip, .reached, (.hops | length), (.duration_ns / 1000000)] | @csv' >> results.csv
+```
 
 ## How It Works
 
@@ -444,6 +676,8 @@ For more detailed information about specific features:
 - **BLACKROCK_SHUFFLE.md** - Deep dive into the Blackrock cipher algorithm, how it works, performance characteristics, and comparison with ZMap
 - **SHUFFLE_USAGE_GUIDE.md** - Comprehensive guide with examples for every use case: testing, research, stealth scanning, distributed scanning, and more
 - **SHUFFLE_DIAGNOSIS.md** - Troubleshooting guide explaining the "scanner appears stuck" issue with private IP ranges
+- **ONE_PER_24_FEATURE.md** - Documentation for the one-per-24 sampling feature (256x scan size reduction)
+- **PING_MODE_FEATURE.md** - Documentation for ping-only mode (10-100x faster than traceroute)
 - **test_shuffle_live.sh** - Automated test script to verify shuffle functionality with routable IPs
 
 ## Testing
@@ -464,11 +698,13 @@ Quick verification with real IPs:
 ./test_shuffle_live.sh
 ```
 
-All tests (134 total) should pass, including:
-- 17 Blackrock cipher tests (bijection, collision detection, edge cases)
-- 7 IP generator shuffle tests (determinism, exclusion ranges, large ranges)
-- Checkpoint and resume functionality tests
-- Raw and external traceroute tests
+All tests (116 total) should pass, including:
+- 12 Blackrock cipher tests (bijection, collision detection, edge cases)
+- 9 IP generator tests (shuffle, one-per-24, exclusion ranges, large ranges)
+- 5 Ping tests (ping functionality, TTL parsing, reachability)
+- 18 Checkpoint and resume functionality tests
+- 13 Worker pool tests (raw and external traceroute modes)
+- External traceroute parsing tests
 
 ## License
 
