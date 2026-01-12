@@ -13,6 +13,7 @@ type WorkerPool struct {
 	maxHops  int
 	timeout  time.Duration
 	mode     string
+	pingOnly bool
 	jobs     chan *Job
 	wg       sync.WaitGroup
 }
@@ -24,12 +25,13 @@ type Job struct {
 }
 
 // NewWorkerPool creates a new worker pool
-func NewWorkerPool(workers, maxHops int, timeout time.Duration, mode string) *WorkerPool {
+func NewWorkerPool(workers, maxHops int, timeout time.Duration, mode string, pingOnly bool) *WorkerPool {
 	return &WorkerPool{
 		workers:  workers,
 		maxHops:  maxHops,
 		timeout:  timeout,
 		mode:     mode,
+		pingOnly: pingOnly,
 		jobs:     make(chan *Job, workers*2),
 	}
 }
@@ -56,23 +58,68 @@ func (p *WorkerPool) worker(id int) {
 		var result *TraceResult
 		var err error
 
-		// Choose traceroute implementation based on mode
-		if p.mode == "raw" {
-			result, err = Traceroute(job.IP, p.maxHops, p.timeout)
-		} else {
-			result, err = TracerouteExternal(job.IP, p.maxHops, p.timeout)
-		}
-
-		if err != nil {
-			if jobNum <= 3 {
-				log.Printf("Worker %d: Error tracing %s: %v", id, job.IP, err)
+		// Choose implementation based on mode
+		if p.pingOnly {
+			// Ping mode - simple ICMP ping
+			pingResult, pingErr := Ping(job.IP, p.timeout)
+			if pingErr != nil {
+				if jobNum <= 3 {
+					log.Printf("Worker %d: Error pinging %s: %v", id, job.IP, pingErr)
+				}
+				result = &TraceResult{
+					DestIP:    job.IP.String(),
+					Hops:      []Hop{},
+					Reached:   false,
+					Timestamp: time.Now(),
+				}
+			} else {
+				// Convert PingResult to TraceResult format
+				result = &TraceResult{
+					DestIP:    pingResult.DestIP,
+					Reached:   pingResult.Reachable,
+					Timestamp: pingResult.Timestamp,
+					Duration:  pingResult.Duration,
+				}
+				if pingResult.Reachable {
+					// Add single hop representing the destination
+					result.Hops = []Hop{
+						{
+							TTL:     pingResult.TTL,
+							IP:      pingResult.DestIP,
+							RTT:     pingResult.RTT,
+							Timeout: false,
+						},
+					}
+				} else {
+					result.Hops = []Hop{}
+				}
 			}
-			// Send error result
-			result = &TraceResult{
-				DestIP:    job.IP.String(),
-				Hops:      []Hop{},
-				Reached:   false,
-				Timestamp: time.Now(),
+		} else if p.mode == "raw" {
+			result, err = Traceroute(job.IP, p.maxHops, p.timeout)
+			if err != nil {
+				if jobNum <= 3 {
+					log.Printf("Worker %d: Error tracing %s: %v", id, job.IP, err)
+				}
+				result = &TraceResult{
+					DestIP:    job.IP.String(),
+					Hops:      []Hop{},
+					Reached:   false,
+					Timestamp: time.Now(),
+				}
+			}
+		} else {
+			// External mode
+			result, err = TracerouteExternal(job.IP, p.maxHops, p.timeout)
+			if err != nil {
+				if jobNum <= 3 {
+					log.Printf("Worker %d: Error tracing %s: %v", id, job.IP, err)
+				}
+				result = &TraceResult{
+					DestIP:    job.IP.String(),
+					Hops:      []Hop{},
+					Reached:   false,
+					Timestamp: time.Now(),
+				}
 			}
 		}
 

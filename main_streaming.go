@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func mainStreamingMode(ipRange, output *string, workers, maxHops *int, timeout *time.Duration, mode *string, shuffle *bool, shuffleSeed *uint64, onePer24 *bool, fresh, archive *bool) {
+func mainStreamingMode(ipRange, output *string, workers, maxHops *int, timeout *time.Duration, mode *string, shuffle *bool, shuffleSeed *uint64, onePer24 *bool, pingOnly *bool, fresh, archive *bool) {
 
 	// Create IP range iterator
 	iterator, err := NewIPRangeIteratorFromString(*ipRange)
@@ -160,7 +160,11 @@ func mainStreamingMode(ipRange, output *string, workers, maxHops *int, timeout *
 		shuffleMode = fmt.Sprintf("shuffled (seed: %d)", seed)
 	}
 
-	fmt.Printf("Mode: %s (streaming), Workers: %d, Max Hops: %d, Timeout: %v\n", *mode, *workers, *maxHops, *timeout)
+	modeStr := *mode
+	if *pingOnly {
+		modeStr = "ping"
+	}
+	fmt.Printf("Mode: %s (streaming), Workers: %d, Max Hops: %d, Timeout: %v\n", modeStr, *workers, *maxHops, *timeout)
 	fmt.Printf("Scan order: %s\n", shuffleMode)
 	fmt.Printf("Output: %s\n", *output)
 	fmt.Printf("Progress: %s\n\n", checkpoint.filename)
@@ -214,7 +218,7 @@ func mainStreamingMode(ipRange, output *string, workers, maxHops *int, timeout *
 	}
 
 	// Create worker pool
-	pool := NewWorkerPool(*workers, *maxHops, *timeout, *mode)
+	pool := NewWorkerPool(*workers, *maxHops, *timeout, *mode, *pingOnly)
 	pool.Start()
 
 	// Feed IPs to workers from generator

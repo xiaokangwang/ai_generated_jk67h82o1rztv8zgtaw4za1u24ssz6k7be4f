@@ -13,7 +13,7 @@ func TestNewWorkerPool(t *testing.T) {
 	timeout := 3 * time.Second
 	mode := "external"
 
-	pool := NewWorkerPool(workers, maxHops, timeout, mode)
+	pool := NewWorkerPool(workers, maxHops, timeout, mode, false)
 
 	if pool.workers != workers {
 		t.Errorf("Expected %d workers, got %d", workers, pool.workers)
@@ -37,7 +37,7 @@ func TestNewWorkerPool(t *testing.T) {
 }
 
 func TestWorkerPoolStartAndWait(t *testing.T) {
-	pool := NewWorkerPool(2, 30, time.Second, "external")
+	pool := NewWorkerPool(2, 30, time.Second, "external", false)
 
 	// Start pool
 	pool.Start()
@@ -64,7 +64,7 @@ func TestWorkerPoolStartAndWait(t *testing.T) {
 }
 
 func TestWorkerPoolSubmit(t *testing.T) {
-	pool := NewWorkerPool(1, 30, time.Second, "external")
+	pool := NewWorkerPool(1, 30, time.Second, "external", false)
 	pool.Start()
 
 	results := make(chan *TraceResult, 10)
@@ -91,7 +91,7 @@ func TestWorkerPoolSubmit(t *testing.T) {
 }
 
 func TestWorkerPoolMultipleJobs(t *testing.T) {
-	pool := NewWorkerPool(3, 30, time.Second, "external")
+	pool := NewWorkerPool(3, 30, time.Second, "external", false)
 	pool.Start()
 
 	results := make(chan *TraceResult, 10)
@@ -134,7 +134,7 @@ func TestWorkerPoolConcurrency(t *testing.T) {
 	workerCount := 5
 	jobCount := 50
 
-	pool := NewWorkerPool(workerCount, 30, time.Second, "external")
+	pool := NewWorkerPool(workerCount, 30, time.Second, "external", false)
 	pool.Start()
 
 	results := make(chan *TraceResult, jobCount)
@@ -166,7 +166,7 @@ func TestWorkerPoolConcurrency(t *testing.T) {
 }
 
 func TestWorkerPoolResultStructure(t *testing.T) {
-	pool := NewWorkerPool(1, 30, time.Second, "external")
+	pool := NewWorkerPool(1, 30, time.Second, "external", false)
 	pool.Start()
 
 	results := make(chan *TraceResult, 1)
@@ -198,7 +198,7 @@ func TestWorkerPoolResultStructure(t *testing.T) {
 
 func TestWorkerPoolTimeout(t *testing.T) {
 	// Use very short timeout to test timeout handling
-	pool := NewWorkerPool(1, 30, 100*time.Millisecond, "external")
+	pool := NewWorkerPool(1, 30, 100*time.Millisecond, "external", false)
 	pool.Start()
 
 	results := make(chan *TraceResult, 1)
@@ -238,7 +238,7 @@ func TestWorkerPoolJobStructure(t *testing.T) {
 }
 
 func TestWorkerPoolEmptyJobs(t *testing.T) {
-	pool := NewWorkerPool(2, 30, time.Second, "external")
+	pool := NewWorkerPool(2, 30, time.Second, "external", false)
 	pool.Start()
 
 	// Don't submit any jobs, just wait
@@ -258,7 +258,7 @@ func TestWorkerPoolEmptyJobs(t *testing.T) {
 
 func TestWorkerPoolZeroWorkers(t *testing.T) {
 	// Edge case: 0 workers - just test creation and cleanup
-	pool := NewWorkerPool(0, 30, time.Second, "external")
+	pool := NewWorkerPool(0, 30, time.Second, "external", false)
 
 	if pool.workers != 0 {
 		t.Errorf("Expected 0 workers, got %d", pool.workers)
@@ -287,7 +287,7 @@ func TestWorkerPoolModeSelection(t *testing.T) {
 
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
-			pool := NewWorkerPool(1, 30, time.Second, mode)
+			pool := NewWorkerPool(1, 30, time.Second, mode, false)
 			if pool.mode != mode {
 				t.Errorf("Expected mode %s, got %s", mode, pool.mode)
 			}
@@ -297,7 +297,7 @@ func TestWorkerPoolModeSelection(t *testing.T) {
 
 func TestWorkerPoolJobBuffer(t *testing.T) {
 	workers := 2
-	pool := NewWorkerPool(workers, 30, time.Second, "external")
+	pool := NewWorkerPool(workers, 30, time.Second, "external", false)
 
 	// Job channel buffer should be workers * 2
 	expectedBuffer := workers * 2
@@ -309,7 +309,7 @@ func TestWorkerPoolJobBuffer(t *testing.T) {
 }
 
 func TestWorkerPoolMultipleSubmitsBeforeStart(t *testing.T) {
-	pool := NewWorkerPool(2, 30, time.Second, "external")
+	pool := NewWorkerPool(2, 30, time.Second, "external", false)
 
 	results := make(chan *TraceResult, 10)
 	ips := []net.IP{
@@ -340,7 +340,7 @@ func TestWorkerPoolMultipleSubmitsBeforeStart(t *testing.T) {
 }
 
 func TestWorkerPoolResultTimestamp(t *testing.T) {
-	pool := NewWorkerPool(1, 30, time.Second, "external")
+	pool := NewWorkerPool(1, 30, time.Second, "external", false)
 	pool.Start()
 
 	results := make(chan *TraceResult, 1)
