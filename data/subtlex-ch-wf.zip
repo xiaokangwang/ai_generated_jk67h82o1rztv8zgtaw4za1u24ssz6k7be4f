@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="nl">
+    <head>
+        <meta charset="UTF-8">
+        <title>UGent - Not Found</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <link rel="stylesheet" href="/_error/static/css/screen.css">
+        <link rel="apple-touch-icon" sizes="57x57" href="/_error/static/icons/apple-icon-57x57.png" />
+        <link rel="apple-touch-icon" sizes="60x60" href="/_error/static/icons/apple-icon-60x60.png" />
+        <link rel="apple-touch-icon" sizes="72x72" href="/_error/static/icons/apple-icon-72x72.png" />
+        <link rel="apple-touch-icon" sizes="76x76" href="/_error/static/icons/apple-icon-76x76.png" />
+        <link rel="apple-touch-icon" sizes="114x114" href="/_error/static/icons/apple-icon-114x114.png" />
+        <link rel="apple-touch-icon" sizes="120x120" href="/_error/static/icons/apple-icon-120x120.png" />
+        <link rel="apple-touch-icon" sizes="144x144" href="/_error/static/icons/apple-icon-144x144.png" />
+        <link rel="apple-touch-icon" sizes="152x152" href="/_error/static/icons/apple-icon-152x152.png" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/_error/static/icons/apple-icon-180x180.png" />
+        <link rel="icon" type="image/png" sizes="192x192" href="/_error/static/icons/android-icon-192x192.png" />
+        <link rel="icon" type="image/png" sizes="96x96" href="/_error/static/icons/favicon-96x96.png" />
+        <link rel="icon" type="image/png" sizes="32x32" href="/_error/static/icons/favicon-32x32.png" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/_error/static/icons/favicon-16x16.png" />
+        <link rel="icon" sizes="16x16 32x32" href="/_error/static/icons/favicon.ico" />
+        <link rel="manifest" href="/_error/static/icons/manifest.json" />
+        <meta name="msapplication-TileColor" content="#ffffff" />
+        <meta name="msapplication-TileImage" content="/_error/static/icons/ms-icon-144x144.png" />
+        <meta name="theme-color" content="#ffffff" />
+    </head>
+    <body>
+        <!-- Piwik Tag Manager -->
+        <script type="text/javascript">
+            (function(window, document, dataLayerName, id) {
+            window[dataLayerName]=window[dataLayerName]||[],window[dataLayerName].push({start:(new Date).getTime(),event:"stg.start"});var scripts=document.getElementsByTagName('script')[0],tags=document.createElement('script');
+            function stgCreateCookie(a,b,c){var d="";if(c){var e=new Date;e.setTime(e.getTime()+24*c*60*60*1e3),d="; expires="+e.toUTCString()}document.cookie=a+"="+b+d+"; path=/"}
+            var isStgDebug=(window.location.href.match("stg_debug")||document.cookie.match("stg_debug"))&&!window.location.href.match("stg_disable_debug");stgCreateCookie("stg_debug",isStgDebug?1:"",isStgDebug?14:-1);
+            var qP=[];dataLayerName!=="dataLayer"&&qP.push("data_layer_name="+dataLayerName),isStgDebug&&qP.push("stg_debug");var qPString=qP.length>0?("?"+qP.join("&")):"";
+            tags.async=!0,tags.src="https://ugent.containers.piwik.pro/"+id+".js"+qPString,scripts.parentNode.insertBefore(tags,scripts);
+            !function(a,n,i){a[n]=a[n]||{};for(var c=0;c<i.length;c++)!function(i){a[n][i]=a[n][i]||{},a[n][i].api=a[n][i].api||function(){var a=[].slice.call(arguments,0);"string"==typeof a[0]&&window[dataLayerName].push({event:n+"."+i+":"+a[0],parameters:[].slice.call(arguments,1)})}}(i[c])}(window,"ppms",["tm","cm"]);
+            })(window, document, 'dataLayer', 'e1b032d5-e42b-42b5-8b73-ea4347239c3d');
+        </script>
+        <!-- End Piwik Tag Manager -->
+        <div class="fluid-container">
+            <div class="row">
+                <header class="pageheader col-xs-12 ">
+                    <nav class="navbar navbar-default">
+                        <div class="row">
+                            <div class="navbar-header col-xs-12 col-sm-2">
+                                <div class="page-logo">
+                                    <a href="https://www.ugent.be" class="link"> <img src="/_error/static/images/logo_ugent_nl.svg" alt="Universiteit Gent"> </a>
+                                </div>
+                            </div>
+                            <div id="navbar" class="collapse navbar-collapse col-sm-10" role="navigation">
+                                <div class="row menu">
+                                    <div class="col-xs-12">
+                                        <div class="bg-primary spacer">
+                                            <div class="row">
+                                                <div class="col-xs-12">
+                                                    <ul class="nav-tertiary nav navbar-nav navbar-right">
+                                                        <li>
+                                                            <a href="https://www.ugent.be"> <span>Home UGent</span> </a>
+                                                        </li>
+                                                    </ul>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </nav>
+                    <div class="row">
+                        <div class="col-xs-12 col-sm-6 col-sm-offset-2 branding-container faculty-1">
+                            <h1></h1>
+                        </div>
+                    </div>
+                </header>
+            </div>
+        </div>
+        <div class="fluid-container">
+            <div class="row mtop-default mbottom-small">
+                <div class="col-xs-12 col-sm-3 ipad-col-sm3 hidden-xs">
+                    <div class="bg-primary full-width image-panel"> <img class="image" src="/_error/static/images/illustration-errorpage.png" /> </div>
+                </div>
+                <article id="portal-column-content" class="cell width-full position-0 col-sm-9 mbottom-large">
+                    <div id="viewlet-above-content"> </div>
+                    <div class="">
+                        <div class="alert alert-info alert-dismissible fade-in" role="alert" id="kssPortalMessage" style="display:none">
+                            <button aria-label="Close" data-dismiss="alert" class="close" type="button"><span aria-hidden="true">×</span></button> <strong>Info</strong> </div>
+                        <div id="content">
+                            <div class="padding-20 bg-tertiary mbottom-default">
+                                <h1 class="documentFirstHeading">Onze excuses / Our apologies</h1>
+                                <h2>404 Not Found</h2>
+                                <p>De pagina die u zonet heeft opgevraagd, bestaat niet op dit webadres. Deze pagina werd mogelijk verplaatst, vervangen of verwijderd.</p>
+                                <p>The page you requested does not exist at this web address. It may have been moved, replaced or deleted.</p>
+                            </div>
+                            <div class="pbottom-default mbottom-default border-bottom">
+                                <h3>Wat kunt u doen?</h3>
+                                <p>Als u denkt dat dit een fout is, kan u dit melden aan <a href="https://www.ugent.be/feedback">het portaalteam</a>. Gelieve de foutieve url en/of pagina die tot deze error leidde te vermelden.<br />Wij zullen het probleem zo snel mogelijk proberen oplossen en u waar mogelijk doorsturen naar de juiste pagina.</p>
+                            </div>
+                            <div class="pbottom-default mbottom-default border-bottom">
+                                <h3>What actions can you take?</h3>
+                                <p>If you think this is a mistake, you can report this to <a href="https://www.ugent.be/feedback">the portal team</a>. Please include the erroneous url and/or page that lead to this error.<br />We will try to solve the problem as soon as possible and if applicable point you to the correct page.</p>
+                            </div>
+                        </div>
+                    </div>
+                </article>
+            </div>
+        </div>
+        <footer class="page-footer fluid-container">
+            <div class="row">
+                <div class="col-xs-12">
+                    <div class="bg-primary padding-20">
+                        <div class="row">
+                            <div class="container-share col-xs-12 col-sm-4">
+                                <ul class="list-inline list-unstyled social">
+                                    <li>
+                                        <a href="http://www.facebook.com/ugent"> <i class="fa fa-facebook"></i><span class="sr-only">Facebook</span> </a>
+                                    </li>
+                                    <li>
+                                        <a href="http://www.twitter.com/ugent"> <i class="fa fa-twitter"></i><span class="sr-only">Twitter</span> </a>
+                                    </li>
+                                    <li>
+                                        <a href="http://www.linkedin.com/company/ghent-university"> <i class="fa fa-linkedin"></i><span class="sr-only">LinkedIn</span> </a>
+                                    </li>
+                                    <li>
+                                        <a href="http://www.youtube.com/user/UniversiteitGent"> <i class="fa fa-youtube"></i><span class="sr-only">YouTube</span> </a>
+                                    </li>
+                                    <li>
+                                        <a href="https://www.instagram.com/ugent/"> <i class="fa fa-instagram"></i><span class="sr-only">Instagram</span> </a>
+                                    </li>
+                                </ul>
+                            </div>
+                            <div class="col-xs-12 col-sm-8">
+                                <ul class="list-inline list-unstyled pull-right" id="footeractions">
+                                    <li id="siteaction-feedback"><a href="https://www.ugent.be/nl/feedback" title="Feedback">Feedback</a></li>
+                                    <li id="siteaction-privacy"><a href="https://www.ugent.be/nl/privacy" title="Privacy">Privacy</a></li>
+                                    <li id="siteaction-disclaimer"><a href="https://www.ugent.be/nl/disclaimer" title="Disclaimer">Disclaimer</a></li>
+                                    <li id="siteaction-cookies"><a href="https://www.ugent.be/nl/cookies" title="Cookies">Cookies</a></li>
+                                    <li id="siteaction-accessibility"><a href="https://www.ugent.be/nl/voorzieningen/ict/portaal/toegankelijkheid.htm" title="Toegankelijkheid">Toegankelijkheid</a></li>
+                                    <li>© 2026 Universiteit Gent</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </footer>
+        <script>
+            const ref = document.referrer || document.location; 
+            if(ref) {
+                document.querySelectorAll('a[href$="feedback"]').forEach(function(link) {
+                    link.href += "?came_from=" + encodeURIComponent(ref);
+                }); 
+            }
+        </script>
+    </body>
+</html>
