@@ -145,7 +145,17 @@
 
 ## Version History
 
-### v1.8 (Current) - Complete Jun Da Frequency Integration
+### v1.9 (Current) - Tab Mode Switching for Mixed Language
+- ✅ Added Tab key to switch between Pinyin and Direct modes
+- ✅ **Pinyin Mode**: Normal Chinese input with candidate selection
+- ✅ **Direct Mode**: Type English, punctuation, and mixed content directly
+- ✅ Visual mode indicators (color-coded output and status)
+- ✅ Mode-specific help text and controls
+- ✅ Seamless mixed Chinese-English content creation
+- Modified: `src/main.rs` - Added InputMode enum and mode switching logic
+- Added: `TAB_MODE_SWITCHING.md` - Complete feature documentation
+
+### v1.8 - Complete Jun Da Frequency Integration
 - ✅ Added user-provided Jun Da frequency data (259K+ entries)
 - ✅ Integrated Bigram(2).txt: 144,132 2-character words
 - ✅ Integrated Bigram(3).txt: 102,546 2-character words (alternate source)
@@ -306,6 +316,7 @@
 7. ✅ "Use frequency and bigger database" - COMPLETE
 8. ✅ "Add each and every word frequency from Jun Da's website" - COMPLETE
 9. ✅ "Add additional word frequency data from user-data/" - COMPLETE
+10. ✅ "Tab to switch to direct mode for mixed language content" - COMPLETE
 
 **Overall Status**: All user requests implemented and verified ✅
 

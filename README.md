@@ -9,6 +9,9 @@ A Terminal User Interface (TUI) application for Chinese pinyin input, built with
   - **Full pinyin with tones**: `ni3hao3` → 你好 (highest priority)
   - **Abbreviated with tones**: `n3h3` → 你好 (medium priority)
   - **Fuzzy search without tones**: `nihao` → 你好 (lowest priority)
+- **Tab mode switching**: Switch between Pinyin and Direct typing modes
+  - **Pinyin Mode**: Normal Chinese input with suggestions
+  - **Direct Mode**: Type English, punctuation, mixed content directly
 - **Frequency-based sorting**: Most common characters appear first
 - **Large database**: 120,604 entries from CC-CEDICT
 - **Comprehensive frequency data**:
@@ -81,16 +84,22 @@ When you exit the application (Esc, Ctrl+C, or Ctrl+Q), your typed Chinese text 
 
 3. **Select a character**:
    - Press `Space` to select the highlighted suggestion (primary method)
-   - Alternatively, press `Enter` or `Tab`
+   - Alternatively, press `Enter`
    - Press `1-9` to directly select by number
    - The selected characters will appear in the output area
 
-4. **Delete**:
+4. **Mixed language input** (NEW):
+   - Press `Tab` to switch to Direct Mode
+   - In Direct Mode, type English, punctuation, etc. directly
+   - Press `Tab` again to return to Pinyin Mode
+   - Perfect for mixed Chinese-English content!
+
+5. **Delete**:
    - Press `Backspace` to delete from the input buffer
    - If input is empty, `Backspace` deletes from the output
 
-5. **Exit**: Press `Ctrl+C`, `Ctrl+Q`, or `Esc` to exit
-   - Your typed Chinese text will be output to stdout
+6. **Exit**: Press `Ctrl+C`, `Ctrl+Q`, or `Esc` to exit
+   - Your typed text will be output to stdout
    - Easy to copy from terminal or redirect to file/clipboard
 
 ### Important: Tone Number Input
