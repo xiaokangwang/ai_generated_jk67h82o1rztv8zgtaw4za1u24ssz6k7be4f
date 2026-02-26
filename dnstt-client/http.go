@@ -47,6 +47,13 @@ type HTTPPacketConn struct {
 	notBefore     time.Time
 	notBeforeLock sync.RWMutex
 
+	// Optional callbacks for observing server behavior.
+	// OnRateLimit is called when the server returns a Retry-After and the
+	// connection is being rate-limited until the given time.
+	OnRateLimit func(time.Time)
+	// OnResponse is called when a successful response is received.
+	OnResponse func()
+
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// sendLoop, via send, removes messages from the outgoing queue that
 	// were placed there by WriteTo, and inserts messages into the incoming
@@ -98,6 +105,9 @@ func (c *HTTPPacketConn) send(p []byte) error {
 		body, err := ioutil.ReadAll(io.LimitReader(resp.Body, 64000))
 		if err == nil {
 			c.QueuePacketConn.QueueIncoming(body, turbotunnel.DummyAddr{})
+			if c.OnResponse != nil {
+				c.OnResponse()
+			}
 		}
 		// Ignore err != nil; don't report an error if we at least
 		// managed to send.
@@ -131,6 +141,9 @@ func (c *HTTPPacketConn) send(p []byte) error {
 				log.Printf("got %+q; ceasing sending for %v",
 					resp.Status, retryAfter.Sub(now))
 				c.notBefore = retryAfter
+				if c.OnRateLimit != nil {
+					c.OnRateLimit(retryAfter)
+				}
 			}
 			c.notBeforeLock.Unlock()
 		}

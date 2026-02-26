@@ -240,6 +240,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 func main() {
 	var dohURL string
 	var dotAddr string
+	var obsFile string
 	var pubkeyFilename string
 	var pubkeyString string
 	var udpAddr string
@@ -279,6 +280,7 @@ Known TLS fingerprints for -utls are:
 	}
 	flag.StringVar(&dohURL, "doh", "", "URL of DoH resolver")
 	flag.StringVar(&dotAddr, "dot", "", "address of DoT resolver")
+	flag.StringVar(&obsFile, "obs-file", "dnstt_observations.json", "path to write server health observations JSON (empty to disable)")
 	flag.StringVar(&pubkeyString, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "read server public key from file")
 	flag.StringVar(&udpAddr, "udp", "", "address of UDP DNS resolver")
@@ -337,35 +339,61 @@ Known TLS fingerprints for -utls are:
 		log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
 	}
 
-	// Iterate over the remote resolver address options and select one and
-	// only one.
-	var remoteAddr net.Addr
-	var pconn net.PacketConn
-	for _, opt := range []struct {
-		s string
-		f func(string) (net.Addr, net.PacketConn, error)
-	}{
-		// -doh
-		{dohURL, func(s string) (net.Addr, net.PacketConn, error) {
+	// Build a list of servers from the flags. Each of -doh, -dot, and -udp may
+	// contain a comma-separated list of endpoints.
+	type serverSpec struct{ kind, val string }
+	var specs []serverSpec
+	if dohURL != "" {
+		for _, s := range strings.Split(dohURL, ",") {
+			if strings.TrimSpace(s) != "" {
+				specs = append(specs, serverSpec{"doh", strings.TrimSpace(s)})
+			}
+		}
+	}
+	if dotAddr != "" {
+		for _, s := range strings.Split(dotAddr, ",") {
+			if strings.TrimSpace(s) != "" {
+				specs = append(specs, serverSpec{"dot", strings.TrimSpace(s)})
+			}
+		}
+	}
+	if udpAddr != "" {
+		for _, s := range strings.Split(udpAddr, ",") {
+			if strings.TrimSpace(s) != "" {
+				specs = append(specs, serverSpec{"udp", strings.TrimSpace(s)})
+			}
+		}
+	}
+	if len(specs) == 0 {
+		fmt.Fprintf(os.Stderr, "one of -doh, -dot, or -udp is required\n")
+		os.Exit(1)
+	}
+
+	// Create a DNSPacketConn for each server and collect serverInfo entries.
+	health := DefaultHealthConfig()
+	var serverInfos []*serverInfo
+	for _, spec := range specs {
+		switch spec.kind {
+		case "doh":
 			addr := turbotunnel.DummyAddr{}
 			var rt http.RoundTripper
 			if utlsClientHelloID == nil {
 				transport := http.DefaultTransport.(*http.Transport).Clone()
-				// Disable DefaultTransport's default Proxy =
-				// ProxyFromEnvironment setting, for conformity
-				// with utlsRoundTripper and with DoT mode,
-				// which do not take a proxy from the
-				// environment.
 				transport.Proxy = nil
 				rt = transport
 			} else {
 				rt = NewUTLSRoundTripper(nil, utlsClientHelloID)
 			}
-			pconn, err := NewHTTPPacketConn(rt, dohURL, 32)
-			return addr, pconn, err
-		}},
-		// -dot
-		{dotAddr, func(s string) (net.Addr, net.PacketConn, error) {
+			httpConn, err := NewHTTPPacketConn(rt, spec.val, 32)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			dnsConn := NewDNSPacketConn(httpConn, addr, domain)
+			si := &serverInfo{name: spec.val, dnsConn: dnsConn, addr: addr}
+			wireHealthCallbacks(si, dnsConn, httpConn, health)
+			serverInfos = append(serverInfos, si)
+		case "dot":
 			addr := turbotunnel.DummyAddr{}
 			var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 			if utlsClientHelloID == nil {
@@ -375,39 +403,41 @@ Known TLS fingerprints for -utls are:
 					return utlsDialContext(ctx, network, addr, nil, utlsClientHelloID)
 				}
 			}
-			pconn, err := NewTLSPacketConn(dotAddr, dialTLSContext)
-			return addr, pconn, err
-		}},
-		// -udp
-		{udpAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			addr, err := net.ResolveUDPAddr("udp", s)
+			tlsConn, err := NewTLSPacketConn(spec.val, dialTLSContext)
 			if err != nil {
-				return nil, nil, err
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
 			}
-			pconn, err := net.ListenUDP("udp", nil)
-			return addr, pconn, err
-		}},
-	} {
-		if opt.s == "" {
-			continue
+			dnsConn := NewDNSPacketConn(tlsConn, addr, domain)
+			si := &serverInfo{name: spec.val, dnsConn: dnsConn, addr: addr}
+			wireHealthCallbacks(si, dnsConn, nil, health)
+			serverInfos = append(serverInfos, si)
+		case "udp":
+			raddr, err := net.ResolveUDPAddr("udp", spec.val)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			conn, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			dnsConn := NewDNSPacketConn(conn, raddr, domain)
+			si := &serverInfo{name: spec.val, dnsConn: dnsConn, addr: raddr}
+			wireHealthCallbacks(si, dnsConn, nil, health)
+			serverInfos = append(serverInfos, si)
 		}
-		if pconn != nil {
-			fmt.Fprintf(os.Stderr, "only one of -doh, -dot, and -udp may be given\n")
-			os.Exit(1)
-		}
-		var err error
-		remoteAddr, pconn, err = opt.f(opt.s)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}
-	if pconn == nil {
-		fmt.Fprintf(os.Stderr, "one of -doh, -dot, or -udp is required\n")
-		os.Exit(1)
 	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
+	// Create a MultiDNSPacketConn that aggregates all server DNS conns.
+	multi := NewMultiDNSPacketConn(serverInfos, obsFile, health)
+	defer multi.Close()
+
+	// Use a dummy remote addr for KCP; the multi conn handles multiple remotes.
+	remoteAddr := turbotunnel.DummyAddr{}
+	pconn := multi
+
 	err = run(pubkey, domain, localAddr, remoteAddr, pconn)
 	if err != nil {
 		log.Fatal(err)

@@ -1,0 +1,37 @@
+{
+  "servers": [
+    {
+      "name": "good",
+      "working": false,
+      "not_before": "2026-02-26T20:17:26.357689092Z",
+      "requests": 3,
+      "rate_estimate": 2.5,
+      "tokens_avail": 17.0002669,
+      "recheck_backoff": "0s"
+    },
+    {
+      "name": "delayed",
+      "working": false,
+      "not_before": "2026-02-26T20:17:26.357689092Z",
+      "requests": 1,
+      "rate_estimate": 5,
+      "tokens_avail": 19,
+      "recheck_backoff": "0s"
+    },
+    {
+      "name": "invalid",
+      "working": false,
+      "not_before": "2026-02-26T20:17:26.357689092Z",
+      "requests": 1,
+      "rate_estimate": 5,
+      "tokens_avail": 19,
+      "recheck_backoff": "0s"
+    }
+  ],
+  "routing": {
+    "phase1_writes": 5,
+    "phase2_writes": 0,
+    "phase3_writes": 0,
+    "phase4_writes": 0
+  }
+}

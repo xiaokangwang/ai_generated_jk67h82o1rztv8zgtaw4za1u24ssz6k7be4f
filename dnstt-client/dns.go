@@ -62,6 +62,9 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+	// Optional callbacks for observers.
+	OnInvalidResponse  func(error)
+	OnResponseReceived func()
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -126,6 +129,13 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 	payload, err := dns.DecodeRDataTXT(answer.Data)
 	if err != nil {
 		return nil
+	}
+	// DecodeRDataTXT may return (nil, nil) for a valid but empty TXT
+	// record (e.g., poll responses with no downstream data). Normalize
+	// to a non-nil empty slice so callers can distinguish "valid empty
+	// response" from "invalid/unparseable response" (which is nil).
+	if payload == nil {
+		payload = []byte{}
 	}
 
 	return payload
@@ -198,10 +208,28 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		resp, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
 			log.Printf("MessageFromWireFormat: %v", err)
+			if c.OnInvalidResponse != nil {
+				c.OnInvalidResponse(err)
+			}
 			continue
 		}
 
 		payload := dnsResponsePayload(&resp, c.domain)
+		if payload == nil {
+			// Invalid or unexpected response contents.
+			if c.OnInvalidResponse != nil {
+				c.OnInvalidResponse(nil)
+			}
+			continue
+		}
+
+		// Notify observers that we've received a valid DNS response,
+		// regardless of whether it contains data packets. This is
+		// important so that the health checker knows the server is alive
+		// even when it responds with an empty payload.
+		if c.OnResponseReceived != nil {
+			c.OnResponseReceived()
+		}
 
 		// Pull out the packets contained in the payload.
 		r := bytes.NewReader(payload)
@@ -215,10 +243,7 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			c.QueuePacketConn.QueueIncoming(p, addr)
 		}
 
-		// If the payload contained one or more packets, permit sendLoop
-		// to poll immediately. ACKs on received data will effectively
-		// serve as another stream of polls whose rate is proportional
-		// to the rate of incoming packets.
+		// If the response carried data, permit an immediate poll.
 		if any {
 			select {
 			case c.pollChan <- struct{}{}:
@@ -256,29 +281,29 @@ func chunks(p []byte, n int) [][]byte {
 //
 //  0. Start with the raw packet contents.
 //
-//	supercalifragilisticexpialidocious
+//     supercalifragilisticexpialidocious
 //
 //  1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
 //     means a data packet of L bytes. A length prefix L ≥ 0xe0 means padding
 //     of L − 0xe0 bytes (not counting the length of the length prefix itself).
 //
-//	\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//     \xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
 //
 //  2. Prefix the ClientID.
 //
-//	CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//     CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
 //
 //  3. Base32-encode, without padding and in lower case.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
 //
 //  4. Break into labels of at most 63 octets.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
 //
 //  5. Append the domain.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	var decoded []byte
 	{
