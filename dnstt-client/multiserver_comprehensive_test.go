@@ -124,31 +124,31 @@ func TestMultiServerComprehensive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dA := NewDNSPacketConn(hA, turbotunnel.DummyAddr{}, domain)
+	dA := NewDNSPacketConn(hA, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 
 	hB, err := NewHTTPPacketConn(rt, b.URL, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dB := NewDNSPacketConn(hB, turbotunnel.DummyAddr{}, domain)
+	dB := NewDNSPacketConn(hB, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 
 	hC, err := NewHTTPPacketConn(rt, c.URL, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dC := NewDNSPacketConn(hC, turbotunnel.DummyAddr{}, domain)
+	dC := NewDNSPacketConn(hC, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 
 	hD, err := NewHTTPPacketConn(rt, d.URL, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dD := NewDNSPacketConn(hD, turbotunnel.DummyAddr{}, domain)
+	dD := NewDNSPacketConn(hD, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 
 	hE, err := NewHTTPPacketConn(rt, e.URL, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dE := NewDNSPacketConn(hE, turbotunnel.DummyAddr{}, domain)
+	dE := NewDNSPacketConn(hE, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 
 	// Create serverInfo entries and wire dnsConn callbacks to update state.
 	health := DefaultHealthConfig()

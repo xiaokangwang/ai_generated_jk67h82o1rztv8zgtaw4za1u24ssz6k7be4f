@@ -329,7 +329,7 @@ func newMockDNSServer(t *testing.T, behaviors []func(int) mockBehaviorResult) *m
 		reqCounts:         make([]int64, n),
 		ttConn:            ttConn,
 		kcpLn:             kcpLn,
-		ch:                make(chan *mockRecord, 100),
+		ch:                make(chan *mockRecord, 1024),
 		maxEncodedPayload: maxEncodedPayload,
 		stop:              make(chan struct{}),
 	}
@@ -580,7 +580,7 @@ func (s *mockDNSServer) acceptSessions(mtu int) {
 			return
 		}
 		conn.SetStreamMode(true)
-		conn.SetNoDelay(0, 0, 0, 1)
+		conn.SetNoDelay(1, 10, 2, 1)
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
@@ -666,7 +666,7 @@ func setupMockTunnel(t *testing.T, behaviors []func(int) mockBehaviorResult) *mo
 		if err != nil {
 			t.Fatal(err)
 		}
-		dnsConn := NewDNSPacketConn(conn, udpAddr, domain)
+		dnsConn := NewDNSPacketConn(conn, udpAddr, domain, turbotunnel.NewClientID())
 		si := &serverInfo{
 			name:    fmt.Sprintf("127.0.0.1:%d", udpAddr.Port),
 			dnsConn: dnsConn,
@@ -696,7 +696,7 @@ func setupMockTunnel(t *testing.T, behaviors []func(int) mockBehaviorResult) *mo
 		t.Fatalf("opening KCP conn: %v", err)
 	}
 	kcpConn.SetStreamMode(true)
-	kcpConn.SetNoDelay(0, 0, 0, 1)
+	kcpConn.SetNoDelay(1, 10, 2, 1)
 	kcpConn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 	if rc := kcpConn.SetMtu(mtu); !rc {
 		panic(rc)

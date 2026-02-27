@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,7 +131,7 @@ func TestMockRateLimit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		dnsConn := NewDNSPacketConn(conn, udpAddr, domain)
+		dnsConn := NewDNSPacketConn(conn, udpAddr, domain, turbotunnel.NewClientID())
 		si := &serverInfo{
 			name:    fmt.Sprintf("127.0.0.1:%d", udpAddr.Port),
 			dnsConn: dnsConn,
@@ -279,4 +282,137 @@ func TestMockObservations(t *testing.T) {
 		}
 	}
 	t.Logf("observations valid with %d total writes", totalWrites)
+}
+
+// TestMockHighVolumeLatency sends 8192 messages through the tunnel and records
+// the round-trip latency for each one. It uses pipelined I/O: a writer
+// goroutine sends messages as fast as the tunnel allows, while the main
+// goroutine reads echoes and records arrival times. This detects connection
+// stalls (stuck after N messages) and reports latency percentiles.
+func TestMockHighVolumeLatency(t *testing.T) {
+	const totalMessages = 8192
+	const stallTimeout = 30 * time.Second // no echo for this long = stuck
+
+	mt := setupMockTunnel(t, []func(int) mockBehaviorResult{
+		healthyBehavior(),
+		healthyBehavior(),
+		healthyBehavior(),
+	})
+	defer mt.cleanup()
+
+	conn, err := net.DialTimeout("tcp", mt.localAddr, 15*time.Second)
+	if err != nil {
+		t.Fatalf("dial tunnel: %v", err)
+	}
+	defer conn.Close()
+
+	// sendTimes records when each message was written.
+	sendTimes := make([]time.Time, totalMessages)
+	// latencies records the round-trip time for each echoed message.
+	var mu sync.Mutex
+	latencies := make([]time.Duration, 0, totalMessages)
+
+	// Track the highest consecutive message index that was sent, so we can
+	// report progress if the connection stalls.
+	var sent int64
+
+	// Writer goroutine: send all messages as fast as possible.
+	testStart := time.Now()
+	writerDone := make(chan error, 1)
+	go func() {
+		for i := 0; i < totalMessages; i++ {
+			msg := fmt.Sprintf("msg-%05d\n", i)
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			sendTimes[i] = time.Now()
+			_, err := conn.Write([]byte(msg))
+			if err != nil {
+				writerDone <- fmt.Errorf("write msg %d: %w", i, err)
+				return
+			}
+			atomic.StoreInt64(&sent, int64(i+1))
+		}
+		writerDone <- nil
+	}()
+
+	// Reader: collect echoes with stall detection.
+	received := 0
+	seen := make(map[string]bool, totalMessages)
+	reader := bufio.NewReaderSize(conn, 256*1024)
+	lastProgress := time.Now()
+
+	for received < totalMessages {
+		remaining := stallTimeout - time.Since(lastProgress)
+		if remaining <= 0 {
+			t.Fatalf("connection stalled: received %d/%d messages, sent %d, no echo for %v",
+				received, totalMessages, atomic.LoadInt64(&sent), stallTimeout)
+		}
+		conn.SetReadDeadline(time.Now().Add(remaining))
+
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+				continue
+			}
+			t.Fatalf("read error after %d/%d messages: %v", received, totalMessages, err)
+		}
+		recvTime := time.Now()
+		lastProgress = recvTime
+
+		key := string(line)
+		if seen[key] {
+			continue // duplicate (KCP retransmission)
+		}
+		seen[key] = true
+
+		// Parse message index to compute latency.
+		var idx int
+		if _, err := fmt.Sscanf(key, "msg-%05d\n", &idx); err != nil || idx < 0 || idx >= totalMessages {
+			continue // unexpected format
+		}
+
+		rtt := recvTime.Sub(sendTimes[idx])
+		mu.Lock()
+		latencies = append(latencies, rtt)
+		mu.Unlock()
+		received++
+	}
+
+	// Wait for writer to finish (it should be done by now).
+	if err := <-writerDone; err != nil {
+		t.Fatalf("writer error: %v", err)
+	}
+
+	// Sort latencies and compute percentiles.
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	n := len(latencies)
+	if n == 0 {
+		t.Fatal("no latencies recorded")
+	}
+	p := func(pct float64) time.Duration {
+		idx := int(float64(n-1) * pct)
+		return latencies[idx]
+	}
+
+	var sum time.Duration
+	for _, l := range latencies {
+		sum += l
+	}
+	avg := sum / time.Duration(n)
+
+	wallClock := time.Since(testStart)
+	t.Logf("=== High-Volume Latency Report (%d messages) ===", n)
+	t.Logf("  min    = %v", latencies[0])
+	t.Logf("  p50    = %v", p(0.50))
+	t.Logf("  p90    = %v", p(0.90))
+	t.Logf("  p95    = %v", p(0.95))
+	t.Logf("  p99    = %v", p(0.99))
+	t.Logf("  max    = %v", latencies[n-1])
+	t.Logf("  avg    = %v", avg)
+	t.Logf("  wall   = %v (first send to last echo)", wallClock)
+	t.Logf("  tput   = %.1f msg/s", float64(n)/wallClock.Seconds())
+
+	// Sanity: we should have gotten all messages.
+	if n < totalMessages {
+		t.Fatalf("only received %d/%d messages", n, totalMessages)
+	}
 }

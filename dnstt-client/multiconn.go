@@ -74,7 +74,7 @@ func DefaultHealthConfig() HealthConfig {
 		AIMDInterval:           2 * time.Second,
 		InitialRate:            10.0,
 		MinRate:                0.5,
-		MaxRate:                200.0,
+		MaxRate:                1000.0,
 		AdditiveIncrease:       2.0,
 		MultiplicativeDecrease: 0.5,
 		MaxTokens:              20.0,
@@ -163,11 +163,6 @@ type MultiDNSPacketConn struct {
 	stop      chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
-	// recent holds recent real outgoing packets for use when re-testing
-	// failed servers. Protected by recentMu.
-	recentMu  sync.Mutex
-	recent    [][]byte
-	maxRecent int
 
 	// candidatesPool recycles candidate slices to reduce GC pressure in
 	// the WriteTo hot path.
@@ -178,6 +173,37 @@ type MultiDNSPacketConn struct {
 	phase2Writes int64 // atomic: any working server (overdraft)
 	phase3Writes int64 // atomic: any non-rate-limited server
 	phase4Writes int64 // atomic: last-resort fallback
+}
+
+// loadPriorRates reads and parses the observation JSON file, returning a map
+// of server name → rate_estimate. Returns nil on any error (file missing,
+// corrupt JSON, etc). Reuses the same JSON shape that writeObservations produces.
+func loadPriorRates(path string) map[string]float64 {
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var doc struct {
+		Servers []struct {
+			Name         string  `json:"name"`
+			RateEstimate float64 `json:"rate_estimate"`
+		} `json:"servers"`
+	}
+	if err := json.NewDecoder(f).Decode(&doc); err != nil {
+		return nil
+	}
+	if len(doc.Servers) == 0 {
+		return nil
+	}
+	m := make(map[string]float64, len(doc.Servers))
+	for _, s := range doc.Servers {
+		m[s.Name] = s.RateEstimate
+	}
+	return m
 }
 
 // archiveObsFile renames an existing observation file to preserve it as a
@@ -204,16 +230,15 @@ func archiveObsFile(path string) {
 // to forward incoming packets from each underlying DNSPacketConn and an
 // observation writer that periodically writes status to obsFile.
 func NewMultiDNSPacketConn(servers []*serverInfo, obsFile string, health HealthConfig) *MultiDNSPacketConn {
+	priorRates := loadPriorRates(obsFile)
 	archiveObsFile(obsFile)
 	nServers := len(servers)
 	m := &MultiDNSPacketConn{
 		servers:   servers,
-		incoming:  make(chan taggedIncoming, 1024),
-		obsFile:   obsFile,
-		health:    health,
-		stop:      make(chan struct{}),
-		recent:    make([][]byte, 0, 100),
-		maxRecent: 100,
+		incoming: make(chan taggedIncoming, 1024),
+		obsFile:  obsFile,
+		health:   health,
+		stop:     make(chan struct{}),
 		candidatesPool: sync.Pool{
 			New: func() interface{} {
 				return make([]serverCandidate, 0, nServers)
@@ -226,8 +251,18 @@ func NewMultiDNSPacketConn(servers []*serverInfo, obsFile string, health HealthC
 		// Bug 1 fix: assume servers are working until proven otherwise.
 		atomic.StoreInt32(&s.working, 1)
 		s.lastResp.Store(time.Time{})
-		// Initialize AIMD rate estimation state.
+		// Initialize AIMD rate estimation state, seeding from prior
+		// observation if available.
 		s.rateEstimate = health.InitialRate
+		if rate, ok := priorRates[s.name]; ok {
+			if rate < health.MinRate {
+				rate = health.MinRate
+			}
+			if rate > health.MaxRate {
+				rate = health.MaxRate
+			}
+			s.rateEstimate = rate
+		}
 		s.tokens = health.MaxTokens
 		s.lastRefill = now
 
@@ -313,10 +348,12 @@ func (m *MultiDNSPacketConn) aimdLoop() {
 	}
 }
 
-// recheckLoop actively re-tests servers that are marked not working by sending
-// a real request periodically (not a synthetic probe). It respects per-server
-// notBefore rate-limit timestamps and uses exponential backoff so that
-// persistently failing servers are probed less frequently over time.
+// recheckLoop actively re-tests servers that are marked not working by
+// triggering an empty DNS poll. Unlike replaying real packets (which contain
+// KCP Conv IDs and cause the server to create zombie sessions), an empty poll
+// encodes only the ClientID + random padding — the server's recvLoop skips it
+// via nextPacket without calling QueueIncoming, but still sends back a DNS
+// response that triggers OnResponseReceived for recovery detection.
 func (m *MultiDNSPacketConn) recheckLoop() {
 	defer m.wg.Done()
 	ticker := time.NewTicker(m.health.RecheckInterval)
@@ -343,23 +380,10 @@ func (m *MultiDNSPacketConn) recheckLoop() {
 				if !si.lastRecheck.IsZero() && now.Sub(si.lastRecheck) < si.recheckBackoff {
 					continue
 				}
-				m.recentMu.Lock()
-				var pkt []byte
-				if len(m.recent) > 0 {
-					pkt = make([]byte, len(m.recent[len(m.recent)-1]))
-					copy(pkt, m.recent[len(m.recent)-1])
-				}
-				m.recentMu.Unlock()
-				if pkt == nil {
-					continue
-				}
 				si.lastSend.Store(now)
 				si.lastRecheck = now
 				atomic.AddInt64(&si.requestsSent, 1)
-				_, err := si.dnsConn.WriteTo(pkt, si.addr)
-				if err != nil {
-					log.Printf("recheck WriteTo %s: %v", si.name, err)
-				}
+				si.dnsConn.RequestPoll()
 				// Double the backoff for next probe, capped at max.
 				si.recheckBackoff *= 2
 				if si.recheckBackoff > m.health.MaxRecheckInterval {
@@ -441,15 +465,6 @@ func (m *MultiDNSPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if nServers == 0 {
 		return 0, nil
 	}
-	// Store a copy of this real outgoing packet for rechecks.
-	pcopy := make([]byte, len(p))
-	copy(pcopy, p)
-	m.recentMu.Lock()
-	m.recent = append(m.recent, pcopy)
-	if len(m.recent) > m.maxRecent {
-		m.recent = m.recent[1:]
-	}
-	m.recentMu.Unlock()
 
 	maxTokens := m.health.MaxTokens
 

@@ -28,7 +28,7 @@ func fastHealth() HealthConfig {
 		AIMDInterval:           300 * time.Millisecond,
 		InitialRate:            10.0,
 		MinRate:                0.5,
-		MaxRate:                200.0,
+		MaxRate:                1000.0,
 		AdditiveIncrease:       2.0,
 		MultiplicativeDecrease: 0.5,
 		MaxTokens:              20.0,
@@ -105,7 +105,7 @@ func makeServerInfo(t *testing.T, name string, ds *dohServer, domain dns.Name, h
 	if err != nil {
 		t.Fatal(err)
 	}
-	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain)
+	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 	si := &serverInfo{name: name, dnsConn: dc, addr: turbotunnel.DummyAddr{}}
 	wireHealthCallbacks(si, dc, hc, health)
 	return si
@@ -254,14 +254,14 @@ func TestWriteToAvoidsNonWorkingServers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dcGood := NewDNSPacketConn(hcGood, turbotunnel.DummyAddr{}, domain)
+	dcGood := NewDNSPacketConn(hcGood, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 	siGood := &serverInfo{name: "good", dnsConn: dcGood, addr: turbotunnel.DummyAddr{}}
 
 	hcBad, err := NewHTTPPacketConn(rt, bad.srv.URL, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dcBad := NewDNSPacketConn(hcBad, turbotunnel.DummyAddr{}, domain)
+	dcBad := NewDNSPacketConn(hcBad, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 	siBad := &serverInfo{name: "bad", dnsConn: dcBad, addr: turbotunnel.DummyAddr{}}
 
 	multi := NewMultiDNSPacketConn([]*serverInfo{siGood, siBad}, "", health)
@@ -368,7 +368,7 @@ func TestWriteToPhase3WhenAllNotWorking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain)
+	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 	si := &serverInfo{name: "s1", dnsConn: dc, addr: turbotunnel.DummyAddr{}}
 
 	multi := NewMultiDNSPacketConn([]*serverInfo{si}, "", health)
@@ -629,7 +629,7 @@ func TestRecheckBackoffDoubles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain)
+	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 	si := &serverInfo{name: "s1", dnsConn: dc, addr: turbotunnel.DummyAddr{}}
 
 	multi := NewMultiDNSPacketConn([]*serverInfo{si}, "", health)
@@ -637,13 +637,6 @@ func TestRecheckBackoffDoubles(t *testing.T) {
 
 	// Mark as not working AFTER construction (constructor resets to working=1).
 	atomic.StoreInt32(&si.working, 0)
-
-	// Directly populate the recent buffer so the recheck loop has data to
-	// send, without going through WriteTo (which would set lastSend and
-	// trigger the health loop's timeout detection / notBefore cycle).
-	multi.recentMu.Lock()
-	multi.recent = append(multi.recent, []byte("probe"))
-	multi.recentMu.Unlock()
 
 	// Wait for several recheck ticks.
 	time.Sleep(2 * time.Second)
@@ -957,7 +950,7 @@ func TestWireHealthCallbacksUsesConfigNotBeforeDelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain)
+	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 	si := &serverInfo{name: "test", dnsConn: dc, addr: turbotunnel.DummyAddr{}}
 
 	wireHealthCallbacks(si, dc, hc, health)
@@ -1056,7 +1049,7 @@ func TestWireHealthCallbacksOnRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain)
+	dc := NewDNSPacketConn(hc, turbotunnel.DummyAddr{}, domain, turbotunnel.NewClientID())
 	si := &serverInfo{name: "test", dnsConn: dc, addr: turbotunnel.DummyAddr{}}
 	atomic.StoreInt32(&si.working, 1)
 

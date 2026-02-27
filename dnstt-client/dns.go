@@ -8,12 +8,26 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
+	mrand "math/rand"
 	"net"
+	"sync"
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
+
+// fastRand is a per-goroutine-safe PRNG seeded from crypto/rand, used for DNS
+// query IDs and padding bytes that need randomness for cache-busting but not
+// cryptographic security. Avoids the syscall overhead of crypto/rand.Reader on
+// the hot send path.
+var fastRandPool = sync.Pool{
+	New: func() interface{} {
+		seed, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+		return mrand.New(mrand.NewSource(seed.Int64()))
+	},
+}
 
 const (
 	// How many bytes of random padding to insert into queries.
@@ -30,13 +44,13 @@ const (
 	// to a maximum of maxPollDelay. The poll timer is reset to
 	// initPollDelay whenever an a send occurs that is not the result of the
 	// poll timer expiring.
-	initPollDelay       = 500 * time.Millisecond
-	maxPollDelay        = 10 * time.Second
+	initPollDelay       = 50 * time.Millisecond
+	maxPollDelay        = 3 * time.Second
 	pollDelayMultiplier = 2.0
 
 	// A limit on the number of empty poll requests we may send in a burst
 	// as a result of receiving data.
-	pollLimit = 16
+	pollLimit = 128
 )
 
 // base32Encoding is a base32 encoding without padding.
@@ -74,10 +88,11 @@ type DNSPacketConn struct {
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
-// transport.WriteTo whenever a message needs to be sent.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
-	// Generate a new random ClientID.
-	clientID := turbotunnel.NewClientID()
+// transport.WriteTo whenever a message needs to be sent. clientID is the
+// tunnel-level identity that the server uses to correlate queries from the
+// same logical client; all DNSPacketConns that share a KCP session MUST use
+// the same ClientID.
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, clientID turbotunnel.ClientID) *DNSPacketConn {
 	c := &DNSPacketConn{
 		clientID:        clientID,
 		domain:          domain,
@@ -97,6 +112,15 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 		}
 	}()
 	return c
+}
+
+// RequestPoll triggers sendLoop to emit an empty polling query. The send is
+// non-blocking: if pollChan is already full, the request is silently dropped.
+func (c *DNSPacketConn) RequestPoll() {
+	select {
+	case c.pollChan <- struct{}{}:
+	default:
+	}
 }
 
 // dnsResponsePayload extracts the downstream payload of a DNS response, encoded
@@ -305,9 +329,13 @@ func chunks(p []byte, n int) [][]byte {
 //
 //     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
+	// Use fast PRNG for padding and query ID (cache-busting, not security).
+	rng := fastRandPool.Get().(*mrand.Rand)
+
 	var decoded []byte
 	{
 		if len(p) >= 224 {
+			fastRandPool.Put(rng)
 			return fmt.Errorf("too long")
 		}
 		var buf bytes.Buffer
@@ -319,7 +347,11 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 		}
 		// Padding / cache inhibition
 		buf.WriteByte(byte(224 + n))
-		io.CopyN(&buf, rand.Reader, int64(n))
+		padBytes := make([]byte, n)
+		for i := range padBytes {
+			padBytes[i] = byte(rng.Intn(256))
+		}
+		buf.Write(padBytes)
 		// Packet contents
 		if len(p) > 0 {
 			buf.WriteByte(byte(len(p)))
@@ -335,11 +367,12 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 	labels = append(labels, c.domain...)
 	name, err := dns.NewName(labels)
 	if err != nil {
+		fastRandPool.Put(rng)
 		return err
 	}
 
-	var id uint16
-	binary.Read(rand.Reader, binary.BigEndian, &id)
+	id := uint16(rng.Intn(65536))
+	fastRandPool.Put(rng)
 	query := &dns.Message{
 		ID:    id,
 		Flags: 0x0100, // QR = 0, RD = 1

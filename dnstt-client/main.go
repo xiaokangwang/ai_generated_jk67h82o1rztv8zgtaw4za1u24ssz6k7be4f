@@ -189,13 +189,16 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	log.Printf("begin session %08x", conn.GetConv())
 	// Permit coalescing the payloads of consecutive sends.
 	conn.SetStreamMode(true)
-	// Disable the dynamic congestion window (limit only by the maximum of
-	// local and remote static windows).
+	// Low-latency KCP configuration:
+	// - nodelay=1: reduce minimum RTO (30ms vs 100ms in normal mode)
+	// - interval=10: 10ms internal update (vs 100ms default), key for throughput
+	// - resend=2: fast retransmit after 2 duplicate ACKs (vs full RTO wait)
+	// - nc=1: disable congestion window (limit only by static windows)
 	conn.SetNoDelay(
-		0, // default nodelay
-		0, // default interval
-		0, // default resend
-		1, // nc=1 => congestion window off
+		1,  // nodelay
+		10, // 10ms update interval
+		2,  // fast resend after 2 dup ACKs
+		1,  // nc=1 => congestion window off
 	)
 	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 	if rc := conn.SetMtu(mtu); !rc {
@@ -369,6 +372,10 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
+	// All servers share a single ClientID so the dnstt server treats
+	// packets arriving via different DNS resolvers as one logical client.
+	clientID := turbotunnel.NewClientID()
+
 	// Create a DNSPacketConn for each server and collect serverInfo entries.
 	health := DefaultHealthConfig()
 	var serverInfos []*serverInfo
@@ -389,7 +396,7 @@ Known TLS fingerprints for -utls are:
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			dnsConn := NewDNSPacketConn(httpConn, addr, domain)
+			dnsConn := NewDNSPacketConn(httpConn, addr, domain, clientID)
 			si := &serverInfo{name: spec.val, dnsConn: dnsConn, addr: addr}
 			wireHealthCallbacks(si, dnsConn, httpConn, health)
 			serverInfos = append(serverInfos, si)
@@ -408,7 +415,7 @@ Known TLS fingerprints for -utls are:
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			dnsConn := NewDNSPacketConn(tlsConn, addr, domain)
+			dnsConn := NewDNSPacketConn(tlsConn, addr, domain, clientID)
 			si := &serverInfo{name: spec.val, dnsConn: dnsConn, addr: addr}
 			wireHealthCallbacks(si, dnsConn, nil, health)
 			serverInfos = append(serverInfos, si)
@@ -423,7 +430,7 @@ Known TLS fingerprints for -utls are:
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			dnsConn := NewDNSPacketConn(conn, raddr, domain)
+			dnsConn := NewDNSPacketConn(conn, raddr, domain, clientID)
 			si := &serverInfo{name: spec.val, dnsConn: dnsConn, addr: raddr}
 			wireHealthCallbacks(si, dnsConn, nil, health)
 			serverInfos = append(serverInfos, si)

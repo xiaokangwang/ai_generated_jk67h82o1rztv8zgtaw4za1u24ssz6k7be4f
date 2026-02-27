@@ -289,13 +289,16 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 		log.Printf("begin session %08x", conn.GetConv())
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
-		// Disable the dynamic congestion window (limit only by the
-		// maximum of local and remote static windows).
+		// Low-latency KCP configuration:
+		// - nodelay=1: reduce minimum RTO (30ms vs 100ms in normal mode)
+		// - interval=10: 10ms internal update (vs 100ms default)
+		// - resend=2: fast retransmit after 2 duplicate ACKs
+		// - nc=1: disable congestion window
 		conn.SetNoDelay(
-			0, // default nodelay
-			0, // default interval
-			0, // default resend
-			1, // nc=1 => congestion window off
+			1,  // nodelay
+			10, // 10ms update interval
+			2,  // fast resend after 2 dup ACKs
+			1,  // nc=1 => congestion window off
 		)
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 		if rc := conn.SetMtu(mtu); !rc {

@@ -7,8 +7,9 @@ package turbotunnel
 import "errors"
 
 // QueueSize is the size of send and receive queues in QueuePacketConn and
-// RemoteMap.
-const QueueSize = 128
+// RemoteMap. Must be large enough to absorb KCP burst flushes without
+// silently dropping packets (which forces costly retransmissions).
+const QueueSize = 2048
 
 var errClosedPacketConn = errors.New("operation on closed connection")
 var errNotImplemented = errors.New("not implemented")
