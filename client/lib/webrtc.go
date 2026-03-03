@@ -2,6 +2,7 @@ package snowflake_client
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -44,6 +45,55 @@ type WebRTCPeer struct {
 	bytesLogger  bytesLogger
 	eventsLogger event.SnowflakeEventReceiver
 	proxy        *url.URL
+}
+
+func sessionDescriptionForLog(desc *webrtc.SessionDescription) map[string]string {
+	if desc == nil {
+		return nil
+	}
+	return map[string]string{
+		"type": desc.Type.String(),
+		"sdp":  desc.SDP,
+	}
+}
+
+func iceServerURLsForLog(config *webrtc.Configuration) []string {
+	if config == nil {
+		return nil
+	}
+	urls := make([]string, 0, len(config.ICEServers))
+	for _, server := range config.ICEServers {
+		urls = append(urls, server.URLs...)
+	}
+	return urls
+}
+
+func (c *WebRTCPeer) logDiagnostic(stage string, err error, fields map[string]interface{}) {
+	entry := map[string]interface{}{
+		"component": "snowflake-client",
+		"subsystem": "webrtc",
+		"peer_id":   c.id,
+		"stage":     stage,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if c.pc != nil {
+		entry["peer_connection_state"] = c.pc.ConnectionState().String()
+		entry["ice_connection_state"] = c.pc.ICEConnectionState().String()
+		entry["ice_gathering_state"] = c.pc.ICEGatheringState().String()
+		entry["signaling_state"] = c.pc.SignalingState().String()
+	}
+	if err != nil {
+		entry["error"] = err.Error()
+	}
+	for k, v := range fields {
+		entry[k] = v
+	}
+	diagnostic, marshalErr := json.Marshal(entry)
+	if marshalErr != nil {
+		log.Printf("WebRTC: failed to marshal diagnostic log at stage %q: %v", stage, marshalErr)
+		return
+	}
+	log.Printf("WebRTC_DIAG %s", diagnostic)
 }
 
 // Deprecated: Use NewWebRTCPeerWithNatPolicyAndEventsAndProxy Instead.
@@ -134,6 +184,9 @@ func (c *WebRTCPeer) Read(b []byte) (int, error) {
 func (c *WebRTCPeer) Write(b []byte) (int, error) {
 	err := c.transport.Send(b)
 	if err != nil {
+		c.logDiagnostic("data_channel.send.failed", err, map[string]interface{}{
+			"payload_bytes": len(b),
+		})
 		return 0, err
 	}
 	c.bytesLogger.addOutbound(int64(len(b)))
@@ -153,9 +206,11 @@ func (c *WebRTCPeer) Closed() bool {
 // Close closes the connection the snowflake proxy.
 func (c *WebRTCPeer) Close() error {
 	c.once.Do(func() {
+		c.logDiagnostic("peer.close.start", nil, nil)
 		close(c.closed)
 		c.cleanup()
 		log.Printf("WebRTC: Closing")
+		c.logDiagnostic("peer.close.complete", nil, nil)
 	})
 	return nil
 }
@@ -175,6 +230,9 @@ func (c *WebRTCPeer) checkForStaleness(timeout time.Duration) {
 			log.Printf("WebRTC: No messages received for %v -- closing stale connection.",
 				timeout)
 			err := errors.New("no messages received, closing stale connection")
+			c.logDiagnostic("connection.failed.stale_timeout", err, map[string]interface{}{
+				"stale_timeout_seconds": timeout.Seconds(),
+			})
 			c.eventsLogger.OnNewSnowflakeEvent(event.EventOnSnowflakeConnectionFailed{Error: err})
 			c.Close()
 			return
@@ -199,9 +257,19 @@ func (c *WebRTCPeer) connect(
 	covertDTLSconfig *covertdtls.CovertDTLSConfig,
 ) error {
 	log.Println(c.id, " connecting...")
+	c.logDiagnostic("connect.start", nil, map[string]interface{}{
+		"keep_local_addresses": broker.keepLocalAddresses,
+		"proxy_configured":     c.proxy != nil,
+	})
 
 	err := c.preparePeerConnection(config, broker.keepLocalAddresses, covertDTLSconfig)
-	localDescription := c.pc.LocalDescription()
+	var localDescription *webrtc.SessionDescription
+	if c.pc != nil {
+		localDescription = c.pc.LocalDescription()
+	}
+	c.logDiagnostic("offer.created", err, map[string]interface{}{
+		"local_description": sessionDescriptionForLog(localDescription),
+	})
 	c.eventsLogger.OnNewSnowflakeEvent(event.EventOnOfferCreated{
 		WebRTCLocalDescription: localDescription,
 		Error:                  err,
@@ -226,8 +294,19 @@ func (c *WebRTCPeer) connect(
 	} else {
 		log.Printf("natTypeToSend: \"%v\" (same as actualNatType)", natTypeToSend)
 	}
+	c.logDiagnostic("broker.negotiate.start", nil, map[string]interface{}{
+		"nat_type_actual":    actualNatType,
+		"nat_type_sent":      natTypeToSend,
+		"local_description":  sessionDescriptionForLog(localDescription),
+		"bridge_fingerprint": broker.BridgeFingerprint,
+	})
 
 	answer, err := broker.Negotiate(localDescription, natTypeToSend)
+	c.logDiagnostic("broker.negotiate.complete", err, map[string]interface{}{
+		"nat_type_actual":   actualNatType,
+		"nat_type_sent":     natTypeToSend,
+		"remote_description": sessionDescriptionForLog(answer),
+	})
 	c.eventsLogger.OnNewSnowflakeEvent(event.EventOnBrokerRendezvous{
 		WebRTCRemoteDescription: answer,
 		Error:                   err,
@@ -239,18 +318,31 @@ func (c *WebRTCPeer) connect(
 	err = c.pc.SetRemoteDescription(*answer)
 	if nil != err {
 		log.Println("WebRTC: Unable to SetRemoteDescription:", err)
+		c.logDiagnostic("peer_connection.set_remote_description.failed", err, map[string]interface{}{
+			"remote_description": sessionDescriptionForLog(answer),
+		})
 		return err
 	}
+	c.logDiagnostic("peer_connection.set_remote_description.succeeded", nil, map[string]interface{}{
+		"remote_description": sessionDescriptionForLog(answer),
+	})
+	c.logDiagnostic("data_channel.wait_open.start", nil, map[string]interface{}{
+		"timeout_seconds": DataChannelTimeout.Seconds(),
+	})
 
 	// Wait for the datachannel to open or time out
 	select {
 	case <-c.open:
+		c.logDiagnostic("data_channel.wait_open.succeeded", nil, nil)
 		if natPolicy != nil {
 			natPolicy.Success(actualNatType, natTypeToSend)
 		}
 	case <-time.After(DataChannelTimeout):
 		c.transport.Close()
 		err := errors.New("timeout waiting for DataChannel.OnOpen")
+		c.logDiagnostic("data_channel.wait_open.timeout", err, map[string]interface{}{
+			"timeout_seconds": DataChannelTimeout.Seconds(),
+		})
 		if natPolicy != nil {
 			natPolicy.Failure(actualNatType, natTypeToSend)
 		}
@@ -258,6 +350,7 @@ func (c *WebRTCPeer) connect(
 		return err
 	}
 
+	c.logDiagnostic("connect.succeeded", nil, nil)
 	go c.checkForStaleness(SnowflakeTimeout)
 	return nil
 }
@@ -269,6 +362,13 @@ func (c *WebRTCPeer) preparePeerConnection(
 	keepLocalAddresses bool,
 	covertDTLSConfig *covertdtls.CovertDTLSConfig,
 ) error {
+	c.logDiagnostic("prepare_peer_connection.start", nil, map[string]interface{}{
+		"ice_server_urls":      iceServerURLsForLog(config),
+		"keep_local_addresses": keepLocalAddresses,
+		"proxy_configured":     c.proxy != nil,
+		"covert_dtls_enabled":  covertDTLSConfig != nil,
+	})
+
 	s := webrtc.SettingEngine{}
 
 	if !keepLocalAddresses {
@@ -292,6 +392,7 @@ func (c *WebRTCPeer) preparePeerConnection(
 
 	if c.proxy != nil {
 		if err := proxy.CheckProxyProtocolSupport(c.proxy); err != nil {
+			c.logDiagnostic("prepare_peer_connection.proxy_check.failed", err, nil)
 			return err
 		}
 		socksClient := proxy.NewSocks5UDPClient(c.proxy)
@@ -304,6 +405,7 @@ func (c *WebRTCPeer) preparePeerConnection(
 		err := covertdtls.SetCovertDTLSSettings(covertDTLSConfig, &s)
 		if err != nil {
 			log.Printf("CovertDTLS ERROR: %s", err)
+			c.logDiagnostic("prepare_peer_connection.covert_dtls.failed", err, nil)
 			return err
 		}
 	}
@@ -313,6 +415,7 @@ func (c *WebRTCPeer) preparePeerConnection(
 	c.pc, err = api.NewPeerConnection(*config)
 	if err != nil {
 		log.Printf("NewPeerConnection ERROR: %s", err)
+		c.logDiagnostic("prepare_peer_connection.new_peer_connection.failed", err, nil)
 		return err
 	}
 	ordered := true
@@ -324,31 +427,41 @@ func (c *WebRTCPeer) preparePeerConnection(
 	dc, err := c.pc.CreateDataChannel(c.id, dataChannelOptions)
 	if err != nil {
 		log.Printf("CreateDataChannel ERROR: %s", err)
+		c.logDiagnostic("prepare_peer_connection.create_data_channel.failed", err, nil)
 		return err
 	}
 	dc.OnOpen(func() {
 		c.eventsLogger.OnNewSnowflakeEvent(event.EventOnSnowflakeConnected{})
 		log.Println("WebRTC: DataChannel.OnOpen")
+		c.logDiagnostic("data_channel.on_open", nil, nil)
 		close(c.open)
 	})
 	dc.OnClose(func() {
 		log.Println("WebRTC: DataChannel.OnClose")
+		c.logDiagnostic("data_channel.on_close", nil, nil)
 		c.Close()
 	})
 	dc.OnError(func(err error) {
+		c.logDiagnostic("data_channel.on_error", err, nil)
 		c.eventsLogger.OnNewSnowflakeEvent(event.EventOnSnowflakeConnectionFailed{Error: err})
 	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if len(msg.Data) <= 0 {
 			log.Println("0 length message---")
+			c.logDiagnostic("data_channel.on_message.zero_length", nil, nil)
 		}
 		n, err := c.writePipe.Write(msg.Data)
 		c.bytesLogger.addInbound(int64(n))
 		if err != nil {
 			// TODO: Maybe shouldn't actually close.
 			log.Println("Error writing to SOCKS pipe")
+			c.logDiagnostic("data_channel.on_message.pipe_write.failed", err, map[string]interface{}{
+				"message_bytes": len(msg.Data),
+				"written_bytes": n,
+			})
 			if inerr := c.writePipe.CloseWithError(err); inerr != nil {
 				log.Printf("c.writePipe.CloseWithError returned error: %v", inerr)
+				c.logDiagnostic("data_channel.on_message.pipe_close.failed", inerr, nil)
 			}
 		}
 		c.mu.Lock()
@@ -363,6 +476,7 @@ func (c *WebRTCPeer) preparePeerConnection(
 	// TODO: Potentially timeout and retry if ICE isn't working.
 	if err != nil {
 		log.Println("Failed to prepare offer", err)
+		c.logDiagnostic("prepare_peer_connection.create_offer.failed", err, nil)
 		c.pc.Close()
 		return err
 	}
@@ -374,12 +488,18 @@ func (c *WebRTCPeer) preparePeerConnection(
 	err = c.pc.SetLocalDescription(offer)
 	if err != nil {
 		log.Println("Failed to apply offer", err)
+		c.logDiagnostic("prepare_peer_connection.set_local_description.failed", err, map[string]interface{}{
+			"local_description": sessionDescriptionForLog(&offer),
+		})
 		c.pc.Close()
 		return err
 	}
 	log.Println("WebRTC: Set local description")
 
 	<-done // Wait for ICE candidate gathering to complete.
+	c.logDiagnostic("prepare_peer_connection.ice_gathering.complete", nil, map[string]interface{}{
+		"local_description": sessionDescriptionForLog(c.pc.LocalDescription()),
+	})
 
 	return nil
 }
