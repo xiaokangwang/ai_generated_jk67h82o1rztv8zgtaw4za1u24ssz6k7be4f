@@ -1,0 +1,102 @@
+Detailed Plan: Connection Attempt Failure Analysis
+
+Goal
+- Determine where each connection attempt fails, then aggregate results to identify the most likely failure points.
+
+Inputs
+- Raw logs containing signaling/WebRTC/Tor events.
+- PCAP files containing packet captures for the same sessions.
+- SDP data per attempt (must include local port and snowflake ID or an equivalent identifier).
+
+Step 1: Normalize and index source artifacts
+1. Build an index of all log files and PCAP files with source filename, timestamp range, and session metadata.
+2. Parse logs into structured events: timestamp, direction (send/recv where available), component, message type, and peer/session identifiers.
+3. Parse PCAP into structured packet records: timestamp, 5-tuple, protocol, handshake markers, and packet direction.
+4. Validate clock alignment between logs and PCAP; record known offset if sources are skewed.
+
+Step 2: Split data into distinct connection attempts
+1. Identify each connection attempt candidate from logs (offer creation, signaling start, or similar start marker).
+2. Extract local port from SDP for each candidate attempt.
+3. Match PCAP traffic to the attempt by local port plus time window around the attempt start.
+4. Assign a stable attempt ID:
+   - <original-file-base>-<snowflake-id>-<local-port>-<attempt-seq>
+5. Write per-attempt artifacts:
+   - !!! IMPORTANT: organize connection attempts in folders.
+   - attempt log slice (only events for that attempt)
+   - attempt PCAP slice (only packets for that attempt)
+   - attempt metadata JSON/record (attempt ID, source files, start/end time, peer identifiers)
+
+Step 3: Inspect each attempt and determine final reached stage
+For each attempt, evaluate received packets/messages and classify exactly one final stage:
+
+Stage A: Unable to reach signaling server
+- No successful signaling connection event; DNS/connect/TLS failure evidence present.
+
+Stage B: Signaling connected, but no message from remote peer
+- Signaling session established, but no remote signaling payload/candidate/answer received.
+
+Stage B-2: Remote signaling received, but no STUN from remote peer.
+- ICE signaling finished, but did not receive stun message from remote peer. (There might be stun message from stun server, but not remote peer.)
+
+Stage C: Remote signaling received, but no DTLS from remote peer
+- ICE/transport setup begins, but no inbound DTLS packets observed in PCAP.
+
+Stage D: DTLS started, handshake not completed
+- Inbound/outbound DTLS packets exist, but handshake completion marker is absent.
+
+Stage E: DTLS handshake succeeded, but Tor bootstrap too slow/incomplete
+- DTLS completion evidence exists; subsequent Tor bootstrap does not complete within timeout.
+
+Stage F: Successful
+- DTLS completes and Tor/bootstrap/connectivity success criteria are met.
+
+Classification rules
+1. Use strongest evidence first (PCAP protocol markers > explicit log markers > inferred state transitions).
+2. Resolve conflicts with deterministic precedence:
+   - Later confirmed stage overrides earlier inferred stage.
+3. Record confidence and evidence references for auditability:
+   - supporting log line IDs/timestamps
+   - supporting packet timestamps/flow IDs
+
+Step 4: Produce per-attempt summary output
+For each attempt, output:
+- attempt_id
+- source_file
+- snowflake_id
+- local_port
+- start_time / end_time / duration
+- final_stage (A-F)
+- classification_confidence
+- evidence pointers (log + packet references)
+- error/failure note (if any parsing or matching issue occurred)
+- !!! nat type actual
+- !!! nat type sent to broker
+
+Step 5: Aggregate and analyze outcomes
+1. Count attempts by final_stage.
+2. Compute percentages by final_stage.
+3. Break down by source file / time bucket / environment (if metadata exists).
+4. Identify top failure stage(s) and report likely dominant root causes.
+5. Highlight unknown/unclassified attempts separately to avoid skewing conclusions.
+
+Step 6: Quality and consistency checks
+1. Ensure every attempt is classified once and only once.
+2. Verify per-attempt durations are non-negative and time windows are coherent.
+3. Spot-check a sample of attempts in each stage for classification correctness.
+4. Report data quality issues (missing SDP/local port, unmatched PCAP, corrupt captures).
+
+Deliverables
+1. Per-attempt dataset (CSV/JSON) with stage classification and evidence fields.
+2. Aggregated summary table with counts/percentages per stage.
+3. Short findings report naming the most likely reasons for connection failure.
+
+!!! Toolchain:
+- Golang: You can install it from offical source directly; do not use debian package
+- tshark: parse pcap files, already installed
+
+!!! Important Design Choice:
+- each steps of the process must be seperately exectuable, and resumable
+- for each step, it must support process every subtasks individually
+- conduct compensative tests before return to user
+- conserve memory space while processing the input; only load what is currently needed
+- !!!!!! Implement the analysis program in golang
