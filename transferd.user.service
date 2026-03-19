@@ -1,0 +1,25 @@
+[Unit]
+Description=fastTransfer server (user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=TRANSFERD_ADDRESS=127.0.0.1:13315
+Environment=PSKey=replace-with-a-long-random-secret
+Environment=FEC_ENGINE=raptorq
+Environment=RAPTORQ_MAX_SOURCE_SYMBOLS=4096
+# Uncomment if you switch to FEC_ENGINE=exec.
+# Environment=FEC_BINARY_PATH=%h/.local/bin/wirehairutil
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/transferd -Address ${TRANSFERD_ADDRESS}
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h
+
+[Install]
+WantedBy=default.target
