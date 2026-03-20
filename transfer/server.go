@@ -10,6 +10,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,12 @@ import (
 	"github.com/lunixbochs/struc"
 )
 
+const (
+	defaultServerAckTimeout   = 2 * time.Second
+	defaultServerWorkInterval = 10
+	serverWorkIntervalEnv     = "TRANSFERD_WORK_INTERVAL_MS"
+)
+
 func NewServer(ctx context.Context, conn io.ReadWriteCloser, engine interfacew.FECEngineV2) *Server {
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{
@@ -29,7 +36,7 @@ func NewServer(ctx context.Context, conn io.ReadWriteCloser, engine interfacew.F
 		ctx:               ctx,
 		finish:            cancel,
 		initialize:        &sync.Once{},
-		workInterval:      10,
+		workInterval:      loadServerWorkIntervalFromEnv(os.LookupEnv),
 		engine:            engine,
 		sendingWorkerDone: make(chan struct{}),
 	}
@@ -37,8 +44,6 @@ func NewServer(ctx context.Context, conn io.ReadWriteCloser, engine interfacew.F
 	go s.cleanupOnDone()
 	return s
 }
-
-const defaultServerAckTimeout = 2 * time.Second
 
 type Server struct {
 	conn       io.ReadWriteCloser
@@ -76,6 +81,28 @@ type Server struct {
 	sendingWorkerStarted atomic.Bool
 	sendingWorkerDone    chan struct{}
 	lastAckAt            atomic.Int64
+}
+
+func loadServerWorkIntervalFromEnv(lookupEnv func(string) (string, bool)) int {
+	value, ok := lookupEnv(serverWorkIntervalEnv)
+	if !ok {
+		return defaultServerWorkInterval
+	}
+
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultServerWorkInterval
+	}
+
+	parsed, err := strconv.ParseUint(value, 10, 31)
+	if err != nil {
+		panic(fmt.Sprintf("invalid %s value %q: %v", serverWorkIntervalEnv, value, err))
+	}
+	if parsed == 0 {
+		panic(fmt.Sprintf("%s must be greater than zero", serverWorkIntervalEnv))
+	}
+
+	return int(parsed)
 }
 
 func (s *Server) cleanupOnDone() {

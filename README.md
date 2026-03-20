@@ -148,6 +148,7 @@ All flags are handled by `transferd`.
 | `FEC_ENGINE` | `raptorq` | FEC backend. Supported values: `raptorq`, `wirehair`, `exec`. |
 | `RAPTORQ_MAX_SOURCE_SYMBOLS` | `4096` | Upper bound for RaptorQ source symbols per part. Lower values reduce memory use and increase part count. Maximum allowed is `56403`. |
 | `WIREHAIR_MAX_SOURCE_BLOCKS` | `64000` | Upper bound for Wirehair source blocks per part. Lower values reduce per-part size and increase part count. Maximum allowed is `64000`. |
+| `TRANSFERD_WORK_INTERVAL_MS` | `10` | Server send-loop batch interval in milliseconds. Lower values send smaller batches more often; higher values send larger bursts less often. |
 | `FEC_BINARY_PATH` | unset | Required only when `FEC_ENGINE=exec`. Path to the external FEC helper. |
 
 ## Client Modes and Semantics

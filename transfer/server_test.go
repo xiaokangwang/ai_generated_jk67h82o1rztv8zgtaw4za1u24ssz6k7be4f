@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -149,6 +150,45 @@ func TestDefaultServerAckTimeout(t *testing.T) {
 
 	if got, want := defaultServerAckTimeout, 2*time.Second; got != want {
 		t.Fatalf("unexpected ack timeout: got %v want %v", got, want)
+	}
+}
+
+func TestLoadServerWorkIntervalFromEnv(t *testing.T) {
+	t.Parallel()
+
+	if got := loadServerWorkIntervalFromEnv(func(string) (string, bool) { return "", false }); got != defaultServerWorkInterval {
+		t.Fatalf("unexpected default work interval: got %d want %d", got, defaultServerWorkInterval)
+	}
+	if got := loadServerWorkIntervalFromEnv(func(string) (string, bool) { return "25", true }); got != 25 {
+		t.Fatalf("unexpected overridden work interval: got %d want 25", got)
+	}
+}
+
+func TestLoadServerWorkIntervalFromEnvInvalid(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		"0",
+		"abc",
+	}
+
+	for _, value := range cases {
+		value := value
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("expected panic")
+				}
+				if !strings.Contains(r.(string), serverWorkIntervalEnv) {
+					t.Fatalf("unexpected panic message: %v", r)
+				}
+			}()
+
+			_ = loadServerWorkIntervalFromEnv(func(string) (string, bool) { return value, true })
+		})
 	}
 }
 
