@@ -18,6 +18,7 @@ import (
 
 	"github.com/xiaokangwang/fastTransfer/fec/execfec"
 	"github.com/xiaokangwang/fastTransfer/fec/raptorqfec"
+	"github.com/xiaokangwang/fastTransfer/fec/wirehairfec"
 	"github.com/xiaokangwang/fastTransfer/interfacew"
 
 	"github.com/xiaokangwang/VLite/transport/udp/udpServer"
@@ -144,6 +145,8 @@ func NewFECEngine() interfacew.FECEngineV2 {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("FEC_ENGINE"))) {
 	case "", "raptorq":
 		return raptorqfec.NewRaptorQFECV2()
+	case "wirehair":
+		return wirehairfec.NewWirehairFECV2()
 	case "exec":
 		return execfec.NewExecFecEngineV2(mustGetConfFromEnv("FEC_BINARY_PATH"))
 	default:

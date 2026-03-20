@@ -32,8 +32,9 @@ At a high level, the stack is:
 3. A custom request/response protocol
 4. FEC-encoded payload transmission
 
-The default FEC engine is native RaptorQ. The older external-process FEC path is
-still available through `FEC_ENGINE=exec`.
+The default FEC engine is native RaptorQ. A native Wirehair option is also
+available, and the older external-process FEC path is still available through
+`FEC_ENGINE=exec`.
 
 ## Requirements
 
@@ -52,6 +53,10 @@ Build the CLI:
 ```bash
 go build -o transferd ./transferd
 ```
+
+For local codec performance data comparing `raptorq`, `wirehair`, and
+`wirehairsimd`, see
+[`docs/fec-benchmarks.md`](/home/shelikhoo/proj/src/github.com/xiaokangwang/fastTransfern/docs/fec-benchmarks.md).
 
 ## Quick Start
 
@@ -140,8 +145,9 @@ All flags are handled by `transferd`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FEC_ENGINE` | `raptorq` | FEC backend. Supported values: `raptorq`, `exec`. |
+| `FEC_ENGINE` | `raptorq` | FEC backend. Supported values: `raptorq`, `wirehair`, `exec`. |
 | `RAPTORQ_MAX_SOURCE_SYMBOLS` | `4096` | Upper bound for RaptorQ source symbols per part. Lower values reduce memory use and increase part count. Maximum allowed is `56403`. |
+| `WIREHAIR_MAX_SOURCE_BLOCKS` | `64000` | Upper bound for Wirehair source blocks per part. Lower values reduce per-part size and increase part count. Maximum allowed is `64000`. |
 | `FEC_BINARY_PATH` | unset | Required only when `FEC_ENGINE=exec`. Path to the external FEC helper. |
 
 ## Client Modes and Semantics
@@ -418,6 +424,7 @@ Files may be split into remote parts before FEC encoding.
 - Default shard size: `1300` bytes
 - Max part size depends on the active FEC engine
 - For RaptorQ, the part size is `RAPTORQ_MAX_SOURCE_SYMBOLS * shard_size`
+- For Wirehair, the part size is `WIREHAIR_MAX_SOURCE_BLOCKS * shard_size`
 
 With the default `RAPTORQ_MAX_SOURCE_SYMBOLS=4096`, the default max remote part
 size is:
@@ -427,6 +434,13 @@ size is:
 ```
 
 This cap exists to keep RaptorQ memory usage bounded.
+
+With the default `WIREHAIR_MAX_SOURCE_BLOCKS=64000`, the default max remote part
+size is:
+
+```text
+64000 * 1300 = 83,200,000 bytes
+```
 
 ### FEC Behavior
 
@@ -438,6 +452,7 @@ This cap exists to keep RaptorQ memory usage bounded.
 Supported FEC modes:
 
 - `raptorq`: native Go integration using `github.com/xssnick/raptorq`
+- `wirehair`: native Go integration using the translated `fec/wirehair` package
 - `exec`: external helper process controlled through stdin/stdout
 
 ### Flow Control, Retry, and Timeouts

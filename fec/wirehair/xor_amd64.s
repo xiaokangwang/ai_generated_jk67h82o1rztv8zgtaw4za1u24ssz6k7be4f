@@ -1,0 +1,227 @@
+//go:build wirehairsimd && amd64
+
+#include "textflag.h"
+
+TEXT ·xorBytesInplaceAsm(SB), NOSPLIT, $0-24
+	MOVQ dst+0(FP), DI
+	MOVQ src+8(FP), SI
+	MOVQ n+16(FP), CX
+
+loop64_inplace:
+	CMPQ CX, $64
+	JB loop16_inplace
+	MOVOU 0(DI), X0
+	MOVOU 16(DI), X1
+	MOVOU 32(DI), X2
+	MOVOU 48(DI), X3
+	MOVOU 0(SI), X4
+	MOVOU 16(SI), X5
+	MOVOU 32(SI), X6
+	MOVOU 48(SI), X7
+	PXOR X4, X0
+	PXOR X5, X1
+	PXOR X6, X2
+	PXOR X7, X3
+	MOVOU X0, 0(DI)
+	MOVOU X1, 16(DI)
+	MOVOU X2, 32(DI)
+	MOVOU X3, 48(DI)
+	ADDQ $64, DI
+	ADDQ $64, SI
+	SUBQ $64, CX
+	JMP loop64_inplace
+
+loop16_inplace:
+	CMPQ CX, $16
+	JB loop8_inplace
+	MOVOU 0(DI), X0
+	MOVOU 0(SI), X1
+	PXOR X1, X0
+	MOVOU X0, 0(DI)
+	ADDQ $16, DI
+	ADDQ $16, SI
+	SUBQ $16, CX
+	JMP loop16_inplace
+
+loop8_inplace:
+	CMPQ CX, $8
+	JB loop1_inplace
+	MOVQ 0(DI), AX
+	XORQ 0(SI), AX
+	MOVQ AX, 0(DI)
+	ADDQ $8, DI
+	ADDQ $8, SI
+	SUBQ $8, CX
+	JMP loop8_inplace
+
+loop1_inplace:
+	TESTQ CX, CX
+	JE done_inplace
+	MOVBLZX 0(DI), AX
+	MOVBLZX 0(SI), BX
+	XORQ BX, AX
+	MOVB AL, 0(DI)
+	INCQ DI
+	INCQ SI
+	DECQ CX
+	JMP loop1_inplace
+
+done_inplace:
+	RET
+
+TEXT ·xorBytesAcc3Asm(SB), NOSPLIT, $0-32
+	MOVQ dst+0(FP), DI
+	MOVQ x+8(FP), SI
+	MOVQ y+16(FP), DX
+	MOVQ n+24(FP), CX
+
+loop64_acc3:
+	CMPQ CX, $64
+	JB loop16_acc3
+	MOVOU 0(DI), X0
+	MOVOU 16(DI), X1
+	MOVOU 32(DI), X2
+	MOVOU 48(DI), X3
+	MOVOU 0(SI), X4
+	MOVOU 16(SI), X5
+	MOVOU 32(SI), X6
+	MOVOU 48(SI), X7
+	PXOR X4, X0
+	PXOR X5, X1
+	PXOR X6, X2
+	PXOR X7, X3
+	MOVOU 0(DX), X4
+	MOVOU 16(DX), X5
+	MOVOU 32(DX), X6
+	MOVOU 48(DX), X7
+	PXOR X4, X0
+	PXOR X5, X1
+	PXOR X6, X2
+	PXOR X7, X3
+	MOVOU X0, 0(DI)
+	MOVOU X1, 16(DI)
+	MOVOU X2, 32(DI)
+	MOVOU X3, 48(DI)
+	ADDQ $64, DI
+	ADDQ $64, SI
+	ADDQ $64, DX
+	SUBQ $64, CX
+	JMP loop64_acc3
+
+loop16_acc3:
+	CMPQ CX, $16
+	JB loop8_acc3
+	MOVOU 0(DI), X0
+	MOVOU 0(SI), X1
+	MOVOU 0(DX), X2
+	PXOR X1, X0
+	PXOR X2, X0
+	MOVOU X0, 0(DI)
+	ADDQ $16, DI
+	ADDQ $16, SI
+	ADDQ $16, DX
+	SUBQ $16, CX
+	JMP loop16_acc3
+
+loop8_acc3:
+	CMPQ CX, $8
+	JB loop1_acc3
+	MOVQ 0(DI), AX
+	XORQ 0(SI), AX
+	XORQ 0(DX), AX
+	MOVQ AX, 0(DI)
+	ADDQ $8, DI
+	ADDQ $8, SI
+	ADDQ $8, DX
+	SUBQ $8, CX
+	JMP loop8_acc3
+
+loop1_acc3:
+	TESTQ CX, CX
+	JE done_acc3
+	MOVBLZX 0(DI), AX
+	MOVBLZX 0(SI), BX
+	MOVBLZX 0(DX), R8
+	XORQ BX, AX
+	XORQ R8, AX
+	MOVB AL, 0(DI)
+	INCQ DI
+	INCQ SI
+	INCQ DX
+	DECQ CX
+	JMP loop1_acc3
+
+done_acc3:
+	RET
+
+TEXT ·xorBytesSetAsm(SB), NOSPLIT, $0-32
+	MOVQ dst+0(FP), DI
+	MOVQ x+8(FP), SI
+	MOVQ y+16(FP), DX
+	MOVQ n+24(FP), CX
+
+loop64_set:
+	CMPQ CX, $64
+	JB loop16_set
+	MOVOU 0(SI), X0
+	MOVOU 16(SI), X1
+	MOVOU 32(SI), X2
+	MOVOU 48(SI), X3
+	MOVOU 0(DX), X4
+	MOVOU 16(DX), X5
+	MOVOU 32(DX), X6
+	MOVOU 48(DX), X7
+	PXOR X4, X0
+	PXOR X5, X1
+	PXOR X6, X2
+	PXOR X7, X3
+	MOVOU X0, 0(DI)
+	MOVOU X1, 16(DI)
+	MOVOU X2, 32(DI)
+	MOVOU X3, 48(DI)
+	ADDQ $64, DI
+	ADDQ $64, SI
+	ADDQ $64, DX
+	SUBQ $64, CX
+	JMP loop64_set
+
+loop16_set:
+	CMPQ CX, $16
+	JB loop8_set
+	MOVOU 0(SI), X0
+	MOVOU 0(DX), X1
+	PXOR X1, X0
+	MOVOU X0, 0(DI)
+	ADDQ $16, DI
+	ADDQ $16, SI
+	ADDQ $16, DX
+	SUBQ $16, CX
+	JMP loop16_set
+
+loop8_set:
+	CMPQ CX, $8
+	JB loop1_set
+	MOVQ 0(SI), AX
+	XORQ 0(DX), AX
+	MOVQ AX, 0(DI)
+	ADDQ $8, DI
+	ADDQ $8, SI
+	ADDQ $8, DX
+	SUBQ $8, CX
+	JMP loop8_set
+
+loop1_set:
+	TESTQ CX, CX
+	JE done_set
+	MOVBLZX 0(SI), AX
+	MOVBLZX 0(DX), BX
+	XORQ BX, AX
+	MOVB AL, 0(DI)
+	INCQ DI
+	INCQ SI
+	INCQ DX
+	DECQ CX
+	JMP loop1_set
+
+done_set:
+	RET
