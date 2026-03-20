@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/xiaokangwang/fastTransfer/transfer"
 )
@@ -180,6 +181,62 @@ func TestReportFileProgressClampsCompletedParts(t *testing.T) {
 
 	if got, want := buf.String(), "/remote/file.bin: 5/5 parts downloaded\n"; got != want {
 		t.Fatalf("unexpected progress output: got %q want %q", got, want)
+	}
+}
+
+func TestFormatByteCount(t *testing.T) {
+	t.Parallel()
+
+	if got := formatByteCount(999); got != "999 B" {
+		t.Fatalf("unexpected byte count for bytes: %q", got)
+	}
+	if got := formatByteCount(1536); got != "1.5 KiB" {
+		t.Fatalf("unexpected byte count for kibibytes: %q", got)
+	}
+}
+
+func TestFormatByteRate(t *testing.T) {
+	t.Parallel()
+
+	if got := formatByteRate(2048, time.Second); got != "2.0 KiB/s" {
+		t.Fatalf("unexpected byte rate: %q", got)
+	}
+	if got := formatByteRate(2048, 0); got != "0 B/s" {
+		t.Fatalf("unexpected byte rate for zero duration: %q", got)
+	}
+}
+
+func TestReportPartTransferSpeed(t *testing.T) {
+	t.Parallel()
+
+	originalWriter := clientProgressWriter
+	defer func() {
+		clientProgressWriter = originalWriter
+	}()
+
+	var buf bytes.Buffer
+	clientProgressWriter = &buf
+	reportPartTransferSpeed("/remote/file.bin", 2, 5, 2048, time.Second)
+
+	if got, want := buf.String(), "/remote/file.bin part 2/5: 2.0 KiB in 1s (2.0 KiB/s)\n"; got != want {
+		t.Fatalf("unexpected part speed output: got %q want %q", got, want)
+	}
+}
+
+func TestReportFileTransferSpeed(t *testing.T) {
+	t.Parallel()
+
+	originalWriter := clientProgressWriter
+	defer func() {
+		clientProgressWriter = originalWriter
+	}()
+
+	var buf bytes.Buffer
+	clientProgressWriter = &buf
+	reportFileTransferSpeed("/remote/file.bin", 3, 5, 6144, 2*time.Second)
+
+	if got, want := buf.String(), "/remote/file.bin: 3/5 parts, 6.0 KiB in 2s (3.0 KiB/s)\n"; got != want {
+		t.Fatalf("unexpected file speed output: got %q want %q", got, want)
 	}
 }
 

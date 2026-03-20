@@ -33,6 +33,17 @@ var errRemotePathIsFile = errors.New("remote path is a file")
 var nextTransferID uint64
 var clientProgressWriter io.Writer = os.Stderr
 
+type countingWriter struct {
+	writer  io.Writer
+	written int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	w.written += int64(n)
+	return n, err
+}
+
 type localFileDecision struct {
 	Exists    bool
 	IsRegular bool
@@ -218,6 +229,81 @@ func reportFileProgress(remotePath string, completedParts, totalParts uint32) {
 	fmt.Fprintf(clientProgressWriter, "%s: %d/%d parts downloaded\n", remotePath, completedParts, totalParts)
 }
 
+func reportPartTransferSpeed(remotePath string, completedPart, totalParts uint32, transferredBytes int64, elapsed time.Duration) {
+	if totalParts <= 1 {
+		return
+	}
+	fmt.Fprintf(
+		clientProgressWriter,
+		"%s part %d/%d: %s in %s (%s)\n",
+		remotePath,
+		completedPart,
+		totalParts,
+		formatByteCount(transferredBytes),
+		formatElapsedDuration(elapsed),
+		formatByteRate(transferredBytes, elapsed),
+	)
+}
+
+func reportFileTransferSpeed(remotePath string, completedParts, totalParts uint32, transferredBytes int64, elapsed time.Duration) {
+	if totalParts <= 1 {
+		fmt.Fprintf(
+			clientProgressWriter,
+			"%s: %s in %s (%s)\n",
+			remotePath,
+			formatByteCount(transferredBytes),
+			formatElapsedDuration(elapsed),
+			formatByteRate(transferredBytes, elapsed),
+		)
+		return
+	}
+	fmt.Fprintf(
+		clientProgressWriter,
+		"%s: %d/%d parts, %s in %s (%s)\n",
+		remotePath,
+		completedParts,
+		totalParts,
+		formatByteCount(transferredBytes),
+		formatElapsedDuration(elapsed),
+		formatByteRate(transferredBytes, elapsed),
+	)
+}
+
+func formatByteCount(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	value := float64(n)
+	unitIndex := 0
+	for unitIndex < len(units)-1 && value >= 1024 {
+		value /= 1024
+		unitIndex++
+	}
+	if unitIndex == 0 {
+		return fmt.Sprintf("%d %s", n, units[unitIndex])
+	}
+	return fmt.Sprintf("%.1f %s", value, units[unitIndex])
+}
+
+func formatByteRate(transferredBytes int64, elapsed time.Duration) string {
+	if elapsed <= 0 {
+		return "0 B/s"
+	}
+	rate := int64(float64(transferredBytes) / elapsed.Seconds())
+	return formatByteCount(rate) + "/s"
+}
+
+func formatElapsedDuration(elapsed time.Duration) string {
+	if elapsed <= 0 {
+		return "0s"
+	}
+	if elapsed < time.Second {
+		return elapsed.Round(time.Millisecond).String()
+	}
+	return elapsed.Round(10 * time.Millisecond).String()
+}
+
 func reportRecursiveFilterDecision(remotePath string, filter *regexp.Regexp, matched bool) {
 	if filter == nil {
 		return
@@ -276,6 +362,8 @@ func downloadRemoteFileParts(address, outputPath, remotePath string, recvRate in
 	defer closeRemoteSession(session)
 
 	currentPart := fromPart
+	transferStarted := time.Now()
+	var totalTransferredBytes int64
 	for {
 		partOutputPath := outputPath
 		if currentPart != 0 {
@@ -290,10 +378,12 @@ func downloadRemoteFileParts(address, outputPath, remotePath string, recvRate in
 			return err
 		}
 
+		partWriter := &countingWriter{writer: file}
+		partStarted := time.Now()
 		totalParts, payloadType, fetchErr := fetchRemoteWithSession(address, &session, transfer.Request{
 			Path:     remotePath,
 			FilePart: currentPart,
-		}, recvRate, file)
+		}, recvRate, partWriter)
 		closeErr := file.Close()
 		if fetchErr != nil {
 			_ = os.Remove(partOutputPath)
@@ -306,9 +396,13 @@ func downloadRemoteFileParts(address, outputPath, remotePath string, recvRate in
 		if closeErr != nil {
 			return closeErr
 		}
+		partBytes := partWriter.written
+		totalTransferredBytes += partBytes
 		reportFileProgress(remotePath, currentPart+1, totalParts)
+		reportPartTransferSpeed(remotePath, currentPart+1, totalParts, partBytes, time.Since(partStarted))
 
 		if int(totalParts) <= int(currentPart)+1 {
+			reportFileTransferSpeed(remotePath, currentPart+1-fromPart, totalParts, totalTransferredBytes, time.Since(transferStarted))
 			return nil
 		}
 		currentPart++
@@ -340,18 +434,26 @@ func downloadRemoteFileAsSingleFileWithSession(address string, session **remoteS
 	}()
 
 	var currentPart uint32
+	transferStarted := time.Now()
+	var totalTransferredBytes int64
+	var totalParts uint32
 	for {
+		partWriter := &countingWriter{writer: file}
+		partStarted := time.Now()
 		totalParts, payloadType, err := fetchRemoteWithSession(address, session, transfer.Request{
 			Path:     remotePath,
 			FilePart: currentPart,
-		}, recvRate, file)
+		}, recvRate, partWriter)
 		if err != nil {
 			return err
 		}
 		if payloadType != transfer.PayloadTypeFile {
 			return fmt.Errorf("%s is a directory; use -list or -recursive", remotePath)
 		}
+		partBytes := partWriter.written
+		totalTransferredBytes += partBytes
 		reportFileProgress(remotePath, currentPart+1, totalParts)
+		reportPartTransferSpeed(remotePath, currentPart+1, totalParts, partBytes, time.Since(partStarted))
 		if int(totalParts) <= int(currentPart)+1 {
 			break
 		}
@@ -367,6 +469,7 @@ func downloadRemoteFileAsSingleFileWithSession(address string, session **remoteS
 		return err
 	}
 	tempPath = ""
+	reportFileTransferSpeed(remotePath, currentPart+1, totalParts, totalTransferredBytes, time.Since(transferStarted))
 	return nil
 }
 
