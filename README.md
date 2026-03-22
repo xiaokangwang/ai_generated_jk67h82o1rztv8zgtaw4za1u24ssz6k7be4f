@@ -41,6 +41,7 @@ available, and the older external-process FEC path is still available through
 - Go 1.25 or newer to build from source
 - A shared `PSKey` on both client and server
 - UDP reachability between client and server
+- or UDP reachability between client and a SOCKS5 UDP relay when using `-socks5udp`
 
 Optional:
 
@@ -78,6 +79,16 @@ Download a single file:
 ```bash
 PSKey='replace-with-a-long-random-secret' \
 ./transferd -client -Address example.com:21978 \
+  -remoteFileName /srv/data/movie.mkv \
+  -localFileName ./movie.mkv
+```
+
+Download a file through a direct SOCKS5 UDP relay:
+
+```bash
+PSKey='replace-with-a-long-random-secret' \
+./transferd -client -Address example.com:21978 \
+  -socks5udp 127.0.0.1:1080 \
   -remoteFileName /srv/data/movie.mkv \
   -localFileName ./movie.mkv
 ```
@@ -121,6 +132,7 @@ All flags are handled by `transferd`.
 | `-remoteFileName` | string | `""` | Remote server path to a file or directory. |
 | `-localFileName` | string | `""` | Local output path. Semantics depend on mode. |
 | `-recvRate` | int | `1000` | Desired receive rate in packets per second. |
+| `-socks5udp` | string | `""` | SOCKS5 UDP relay `host:port`. Skips UDP ASSOCIATE/TCP handshake and sends SOCKS5 UDP datagrams directly to that relay. |
 | `-list` | bool | `false` | Request a directory listing instead of downloading file data. |
 | `-recursive` | bool | `false` | Recursively walk directory trees client-side. |
 | `-resume` | bool | `false` | In recursive mode, skip a file if a local regular file already exists with the same size. |

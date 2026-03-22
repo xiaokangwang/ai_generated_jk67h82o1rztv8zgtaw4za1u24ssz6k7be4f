@@ -18,6 +18,8 @@ import (
 
 	"github.com/pion/dtls/v3"
 
+	"github.com/xiaokangwang/VLite/interfaces"
+	"github.com/xiaokangwang/VLite/interfaces/ibus"
 	"github.com/xiaokangwang/VLite/transport/udp/udpClient"
 	"github.com/xiaokangwang/fastTransfer/transfer"
 )
@@ -104,8 +106,7 @@ func fetchRemoteWithSession(address string, session **remoteSession, request tra
 }
 
 func newRemoteSession(address string) (*remoteSession, error) {
-	udpClient := udpClient.NewUdpClient(address, context.TODO())
-	conn, err, ctx := udpClient.Connect(context.TODO())
+	conn, ctx, err := dialRemoteTransport(address, socks5UDPRelayAddress)
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +129,29 @@ func newRemoteSession(address string) (*remoteSession, error) {
 		ctx:     ctx,
 		address: address,
 	}, nil
+}
+
+func dialRemoteTransport(address, relayAddress string) (net.Conn, context.Context, error) {
+	if relayAddress != "" {
+		conn, err := dialSocks5UDPConn(address, relayAddress)
+		if err != nil {
+			return nil, nil, err
+		}
+		return conn, newRemoteConnContext(context.TODO(), conn), nil
+	}
+
+	client := udpClient.NewUdpClient(address, context.TODO())
+	conn, err, ctx := client.Connect(context.TODO())
+	if err != nil {
+		return nil, nil, err
+	}
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+	if ctx.Value(interfaces.ExtraOptionsMessageBusByConn) == nil {
+		ctx = context.WithValue(ctx, interfaces.ExtraOptionsMessageBusByConn, ibus.NewMessageBus())
+	}
+	return conn, ctx, nil
 }
 
 func (s *remoteSession) fetch(request transfer.Request, recvRate int, output io.Writer) (uint32, uint8, error) {

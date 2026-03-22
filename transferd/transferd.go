@@ -29,6 +29,8 @@ type sr struct {
 	localAddr net.Addr
 }
 
+var socks5UDPRelayAddress string
+
 func (s *sr) Connection(conn net.Conn, ctx context.Context) context.Context {
 	remoteAddr, err := remoteAddrFromConnContext(ctx)
 	if err != nil {
@@ -70,6 +72,7 @@ func main() {
 	flag.StringVar(&fileName, "remoteFileName", "", "")
 	flag.StringVar(&outfileName, "localFileName", "", "")
 	flag.StringVar(&recursiveFilter, "filter", "", "")
+	flag.StringVar(&socks5UDPRelayAddress, "socks5udp", "", "")
 	flag.IntVar(&recvRate, "recvRate", 1000, "")
 	flag.IntVar(&FromPart, "fromPart", 0, "")
 	flag.BoolVar(&client, "client", false, "")
