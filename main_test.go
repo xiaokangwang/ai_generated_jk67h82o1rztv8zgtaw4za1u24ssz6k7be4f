@@ -262,6 +262,88 @@ func TestSplitDestinationsUseDifferentSourcePorts(t *testing.T) {
 	}
 }
 
+func TestSplitDestinationsRelayResponsesFromMultipleDestinations(t *testing.T) {
+	echoAddrOne, stopEchoOne := startUDPEchoServer(t)
+	defer stopEchoOne()
+
+	echoAddrTwo, stopEchoTwo := startUDPEchoServer(t)
+	defer stopEchoTwo()
+
+	logger := log.New(io.Discard, "", 0)
+	p, err := newProxyWithOptions("127.0.0.1:0", time.Minute, true, logger)
+	if err != nil {
+		t.Fatalf("newProxyWithOptions returned error: %v", err)
+	}
+	defer p.listener.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.serve()
+	}()
+
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP client returned error: %v", err)
+	}
+	defer client.Close()
+
+	requestOne, err := buildSocks5UDPDatagram(echoAddrOne, []byte("payload-one"))
+	if err != nil {
+		t.Fatalf("buildSocks5UDPDatagram requestOne returned error: %v", err)
+	}
+
+	requestTwo, err := buildSocks5UDPDatagram(echoAddrTwo, []byte("payload-two"))
+	if err != nil {
+		t.Fatalf("buildSocks5UDPDatagram requestTwo returned error: %v", err)
+	}
+
+	proxyAddr := p.listener.LocalAddr().(*net.UDPAddr)
+	if _, err := client.WriteToUDP(requestOne, proxyAddr); err != nil {
+		t.Fatalf("client WriteToUDP requestOne returned error: %v", err)
+	}
+
+	if _, err := client.WriteToUDP(requestTwo, proxyAddr); err != nil {
+		t.Fatalf("client WriteToUDP requestTwo returned error: %v", err)
+	}
+
+	responses := make(map[string]string)
+	buffer := make([]byte, 2048)
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	for i := 0; i < 2; i++ {
+		n, _, err := client.ReadFromUDP(buffer)
+		if err != nil {
+			t.Fatalf("client ReadFromUDP returned error: %v", err)
+		}
+
+		addr, payload, err := parseSocks5UDPRequest(buffer[:n])
+		if err != nil {
+			t.Fatalf("parseSocks5UDPRequest returned error: %v", err)
+		}
+
+		responses[addr.String()] = string(payload)
+	}
+
+	if got, want := responses[echoAddrOne.String()], "payload-one"; got != want {
+		t.Fatalf("unexpected response from destination one: got %q want %q", got, want)
+	}
+
+	if got, want := responses[echoAddrTwo.String()], "payload-two"; got != want {
+		t.Fatalf("unexpected response from destination two: got %q want %q", got, want)
+	}
+
+	_ = p.listener.Close()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected serve to stop with an error after closing listener")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy serve did not stop after closing listener")
+	}
+}
+
 func TestSplitDestinationsEvictLeastRecentlyUsedSocket(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	p, err := newProxyWithSettings("127.0.0.1:0", time.Minute, true, 2, false, time.Second, 0, logger)
