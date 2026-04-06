@@ -189,7 +189,7 @@
     .result-meta {
       display: grid;
       gap: 12px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     }
 
     .meta-tile {
@@ -410,6 +410,16 @@
       color: var(--accent);
     }
 
+    .tone-idle {
+      background: rgba(27, 36, 48, 0.08);
+      color: var(--muted);
+    }
+
+    .tone-mid {
+      background: rgba(177, 93, 40, 0.13);
+      color: #8a531e;
+    }
+
     code {
       font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
       font-size: 0.92em;
@@ -471,24 +481,25 @@
         <p class="eyebrow">Snowflake / Probetest</p>
         <h1>Browser NAT probe demo</h1>
         <p>
-          This page behaves like the Snowflake proxy NAT check. It creates a WebRTC
-          offer, posts it to <code>/probe</code>, applies the returned answer, and
-          waits for the test data channel to open.
+          This page behaves like the Snowflake proxy NAT check, but it runs two
+          sequential assist-path connections. It tries the <code>strict</code> path
+          first, then the <code>moderate</code> path, and combines both outcomes into
+          one NAT verdict.
         </p>
         <div class="hero-note">
-          <span class="chip">Open data channel = <strong>unrestricted</strong></span>
-          <span class="chip">Timeout after signaling = <strong>restricted</strong></span>
-          <span class="chip">Signaling or browser failure = <strong>unknown</strong></span>
+          <span class="chip">Strict success = <strong>open NAT</strong></span>
+          <span class="chip">Moderate success = <strong>moderate-or-better</strong></span>
+          <span class="chip">Both fail = <strong>more restrictive than moderate</strong></span>
         </div>
       </article>
 
       <aside class="panel status-card">
         <div>
-          <span id="resultTone" class="result-label">idle</span>
-          <div id="natResult" class="result-value">unknown</div>
+          <span id="resultTone" class="result-label tone-idle">idle</span>
+          <div id="natResult" class="result-value">not tested</div>
         </div>
         <p id="resultDetail" class="result-detail">
-          Configure the probe endpoint, then start a NAT check.
+          Run both assist paths. If the strict path connects, your NAT behaves like open NAT. If only the moderate path connects, your NAT is moderate or better.
         </p>
         <div class="result-meta">
           <div class="meta-tile">
@@ -496,7 +507,19 @@
             <span id="probeEcho" class="meta-value">not started</span>
           </div>
           <div class="meta-tile">
-            <span class="meta-label">Round trip</span>
+            <span class="meta-label">Active test</span>
+            <span id="activeTestEcho" class="meta-value">idle</span>
+          </div>
+          <div class="meta-tile">
+            <span class="meta-label">Strict path</span>
+            <span id="strictEcho" class="meta-value">pending</span>
+          </div>
+          <div class="meta-tile">
+            <span class="meta-label">Moderate path</span>
+            <span id="moderateEcho" class="meta-value">pending</span>
+          </div>
+          <div class="meta-tile">
+            <span class="meta-label">Total time</span>
             <span id="durationEcho" class="meta-value">-</span>
           </div>
         </div>
@@ -505,7 +528,7 @@
 
     <section class="grid">
       <article class="panel">
-        <h2>Run a check</h2>
+        <h2>Run the two-path check</h2>
         <div class="form-grid">
           <div class="field">
             <label for="probeUrl">Probe URL</label>
@@ -517,21 +540,18 @@
 
           <div class="field-row">
             <div class="field">
-              <label for="simulation">Connectivity simulation</label>
-              <select id="simulation" name="simulation">
-                <option value="strict">Strict symmetric NAT check</option>
-                <option value="moderate">Moderate connectivity simulation</option>
-              </select>
+              <label>Checks performed</label>
               <div class="helper">
-                Maps to probetest's <code>InCoSim</code> query parameter.
+                This page first runs the <code>strict</code> assist path, then the
+                <code>moderate</code> assist path, and combines both outcomes into one verdict.
               </div>
             </div>
 
             <div class="field">
-              <label for="timeoutSeconds">Timeout (seconds)</label>
+              <label for="timeoutSeconds">Per-test timeout (seconds)</label>
               <input id="timeoutSeconds" name="timeoutSeconds" type="number" min="5" max="120" step="1" value="20">
               <div class="helper">
-                Snowflake proxy uses 20 seconds by default.
+                Each assist-path connection uses this timeout. Snowflake proxy uses 20 seconds by default.
               </div>
             </div>
           </div>
@@ -545,7 +565,7 @@
           </div>
 
           <div class="actions">
-            <button id="startButton" class="button button-primary" type="button">Start NAT probe</button>
+            <button id="startButton" class="button button-primary" type="button">Run strict + moderate tests</button>
             <button id="stopButton" class="button button-secondary" type="button" disabled>Stop</button>
           </div>
         </div>
@@ -572,6 +592,10 @@
             <div id="connectionState" class="stat-value">new</div>
           </div>
           <div class="stat">
+            <div class="stat-title">Active test</div>
+            <div id="activeTest" class="stat-value">idle</div>
+          </div>
+          <div class="stat">
             <div class="stat-title">Candidate profile</div>
             <div id="candidateSummary" class="stat-value">not gathered</div>
           </div>
@@ -580,9 +604,10 @@
         <div>
           <h3>How to read the result</h3>
           <ul class="bullet-list">
-            <li><strong>Unrestricted</strong>: the browser established the WebRTC data channel to the probe server.</li>
-            <li><strong>Restricted</strong>: signaling completed, but the data channel never opened before the timeout.</li>
-            <li><strong>Unknown</strong>: the check failed before a meaningful NAT classification could be made.</li>
+            <li><strong>Strict connected</strong>: your NAT behaves like open NAT.</li>
+            <li><strong>Strict failed, moderate connected</strong>: your NAT is moderate.</li>
+            <li><strong>Moderate connected while strict was inconclusive</strong>: your NAT is moderate or better.</li>
+            <li><strong>Neither connected</strong>: your NAT is more restrictive than moderate, or the run was inconclusive if signaling failed.</li>
           </ul>
         </div>
 
@@ -602,13 +627,17 @@
       "stun:stun.voip.blackberry.com:3478",
     ];
 
+    const TEST_SEQUENCE = [
+      { kind: "strict", label: "strict assist path" },
+      { kind: "moderate", label: "moderate assist path" },
+    ];
+
     const state = {
       run: null,
     };
 
     const ui = {
       probeUrl: document.getElementById("probeUrl"),
-      simulation: document.getElementById("simulation"),
       timeoutSeconds: document.getElementById("timeoutSeconds"),
       iceServers: document.getElementById("iceServers"),
       startButton: document.getElementById("startButton"),
@@ -617,10 +646,14 @@
       natResult: document.getElementById("natResult"),
       resultDetail: document.getElementById("resultDetail"),
       probeEcho: document.getElementById("probeEcho"),
+      activeTestEcho: document.getElementById("activeTestEcho"),
+      strictEcho: document.getElementById("strictEcho"),
+      moderateEcho: document.getElementById("moderateEcho"),
       durationEcho: document.getElementById("durationEcho"),
       iceGatheringState: document.getElementById("iceGatheringState"),
       iceConnectionState: document.getElementById("iceConnectionState"),
       connectionState: document.getElementById("connectionState"),
+      activeTest: document.getElementById("activeTest"),
       candidateSummary: document.getElementById("candidateSummary"),
       log: document.getElementById("log"),
     };
@@ -667,21 +700,27 @@
       ui.resultDetail.textContent = detail;
       ui.resultTone.textContent = tone;
       ui.resultTone.className = "result-label";
-      if (tone === "unrestricted") {
+      if (tone === "open") {
         ui.resultTone.classList.add("tone-ok");
+      } else if (tone === "moderate") {
+        ui.resultTone.classList.add("tone-mid");
       } else if (tone === "restricted") {
         ui.resultTone.classList.add("tone-warn");
       } else if (tone === "running") {
         ui.resultTone.classList.add("tone-running");
       } else if (tone === "error") {
         ui.resultTone.classList.add("tone-danger");
+      } else {
+        ui.resultTone.classList.add("tone-idle");
       }
     }
 
-    function setTelemetry(pc) {
+    function setTelemetry(pc, activeTestLabel) {
       ui.iceGatheringState.textContent = pc.iceGatheringState;
       ui.iceConnectionState.textContent = pc.iceConnectionState;
       ui.connectionState.textContent = pc.connectionState;
+      ui.activeTest.textContent = activeTestLabel || "idle";
+      ui.activeTestEcho.textContent = activeTestLabel || "idle";
     }
 
     function summarizeCandidates(sdp) {
@@ -744,24 +783,30 @@
       });
     }
 
+    function setCheckEcho(kind, text) {
+      if (kind === "strict") {
+        ui.strictEcho.textContent = text;
+      } else if (kind === "moderate") {
+        ui.moderateEcho.textContent = text;
+      }
+    }
+
     function resetTelemetry() {
       ui.iceGatheringState.textContent = "new";
       ui.iceConnectionState.textContent = "new";
       ui.connectionState.textContent = "new";
+      ui.activeTest.textContent = "idle";
       ui.candidateSummary.textContent = "not gathered";
       ui.durationEcho.textContent = "-";
       ui.probeEcho.textContent = "not started";
+      ui.activeTestEcho.textContent = "idle";
+      ui.strictEcho.textContent = "pending";
+      ui.moderateEcho.textContent = "pending";
     }
 
-    function stopRun(reason) {
-      const run = state.run;
-      if (!run) {
-        return;
-      }
-
-      state.run = null;
+    function closeActivePeer(run) {
       window.clearTimeout(run.timeoutId);
-      run.abortController.abort();
+      run.timeoutId = 0;
 
       if (run.dataChannel) {
         try {
@@ -769,6 +814,7 @@
         } catch (error) {
           console.debug(error);
         }
+        run.dataChannel = null;
       }
 
       if (run.pc) {
@@ -777,15 +823,254 @@
         } catch (error) {
           console.debug(error);
         }
+        run.pc = null;
+      }
+    }
+
+    function stopRun(reason) {
+      const run = state.run;
+      if (!run) {
+        return;
       }
 
+      run.abortController.abort();
+      closeActivePeer(run);
+      state.run = null;
+
       setRunState(false);
+      ui.activeTest.textContent = "stopped";
+      ui.activeTestEcho.textContent = "stopped";
       if (reason) {
         appendLog(reason, "tone-warn");
       }
     }
 
-    async function startProbe() {
+    function summarizeOutcome(outcome) {
+      if (!outcome) {
+        return "pending";
+      }
+
+      if (outcome.status === "success") {
+        return "connected in " + outcome.durationMs + " ms";
+      }
+      if (outcome.status === "timeout") {
+        return "timed out after signaling";
+      }
+      if (outcome.status === "aborted") {
+        return "stopped";
+      }
+      return "error: " + outcome.detail;
+    }
+
+    function computeVerdict(results) {
+      const strict = results.strict;
+      const moderate = results.moderate;
+
+      if (strict && strict.status === "success") {
+        return {
+          verdict: "open",
+          tone: "open",
+          detail: "The strict assist path connected successfully. That means your NAT behaves like open NAT.",
+        };
+      }
+
+      if (moderate && moderate.status === "success") {
+        if (strict && strict.status === "timeout") {
+          return {
+            verdict: "moderate",
+            tone: "moderate",
+            detail: "The strict assist path did not connect, but the moderate assist path did. That indicates moderate NAT behavior.",
+          };
+        }
+        return {
+          verdict: "moderate or better",
+          tone: "moderate",
+          detail: "The moderate assist path connected, so your NAT is at least moderate. The strict result was inconclusive.",
+        };
+      }
+
+      if (strict && moderate && strict.status === "timeout" && moderate.status === "timeout") {
+        return {
+          verdict: "restricted",
+          tone: "restricted",
+          detail: "Neither the strict nor the moderate assist path opened a data channel. That points to NAT behavior more restrictive than moderate.",
+        };
+      }
+
+      if ((strict && strict.status === "timeout") || (moderate && moderate.status === "timeout")) {
+        return {
+          verdict: "likely restricted",
+          tone: "restricted",
+          detail: "No assist path connected successfully, and at least one path timed out after signaling. That suggests NAT behavior more restrictive than moderate, but the run was not fully conclusive.",
+        };
+      }
+
+      return {
+        verdict: "unknown",
+        tone: "error",
+        detail: "The checks did not produce a successful assist-path connection, and the failures were inconclusive.",
+      };
+    }
+
+    async function waitForProbeOutcome(run, dataChannel, timeoutSeconds, testLabel) {
+      return new Promise((resolve) => {
+        let settled = false;
+
+        function finish(outcome) {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          window.clearTimeout(run.timeoutId);
+          run.timeoutId = 0;
+          resolve(outcome);
+        }
+
+        dataChannel.addEventListener("open", () => {
+          finish({
+            status: "success",
+            detail: "The data channel opened before the timeout.",
+          });
+        }, { once: true });
+
+        dataChannel.addEventListener("close", () => {
+          if (!settled) {
+            appendLog("[" + testLabel + "] data channel closed before classification finished.", "tone-warn");
+          }
+        }, { once: true });
+
+        dataChannel.addEventListener("error", (event) => {
+          const message = event && event.error && event.error.message
+            ? event.error.message
+            : "The data channel reported an error.";
+          appendLog("[" + testLabel + "] " + message, "tone-warn");
+        });
+
+        run.abortController.signal.addEventListener("abort", () => {
+          finish({
+            status: "aborted",
+            detail: "Probe run cancelled.",
+          });
+        }, { once: true });
+
+        run.timeoutId = window.setTimeout(() => {
+          finish({
+            status: "timeout",
+            detail: "The assist server answered, but the data channel never opened before the timeout.",
+          });
+        }, timeoutSeconds * 1000);
+      });
+    }
+
+    async function runSingleProbe(run, options, test) {
+      const probeTargetURL = buildProbeURL(options.probeURL, test.kind);
+      const startedAt = performance.now();
+
+      ui.probeEcho.textContent = probeTargetURL;
+      ui.activeTest.textContent = test.label;
+      ui.activeTestEcho.textContent = test.label;
+      setCheckEcho(test.kind, "running");
+      appendLog("[" + test.label + "] creating RTCPeerConnection.", "tone-running");
+
+      const pc = new RTCPeerConnection({ iceServers: options.iceServers });
+      run.pc = pc;
+
+      const dataChannel = pc.createDataChannel("nat-probe-" + test.kind);
+      run.dataChannel = dataChannel;
+
+      pc.addEventListener("icegatheringstatechange", () => {
+        if (state.run !== run) {
+          return;
+        }
+        setTelemetry(pc, test.label);
+      });
+
+      pc.addEventListener("iceconnectionstatechange", () => {
+        if (state.run !== run) {
+          return;
+        }
+        setTelemetry(pc, test.label);
+        appendLog("[" + test.label + "] ICE connection state changed to " + pc.iceConnectionState + ".", "tone-running");
+      });
+
+      pc.addEventListener("connectionstatechange", () => {
+        if (state.run !== run) {
+          return;
+        }
+        setTelemetry(pc, test.label);
+        appendLog("[" + test.label + "] peer connection state changed to " + pc.connectionState + ".", "tone-running");
+      });
+
+      setTelemetry(pc, test.label);
+      appendLog("[" + test.label + "] creating offer.", "tone-running");
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      appendLog("[" + test.label + "] local description set; gathering ICE candidates.", "tone-running");
+
+      const gatheringTimedOut = await waitForIceGatheringComplete(pc, 10000);
+      if (state.run !== run || run.abortController.signal.aborted) {
+        return {
+          status: "aborted",
+          detail: "Probe run cancelled.",
+          durationMs: Math.round(performance.now() - startedAt),
+        };
+      }
+
+      setTelemetry(pc, test.label);
+
+      if (gatheringTimedOut) {
+        appendLog("[" + test.label + "] ICE gathering did not complete within 10 seconds; proceeding with partial candidates.", "tone-warn");
+      } else {
+        appendLog("[" + test.label + "] ICE gathering completed.", "tone-running");
+      }
+
+      const localDescription = pc.localDescription;
+      if (!localDescription) {
+        throw new Error("Browser did not expose a local description after offer creation.");
+      }
+
+      ui.candidateSummary.textContent = summarizeCandidates(localDescription.sdp);
+
+      const response = await fetch(probeTargetURL, {
+        method: "POST",
+        body: JSON.stringify({
+          Status: "client match",
+          Offer: JSON.stringify(localDescription),
+        }),
+        signal: run.abortController.signal,
+      });
+
+      if (state.run !== run || run.abortController.signal.aborted) {
+        return {
+          status: "aborted",
+          detail: "Probe run cancelled.",
+          durationMs: Math.round(performance.now() - startedAt),
+        };
+      }
+
+      appendLog("[" + test.label + "] probe server responded with status " + response.status + ".", "tone-running");
+
+      if (!response.ok) {
+        throw new Error("Probe endpoint returned HTTP " + response.status + " for the " + test.label + ".");
+      }
+
+      const payload = await response.json();
+      if (!payload || typeof payload.Answer !== "string") {
+        throw new Error("Probe response did not contain an SDP answer for the " + test.label + ".");
+      }
+
+      appendLog("[" + test.label + "] applying SDP answer from probe server.", "tone-running");
+      await pc.setRemoteDescription(JSON.parse(payload.Answer));
+      setTelemetry(pc, test.label);
+
+      appendLog("[" + test.label + "] waiting for the test data channel to open.", "tone-running");
+      const outcome = await waitForProbeOutcome(run, dataChannel, options.timeoutSeconds, test.label);
+      outcome.durationMs = Math.round(performance.now() - startedAt);
+      return outcome;
+    }
+
+    async function startProbeMatrix() {
       if (!window.RTCPeerConnection) {
         setResult("unknown", "This browser does not expose RTCPeerConnection.", "error");
         appendLog("RTCPeerConnection is not available in this browser.", "tone-danger");
@@ -802,14 +1087,12 @@
         timeoutId: 0,
         pc: null,
         dataChannel: null,
-        finished: false,
+        results: {},
       };
       state.run = run;
 
       let probeURL = ui.probeUrl.value.trim();
-      let probeTargetURL = "";
       let timeoutSeconds = Number(ui.timeoutSeconds.value);
-      let simulation = ui.simulation.value;
       let iceServers;
 
       try {
@@ -818,9 +1101,7 @@
         }
         timeoutSeconds = Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 20;
         iceServers = parseIceServers(ui.iceServers.value);
-        probeTargetURL = buildProbeURL(probeURL, simulation);
-
-        if (window.location.protocol === "https:" && probeTargetURL.startsWith("http://")) {
+        if (window.location.protocol === "https:" && probeURL.startsWith("http://")) {
           throw new Error("HTTPS pages cannot call an HTTP probe endpoint because browsers block mixed content.");
         }
       } catch (error) {
@@ -832,144 +1113,62 @@
       }
 
       setRunState(true);
-      setResult("unknown", "Preparing WebRTC offer and waiting for the probe server.", "running");
-      ui.probeEcho.textContent = probeTargetURL;
-
-      appendLog("Creating RTCPeerConnection.", "tone-running");
+      setResult("in progress", "Running strict assist path first, then moderate assist path.", "running");
+      ui.probeEcho.textContent = probeURL;
+      ui.activeTest.textContent = "starting";
+      ui.activeTestEcho.textContent = "starting";
 
       try {
-        const pc = new RTCPeerConnection({ iceServers });
-        run.pc = pc;
+        const options = {
+          probeURL,
+          timeoutSeconds,
+          iceServers,
+        };
 
-        const dataChannel = pc.createDataChannel("nat-probe");
-        run.dataChannel = dataChannel;
-
-        pc.addEventListener("icegatheringstatechange", () => {
-          if (state.run !== run) {
+        for (const test of TEST_SEQUENCE) {
+          if (state.run !== run || run.abortController.signal.aborted) {
             return;
           }
-          ui.iceGatheringState.textContent = pc.iceGatheringState;
-        });
 
-        pc.addEventListener("iceconnectionstatechange", () => {
-          if (state.run !== run) {
+          const outcome = await runSingleProbe(run, options, test);
+          run.results[test.kind] = outcome;
+          setCheckEcho(test.kind, summarizeOutcome(outcome));
+          closeActivePeer(run);
+
+          if (outcome.status === "aborted") {
             return;
           }
-          ui.iceConnectionState.textContent = pc.iceConnectionState;
-          appendLog("ICE connection state changed to " + pc.iceConnectionState + ".", "tone-running");
-        });
 
-        pc.addEventListener("connectionstatechange", () => {
-          if (state.run !== run) {
-            return;
+          if (test.kind === "strict" && outcome.status === "success") {
+            setResult("in progress", "The strict assist path connected. Running the moderate path now to complete the matrix.", "running");
+          } else if (test.kind === "strict" && outcome.status === "timeout") {
+            setResult("in progress", "The strict assist path did not connect. Running the moderate path now.", "running");
+          } else if (test.kind === "strict") {
+            setResult("in progress", "The strict assist path was inconclusive. Running the moderate path now.", "running");
           }
-          ui.connectionState.textContent = pc.connectionState;
-          appendLog("Peer connection state changed to " + pc.connectionState + ".", "tone-running");
-        });
-
-        dataChannel.addEventListener("open", () => {
-          if (state.run !== run || run.finished) {
-            return;
-          }
-          run.finished = true;
-          const durationMs = Math.round(performance.now() - run.startedAt);
-          ui.durationEcho.textContent = durationMs + " ms";
-          setResult(
-            "unrestricted",
-            "The probe server opened the test data channel before the timeout.",
-            "unrestricted",
-          );
-          appendLog("Data channel opened. NAT classified as unrestricted.", "tone-ok");
-          stopRun("");
-        });
-
-        dataChannel.addEventListener("close", () => {
-          if (state.run === run && !run.finished) {
-            appendLog("Test data channel closed before classification finished.", "tone-warn");
-          }
-        });
-
-        dataChannel.addEventListener("error", (event) => {
-          if (state.run !== run || run.finished) {
-            return;
-          }
-          const message = event && event.error && event.error.message
-            ? event.error.message
-            : "The data channel reported an error.";
-          appendLog(message, "tone-warn");
-        });
-
-        setTelemetry(pc);
-        appendLog("Creating offer.", "tone-running");
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        appendLog("Local description set; gathering ICE candidates.", "tone-running");
-
-        const gatheringTimedOut = await waitForIceGatheringComplete(pc, 10000);
-        if (state.run !== run) {
-          return;
         }
-        setTelemetry(pc);
-
-        if (gatheringTimedOut) {
-          appendLog("ICE gathering did not complete within 10 seconds; proceeding with partial candidates.", "tone-warn");
-        } else {
-          appendLog("ICE gathering completed.", "tone-running");
-        }
-
-        const localDescription = pc.localDescription;
-        if (!localDescription) {
-          throw new Error("Browser did not expose a local description after offer creation.");
-        }
-
-        ui.candidateSummary.textContent = summarizeCandidates(localDescription.sdp);
-
-        const response = await fetch(probeTargetURL, {
-          method: "POST",
-          body: JSON.stringify({
-            Status: "client match",
-            Offer: JSON.stringify(localDescription),
-          }),
-          signal: run.abortController.signal,
-        });
 
         if (state.run !== run) {
           return;
         }
 
-        appendLog("Probe server responded with status " + response.status + ".", "tone-running");
+        const totalDurationMs = Math.round(performance.now() - run.startedAt);
+        ui.durationEcho.textContent = totalDurationMs + " ms";
+        ui.activeTest.textContent = "complete";
+        ui.activeTestEcho.textContent = "complete";
 
-        if (!response.ok) {
-          throw new Error("Probe endpoint returned HTTP " + response.status + ".");
+        const verdict = computeVerdict(run.results);
+        setResult(verdict.verdict, verdict.detail, verdict.tone);
+        let verdictTone = "tone-ok";
+        if (verdict.tone === "error") {
+          verdictTone = "tone-danger";
+        } else if (verdict.tone === "restricted") {
+          verdictTone = "tone-warn";
         }
+        appendLog("Final verdict: " + verdict.verdict + ".", verdictTone);
 
-        const payload = await response.json();
-        if (!payload || typeof payload.Answer !== "string") {
-          throw new Error("Probe response did not contain an SDP answer.");
-        }
-
-        appendLog("Applying SDP answer from probe server.", "tone-running");
-        await pc.setRemoteDescription(JSON.parse(payload.Answer));
-        setTelemetry(pc);
-
-        setResult("unknown", "Signaling completed. Waiting for the probe data channel to open.", "running");
-
-        run.timeoutId = window.setTimeout(() => {
-          if (state.run !== run || run.finished) {
-            return;
-          }
-          run.finished = true;
-          const durationMs = Math.round(performance.now() - run.startedAt);
-          ui.durationEcho.textContent = durationMs + " ms";
-          setResult(
-            "restricted",
-            "The probe answered, but the data channel never opened before the timeout.",
-            "restricted",
-          );
-          appendLog("Timed out waiting for the test data channel. NAT classified as restricted.", "tone-warn");
-          stopRun("");
-        }, timeoutSeconds * 1000);
+        state.run = null;
+        setRunState(false);
       } catch (error) {
         if (state.run !== run) {
           return;
@@ -982,14 +1181,17 @@
           ? "Probe run cancelled."
           : error.message || String(error);
 
-        run.finished = true;
         setResult("unknown", message, "error");
         appendLog(message, "tone-danger");
-        stopRun("");
+        closeActivePeer(run);
+        state.run = null;
+        setRunState(false);
+        ui.activeTest.textContent = "error";
+        ui.activeTestEcho.textContent = "error";
       }
     }
 
-    ui.startButton.addEventListener("click", startProbe);
+    ui.startButton.addEventListener("click", startProbeMatrix);
     ui.stopButton.addEventListener("click", () => {
       setResult("unknown", "Probe run stopped before classification finished.", "error");
       stopRun("Probe run stopped.");
