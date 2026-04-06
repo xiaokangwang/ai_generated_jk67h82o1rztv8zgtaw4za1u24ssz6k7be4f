@@ -1,0 +1,1003 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Snowflake NAT Probe Demo</title>
+  <style>
+    :root {
+      --bg: #f2ede3;
+      --surface: rgba(255, 251, 245, 0.88);
+      --surface-strong: #fffaf1;
+      --ink: #1b2430;
+      --muted: #5d6c77;
+      --line: rgba(27, 36, 48, 0.12);
+      --accent: #1f6b59;
+      --accent-soft: rgba(31, 107, 89, 0.12);
+      --warning: #b15d28;
+      --danger: #9b2c2c;
+      --ok: #156f51;
+      --shadow: 0 22px 70px rgba(32, 36, 41, 0.15);
+      --radius-lg: 28px;
+      --radius-md: 18px;
+      --radius-sm: 12px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(255, 181, 95, 0.34), transparent 34%),
+        radial-gradient(circle at top right, rgba(45, 122, 111, 0.20), transparent 32%),
+        linear-gradient(180deg, #efe7d7 0%, #f6f2ea 52%, #ece5d8 100%);
+      font-family: "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+    }
+
+    body::before,
+    body::after {
+      content: "";
+      position: fixed;
+      border-radius: 999px;
+      pointer-events: none;
+      filter: blur(30px);
+      opacity: 0.6;
+      z-index: 0;
+    }
+
+    body::before {
+      width: 260px;
+      height: 260px;
+      top: 7vh;
+      right: -80px;
+      background: rgba(255, 176, 86, 0.26);
+    }
+
+    body::after {
+      width: 220px;
+      height: 220px;
+      left: -70px;
+      bottom: 10vh;
+      background: rgba(31, 107, 89, 0.16);
+    }
+
+    .page {
+      position: relative;
+      z-index: 1;
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }
+
+    .hero {
+      display: grid;
+      gap: 20px;
+      grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.9fr);
+      align-items: stretch;
+      margin-bottom: 22px;
+      animation: rise 480ms ease-out both;
+    }
+
+    .panel {
+      background: var(--surface);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.55);
+      box-shadow: var(--shadow);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      font-size: 0.75rem;
+      color: var(--accent);
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      line-height: 1.05;
+      font-weight: 600;
+    }
+
+    h1 {
+      font-size: clamp(2.3rem, 5vw, 4.4rem);
+      max-width: 12ch;
+    }
+
+    h2 {
+      font-size: clamp(1.55rem, 3vw, 2.15rem);
+      margin-bottom: 18px;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 1rem;
+    }
+
+    .hero-copy p {
+      margin-top: 16px;
+      max-width: 60ch;
+      font-size: 1.05rem;
+    }
+
+    .hero-note {
+      margin-top: 22px;
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(27, 36, 48, 0.08);
+      font-size: 0.92rem;
+      color: var(--ink);
+    }
+
+    .status-card {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 22px;
+      background:
+        linear-gradient(160deg, rgba(255, 250, 241, 0.96), rgba(248, 240, 226, 0.9)),
+        var(--surface-strong);
+    }
+
+    .result-label {
+      display: inline-flex;
+      align-items: center;
+      align-self: flex-start;
+      padding: 8px 14px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      background: rgba(27, 36, 48, 0.08);
+      color: var(--muted);
+    }
+
+    .result-value {
+      font-size: clamp(2rem, 6vw, 3.3rem);
+      letter-spacing: -0.03em;
+      margin-top: 12px;
+      text-transform: capitalize;
+    }
+
+    .result-detail {
+      font-size: 1rem;
+      min-height: 3.2em;
+      color: var(--muted);
+    }
+
+    .result-meta {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .meta-tile {
+      padding: 14px 16px;
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.76);
+      border: 1px solid rgba(27, 36, 48, 0.08);
+    }
+
+    .meta-label {
+      display: block;
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .meta-value {
+      font-size: 1.02rem;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    .grid {
+      display: grid;
+      gap: 22px;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+      animation: rise 620ms ease-out both;
+      animation-delay: 70ms;
+    }
+
+    .form-grid {
+      display: grid;
+      gap: 18px;
+    }
+
+    .field {
+      display: grid;
+      gap: 8px;
+    }
+
+    .field-row {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    label {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--ink);
+    }
+
+    input,
+    textarea,
+    select,
+    button {
+      font: inherit;
+    }
+
+    input,
+    textarea,
+    select {
+      width: 100%;
+      padding: 14px 16px;
+      border-radius: var(--radius-sm);
+      border: 1px solid rgba(27, 36, 48, 0.14);
+      background: rgba(255, 255, 255, 0.86);
+      color: var(--ink);
+      outline: none;
+      transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+    }
+
+    textarea {
+      min-height: 86px;
+      resize: vertical;
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92rem;
+    }
+
+    input:focus,
+    textarea:focus,
+    select:focus {
+      border-color: rgba(31, 107, 89, 0.45);
+      box-shadow: 0 0 0 4px rgba(31, 107, 89, 0.12);
+      transform: translateY(-1px);
+    }
+
+    .helper {
+      font-size: 0.88rem;
+      color: var(--muted);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-top: 4px;
+    }
+
+    .button {
+      border: 0;
+      border-radius: 999px;
+      padding: 13px 20px;
+      cursor: pointer;
+      transition: transform 180ms ease, box-shadow 180ms ease, opacity 180ms ease;
+    }
+
+    .button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 28px rgba(27, 36, 48, 0.16);
+    }
+
+    .button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .button-primary {
+      background: linear-gradient(135deg, #1f6b59, #0d3f44);
+      color: #fffef9;
+    }
+
+    .button-secondary {
+      background: rgba(255, 255, 255, 0.74);
+      color: var(--ink);
+      border: 1px solid rgba(27, 36, 48, 0.12);
+    }
+
+    .stats {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .stat {
+      padding: 16px;
+      border-radius: var(--radius-md);
+      background: rgba(255, 255, 255, 0.7);
+      border: 1px solid rgba(27, 36, 48, 0.08);
+    }
+
+    .stat-title {
+      font-size: 0.76rem;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .stat-value {
+      font-size: 1rem;
+      line-height: 1.45;
+      text-transform: capitalize;
+      word-break: break-word;
+    }
+
+    .list-card {
+      display: grid;
+      gap: 16px;
+    }
+
+    .bullet-list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    .bullet-list li + li {
+      margin-top: 10px;
+    }
+
+    .log {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 10px;
+      max-height: 360px;
+      overflow: auto;
+    }
+
+    .log li {
+      padding: 12px 14px;
+      border-radius: var(--radius-sm);
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(27, 36, 48, 0.08);
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.84rem;
+      line-height: 1.55;
+      color: #24333f;
+    }
+
+    .empty-log {
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    .tone-ok {
+      background: rgba(21, 111, 81, 0.12);
+      color: var(--ok);
+    }
+
+    .tone-warn {
+      background: rgba(177, 93, 40, 0.13);
+      color: var(--warning);
+    }
+
+    .tone-danger {
+      background: rgba(155, 44, 44, 0.13);
+      color: var(--danger);
+    }
+
+    .tone-running {
+      background: rgba(31, 107, 89, 0.10);
+      color: var(--accent);
+    }
+
+    code {
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    .footer-note {
+      margin-top: 22px;
+      font-size: 0.92rem;
+      color: var(--muted);
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 980px) {
+      .hero,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        padding: 20px 14px 40px;
+      }
+
+      .panel {
+        padding: 20px;
+      }
+
+      .field-row,
+      .stats,
+      .result-meta {
+        grid-template-columns: 1fr;
+      }
+
+      .actions {
+        flex-direction: column;
+      }
+
+      .button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <article class="panel hero-copy">
+        <p class="eyebrow">Snowflake / Probetest</p>
+        <h1>Browser NAT probe demo</h1>
+        <p>
+          This page behaves like the Snowflake proxy NAT check. It creates a WebRTC
+          offer, posts it to <code>/probe</code>, applies the returned answer, and
+          waits for the test data channel to open.
+        </p>
+        <div class="hero-note">
+          <span class="chip">Open data channel = <strong>unrestricted</strong></span>
+          <span class="chip">Timeout after signaling = <strong>restricted</strong></span>
+          <span class="chip">Signaling or browser failure = <strong>unknown</strong></span>
+        </div>
+      </article>
+
+      <aside class="panel status-card">
+        <div>
+          <span id="resultTone" class="result-label">idle</span>
+          <div id="natResult" class="result-value">unknown</div>
+        </div>
+        <p id="resultDetail" class="result-detail">
+          Configure the probe endpoint, then start a NAT check.
+        </p>
+        <div class="result-meta">
+          <div class="meta-tile">
+            <span class="meta-label">Probe target</span>
+            <span id="probeEcho" class="meta-value">not started</span>
+          </div>
+          <div class="meta-tile">
+            <span class="meta-label">Round trip</span>
+            <span id="durationEcho" class="meta-value">-</span>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Run a check</h2>
+        <div class="form-grid">
+          <div class="field">
+            <label for="probeUrl">Probe URL</label>
+            <input id="probeUrl" name="probeUrl" spellcheck="false">
+            <div class="helper">
+              Defaults to the current origin's <code>/probe</code> endpoint.
+            </div>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="simulation">Connectivity simulation</label>
+              <select id="simulation" name="simulation">
+                <option value="strict">Strict symmetric NAT check</option>
+                <option value="moderate">Moderate connectivity simulation</option>
+              </select>
+              <div class="helper">
+                Maps to probetest's <code>InCoSim</code> query parameter.
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="timeoutSeconds">Timeout (seconds)</label>
+              <input id="timeoutSeconds" name="timeoutSeconds" type="number" min="5" max="120" step="1" value="20">
+              <div class="helper">
+                Snowflake proxy uses 20 seconds by default.
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="iceServers">ICE / STUN servers</label>
+            <textarea id="iceServers" name="iceServers" spellcheck="false"></textarea>
+            <div class="helper">
+              Comma-separated list of ICE server URLs used by the browser while creating the offer.
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="startButton" class="button button-primary" type="button">Start NAT probe</button>
+            <button id="stopButton" class="button button-secondary" type="button" disabled>Stop</button>
+          </div>
+        </div>
+
+        <p class="footer-note">
+          If this page is loaded over <code>https://</code>, the probe endpoint also needs to be
+          <code>https://</code> to avoid mixed-content blocking.
+        </p>
+      </article>
+
+      <article class="panel list-card">
+        <h2>Session telemetry</h2>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-title">ICE gathering</div>
+            <div id="iceGatheringState" class="stat-value">new</div>
+          </div>
+          <div class="stat">
+            <div class="stat-title">ICE connection</div>
+            <div id="iceConnectionState" class="stat-value">new</div>
+          </div>
+          <div class="stat">
+            <div class="stat-title">Peer connection</div>
+            <div id="connectionState" class="stat-value">new</div>
+          </div>
+          <div class="stat">
+            <div class="stat-title">Candidate profile</div>
+            <div id="candidateSummary" class="stat-value">not gathered</div>
+          </div>
+        </div>
+
+        <div>
+          <h3>How to read the result</h3>
+          <ul class="bullet-list">
+            <li><strong>Unrestricted</strong>: the browser established the WebRTC data channel to the probe server.</li>
+            <li><strong>Restricted</strong>: signaling completed, but the data channel never opened before the timeout.</li>
+            <li><strong>Unknown</strong>: the check failed before a meaningful NAT classification could be made.</li>
+          </ul>
+        </div>
+
+        <div>
+          <h3>Activity log</h3>
+          <ul id="log" class="log">
+            <li class="empty-log">No probe has been run yet.</li>
+          </ul>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const DEFAULT_ICE_SERVERS = [
+      "stun:stun.l.google.com:19302",
+      "stun:stun.voip.blackberry.com:3478",
+    ];
+
+    const state = {
+      run: null,
+    };
+
+    const ui = {
+      probeUrl: document.getElementById("probeUrl"),
+      simulation: document.getElementById("simulation"),
+      timeoutSeconds: document.getElementById("timeoutSeconds"),
+      iceServers: document.getElementById("iceServers"),
+      startButton: document.getElementById("startButton"),
+      stopButton: document.getElementById("stopButton"),
+      resultTone: document.getElementById("resultTone"),
+      natResult: document.getElementById("natResult"),
+      resultDetail: document.getElementById("resultDetail"),
+      probeEcho: document.getElementById("probeEcho"),
+      durationEcho: document.getElementById("durationEcho"),
+      iceGatheringState: document.getElementById("iceGatheringState"),
+      iceConnectionState: document.getElementById("iceConnectionState"),
+      connectionState: document.getElementById("connectionState"),
+      candidateSummary: document.getElementById("candidateSummary"),
+      log: document.getElementById("log"),
+    };
+
+    function defaultProbeURL() {
+      if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+        return new URL("/probe", window.location.origin).toString();
+      }
+      return "/probe";
+    }
+
+    function parseIceServers(rawValue) {
+      const urls = rawValue
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (!urls.length) {
+        throw new Error("Provide at least one ICE server URL.");
+      }
+      return [{ urls }];
+    }
+
+    function appendLog(message, tone) {
+      const item = document.createElement("li");
+      const timestamp = new Date().toLocaleTimeString();
+      item.textContent = "[" + timestamp + "] " + message;
+      if (tone) {
+        item.classList.add(tone);
+      }
+      const empty = ui.log.querySelector(".empty-log");
+      if (empty) {
+        empty.remove();
+      }
+      ui.log.prepend(item);
+    }
+
+    function setRunState(isRunning) {
+      ui.startButton.disabled = isRunning;
+      ui.stopButton.disabled = !isRunning;
+    }
+
+    function setResult(natType, detail, tone) {
+      ui.natResult.textContent = natType;
+      ui.resultDetail.textContent = detail;
+      ui.resultTone.textContent = tone;
+      ui.resultTone.className = "result-label";
+      if (tone === "unrestricted") {
+        ui.resultTone.classList.add("tone-ok");
+      } else if (tone === "restricted") {
+        ui.resultTone.classList.add("tone-warn");
+      } else if (tone === "running") {
+        ui.resultTone.classList.add("tone-running");
+      } else if (tone === "error") {
+        ui.resultTone.classList.add("tone-danger");
+      }
+    }
+
+    function setTelemetry(pc) {
+      ui.iceGatheringState.textContent = pc.iceGatheringState;
+      ui.iceConnectionState.textContent = pc.iceConnectionState;
+      ui.connectionState.textContent = pc.connectionState;
+    }
+
+    function summarizeCandidates(sdp) {
+      if (!sdp) {
+        return "not gathered";
+      }
+
+      const counts = { host: 0, srflx: 0, relay: 0, prflx: 0, other: 0 };
+      const lines = sdp.split(/\r?\n/);
+
+      for (const line of lines) {
+        if (!line.startsWith("a=candidate:")) {
+          continue;
+        }
+        const parts = line.slice("a=candidate:".length).trim().split(/\s+/);
+        const typeIndex = parts.indexOf("typ");
+        const candidateType = typeIndex >= 0 ? parts[typeIndex + 1] : "other";
+        if (Object.hasOwn(counts, candidateType)) {
+          counts[candidateType] += 1;
+        } else {
+          counts.other += 1;
+        }
+      }
+
+      const fragments = [];
+      for (const key of ["host", "srflx", "relay", "prflx", "other"]) {
+        if (counts[key] > 0) {
+          fragments.push(key + " " + counts[key]);
+        }
+      }
+      return fragments.length ? fragments.join(", ") : "no candidates in SDP";
+    }
+
+    function buildProbeURL(rawURL, simulation) {
+      const url = new URL(rawURL, window.location.href);
+      url.searchParams.set("InCoSim", simulation);
+      return url.toString();
+    }
+
+    function waitForIceGatheringComplete(pc, timeoutMs) {
+      if (pc.iceGatheringState === "complete") {
+        return Promise.resolve(false);
+      }
+
+      return new Promise((resolve) => {
+        const timeoutId = window.setTimeout(() => {
+          pc.removeEventListener("icegatheringstatechange", handleChange);
+          resolve(true);
+        }, timeoutMs);
+
+        function handleChange() {
+          if (pc.iceGatheringState === "complete") {
+            window.clearTimeout(timeoutId);
+            pc.removeEventListener("icegatheringstatechange", handleChange);
+            resolve(false);
+          }
+        }
+
+        pc.addEventListener("icegatheringstatechange", handleChange);
+      });
+    }
+
+    function resetTelemetry() {
+      ui.iceGatheringState.textContent = "new";
+      ui.iceConnectionState.textContent = "new";
+      ui.connectionState.textContent = "new";
+      ui.candidateSummary.textContent = "not gathered";
+      ui.durationEcho.textContent = "-";
+      ui.probeEcho.textContent = "not started";
+    }
+
+    function stopRun(reason) {
+      const run = state.run;
+      if (!run) {
+        return;
+      }
+
+      state.run = null;
+      window.clearTimeout(run.timeoutId);
+      run.abortController.abort();
+
+      if (run.dataChannel) {
+        try {
+          run.dataChannel.close();
+        } catch (error) {
+          console.debug(error);
+        }
+      }
+
+      if (run.pc) {
+        try {
+          run.pc.close();
+        } catch (error) {
+          console.debug(error);
+        }
+      }
+
+      setRunState(false);
+      if (reason) {
+        appendLog(reason, "tone-warn");
+      }
+    }
+
+    async function startProbe() {
+      if (!window.RTCPeerConnection) {
+        setResult("unknown", "This browser does not expose RTCPeerConnection.", "error");
+        appendLog("RTCPeerConnection is not available in this browser.", "tone-danger");
+        return;
+      }
+
+      stopRun("");
+      resetTelemetry();
+      ui.log.innerHTML = "";
+
+      const run = {
+        abortController: new AbortController(),
+        startedAt: performance.now(),
+        timeoutId: 0,
+        pc: null,
+        dataChannel: null,
+        finished: false,
+      };
+      state.run = run;
+
+      let probeURL = ui.probeUrl.value.trim();
+      let probeTargetURL = "";
+      let timeoutSeconds = Number(ui.timeoutSeconds.value);
+      let simulation = ui.simulation.value;
+      let iceServers;
+
+      try {
+        if (!probeURL) {
+          throw new Error("Probe URL is required.");
+        }
+        timeoutSeconds = Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 20;
+        iceServers = parseIceServers(ui.iceServers.value);
+        probeTargetURL = buildProbeURL(probeURL, simulation);
+
+        if (window.location.protocol === "https:" && probeTargetURL.startsWith("http://")) {
+          throw new Error("HTTPS pages cannot call an HTTP probe endpoint because browsers block mixed content.");
+        }
+      } catch (error) {
+        state.run = null;
+        setRunState(false);
+        setResult("unknown", error.message, "error");
+        appendLog(error.message, "tone-danger");
+        return;
+      }
+
+      setRunState(true);
+      setResult("unknown", "Preparing WebRTC offer and waiting for the probe server.", "running");
+      ui.probeEcho.textContent = probeTargetURL;
+
+      appendLog("Creating RTCPeerConnection.", "tone-running");
+
+      try {
+        const pc = new RTCPeerConnection({ iceServers });
+        run.pc = pc;
+
+        const dataChannel = pc.createDataChannel("nat-probe");
+        run.dataChannel = dataChannel;
+
+        pc.addEventListener("icegatheringstatechange", () => {
+          if (state.run !== run) {
+            return;
+          }
+          ui.iceGatheringState.textContent = pc.iceGatheringState;
+        });
+
+        pc.addEventListener("iceconnectionstatechange", () => {
+          if (state.run !== run) {
+            return;
+          }
+          ui.iceConnectionState.textContent = pc.iceConnectionState;
+          appendLog("ICE connection state changed to " + pc.iceConnectionState + ".", "tone-running");
+        });
+
+        pc.addEventListener("connectionstatechange", () => {
+          if (state.run !== run) {
+            return;
+          }
+          ui.connectionState.textContent = pc.connectionState;
+          appendLog("Peer connection state changed to " + pc.connectionState + ".", "tone-running");
+        });
+
+        dataChannel.addEventListener("open", () => {
+          if (state.run !== run || run.finished) {
+            return;
+          }
+          run.finished = true;
+          const durationMs = Math.round(performance.now() - run.startedAt);
+          ui.durationEcho.textContent = durationMs + " ms";
+          setResult(
+            "unrestricted",
+            "The probe server opened the test data channel before the timeout.",
+            "unrestricted",
+          );
+          appendLog("Data channel opened. NAT classified as unrestricted.", "tone-ok");
+          stopRun("");
+        });
+
+        dataChannel.addEventListener("close", () => {
+          if (state.run === run && !run.finished) {
+            appendLog("Test data channel closed before classification finished.", "tone-warn");
+          }
+        });
+
+        dataChannel.addEventListener("error", (event) => {
+          if (state.run !== run || run.finished) {
+            return;
+          }
+          const message = event && event.error && event.error.message
+            ? event.error.message
+            : "The data channel reported an error.";
+          appendLog(message, "tone-warn");
+        });
+
+        setTelemetry(pc);
+        appendLog("Creating offer.", "tone-running");
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        appendLog("Local description set; gathering ICE candidates.", "tone-running");
+
+        const gatheringTimedOut = await waitForIceGatheringComplete(pc, 10000);
+        if (state.run !== run) {
+          return;
+        }
+        setTelemetry(pc);
+
+        if (gatheringTimedOut) {
+          appendLog("ICE gathering did not complete within 10 seconds; proceeding with partial candidates.", "tone-warn");
+        } else {
+          appendLog("ICE gathering completed.", "tone-running");
+        }
+
+        const localDescription = pc.localDescription;
+        if (!localDescription) {
+          throw new Error("Browser did not expose a local description after offer creation.");
+        }
+
+        ui.candidateSummary.textContent = summarizeCandidates(localDescription.sdp);
+
+        const response = await fetch(probeTargetURL, {
+          method: "POST",
+          body: JSON.stringify({
+            Status: "client match",
+            Offer: JSON.stringify(localDescription),
+          }),
+          signal: run.abortController.signal,
+        });
+
+        if (state.run !== run) {
+          return;
+        }
+
+        appendLog("Probe server responded with status " + response.status + ".", "tone-running");
+
+        if (!response.ok) {
+          throw new Error("Probe endpoint returned HTTP " + response.status + ".");
+        }
+
+        const payload = await response.json();
+        if (!payload || typeof payload.Answer !== "string") {
+          throw new Error("Probe response did not contain an SDP answer.");
+        }
+
+        appendLog("Applying SDP answer from probe server.", "tone-running");
+        await pc.setRemoteDescription(JSON.parse(payload.Answer));
+        setTelemetry(pc);
+
+        setResult("unknown", "Signaling completed. Waiting for the probe data channel to open.", "running");
+
+        run.timeoutId = window.setTimeout(() => {
+          if (state.run !== run || run.finished) {
+            return;
+          }
+          run.finished = true;
+          const durationMs = Math.round(performance.now() - run.startedAt);
+          ui.durationEcho.textContent = durationMs + " ms";
+          setResult(
+            "restricted",
+            "The probe answered, but the data channel never opened before the timeout.",
+            "restricted",
+          );
+          appendLog("Timed out waiting for the test data channel. NAT classified as restricted.", "tone-warn");
+          stopRun("");
+        }, timeoutSeconds * 1000);
+      } catch (error) {
+        if (state.run !== run) {
+          return;
+        }
+
+        const durationMs = Math.round(performance.now() - run.startedAt);
+        ui.durationEcho.textContent = durationMs + " ms";
+
+        const message = error && error.name === "AbortError"
+          ? "Probe run cancelled."
+          : error.message || String(error);
+
+        run.finished = true;
+        setResult("unknown", message, "error");
+        appendLog(message, "tone-danger");
+        stopRun("");
+      }
+    }
+
+    ui.startButton.addEventListener("click", startProbe);
+    ui.stopButton.addEventListener("click", () => {
+      setResult("unknown", "Probe run stopped before classification finished.", "error");
+      stopRun("Probe run stopped.");
+    });
+
+    ui.probeUrl.value = defaultProbeURL();
+    ui.iceServers.value = DEFAULT_ICE_SERVERS.join(", ");
+    resetTelemetry();
+  </script>
+</body>
+</html>
