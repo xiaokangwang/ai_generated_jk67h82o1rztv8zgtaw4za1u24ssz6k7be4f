@@ -98,6 +98,9 @@ func makePeerConnectionFromOffer(stunURL string, sdp *webrtc.SessionDescription,
 			},
 		},
 	}
+	if removeLocalCandidate {
+		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	}
 	pc, err := api.NewPeerConnection(config)
 	if err != nil {
 		return nil, fmt.Errorf("accept: NewPeerConnection: %s", err)
