@@ -3,6 +3,7 @@
 **Table of Contents**
 
 - [Overview](#overview)
+- [Browser demo](#browser-demo)
 - [Running your own](#running-your-own)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
@@ -14,6 +15,28 @@ This is code for a remote probe test component of Snowflake.
 This is a probe test server to allow proxies to test their compatability
 with Snowflake. Right now the only type of test implemented is a
 compatability check for clients with symmetric NATs.
+
+### Browser demo
+
+The probetest server now also serves an HTML/JavaScript demo UI at `/`
+(also available at `/demo.html`). The page runs the same high-level flow
+as Snowflake's proxy NAT check:
+
+1. Create a WebRTC offer with a test data channel.
+2. `POST` the offer to `/probe`.
+3. Apply the answer from probetest.
+4. Classify the NAT as:
+   - `unrestricted` if the data channel opens.
+   - `restricted` if signaling succeeds but the data channel times out.
+   - `unknown` if signaling or browser setup fails.
+
+For a quick local demo:
+
+```
+go run ./probetest --disable-tls
+```
+
+Then open `http://127.0.0.1:8443/` in a browser.
 
 ### Running your own
 

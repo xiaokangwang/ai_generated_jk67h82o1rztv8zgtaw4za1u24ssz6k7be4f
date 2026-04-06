@@ -156,6 +156,19 @@ func probeHandler(stunURL string, w http.ResponseWriter, r *http.Request,
 	strictInteractiveConnectivitySimulationSocks5Proxy string,
 	moderateInteractiveConnectivitySimulationSocks5Proxy string) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST, OPTIONS")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
 	var removeLocalCandidate bool
 	var socks5proxy *url.URL
 	interactiveConnectivitySimulationKind := r.URL.Query().Get("InCoSim")
@@ -306,6 +319,7 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
+	http.HandleFunc("/", demoHandler)
 	http.Handle("/probe", ProbeHandler{stunURL, probeHandler,
 		strictInteractiveConnectivitySimulationSocks5Proxy,
 		moderateInteractiveConnectivitySimulationSocks5Proxy})
