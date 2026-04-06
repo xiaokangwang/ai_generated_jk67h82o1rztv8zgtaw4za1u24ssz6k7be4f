@@ -1,6 +1,6 @@
 # socks5udp-proxy
 
-A small Go project that exposes a UDP port and accepts SOCKS5 UDP packets directly, without the normal SOCKS5 TCP handshake or `UDP ASSOCIATE` step.
+A small Go project that exposes a UDP port and accepts SOCKS5 UDP packets directly. It can also optionally expose a TCP SOCKS5 control listener on the same port number to handle a no-auth `UDP ASSOCIATE` handshake for clients that expect the standard SOCKS5 setup step.
 
 ## What it does
 
@@ -9,13 +9,15 @@ A small Go project that exposes a UDP port and accepts SOCKS5 UDP packets direct
 - Extracts the target host and port from the packet.
 - Forwards the payload to that UDP target.
 - Sends upstream replies back to the client wrapped in SOCKS5 UDP format.
+- Optionally listens on TCP on the same numeric port and handles SOCKS5 version 5 with no authentication.
+- When the optional TCP listener is enabled, accepts `UDP ASSOCIATE` and returns the configured UDP relay port.
 
 ## What it does not do
 
-- No TCP SOCKS5 handshake.
-- No authentication.
+- No username/password authentication.
 - No support for `FRAG != 0`.
-- No TCP proxying.
+- No TCP proxying for `CONNECT`.
+- No `BIND` support.
 
 ## Packet format
 
@@ -38,10 +40,17 @@ Replies are sent back in the same format, using the upstream sender as the encod
 go run . -listen :1080
 ```
 
+Enable the optional TCP SOCKS5 adaptor on the same port:
+
+```bash
+go run . -listen :1080 -tcp-socks5-adaptor
+```
+
 Optional flags:
 
 ```bash
 go run . -listen :1080 -idle-timeout 2m
+go run . -listen :1080 -tcp-socks5-adaptor
 go run . -listen :1080 -split-destinations=true
 go run . -listen :1080 -split-destinations=true -max-open-sockets 32
 go run . -listen :1080 -split-destinations=false -incoming-filter=true -incoming-allow-period 30s
@@ -50,7 +59,15 @@ go run . -listen :1080 -split-destinations=false -incoming-filter=true -incoming
 
 ## Notes
 
-This is intentionally non-standard from a SOCKS5 client perspective. A normal SOCKS5 client will usually expect to negotiate over TCP first. This proxy is for clients that already know the UDP relay port and can emit SOCKS5 UDP packets directly.
+Without `-tcp-socks5-adaptor`, this is intentionally non-standard from a SOCKS5 client perspective. The client must already know the UDP relay port and emit SOCKS5 UDP packets directly.
+
+With `-tcp-socks5-adaptor`, the proxy also listens on TCP on the same port number as the UDP relay and supports the minimal SOCKS5 flow needed for UDP:
+
+- SOCKS5 version 5 only.
+- No-auth method only (`0x00`).
+- `UDP ASSOCIATE` only.
+- The reply returns the configured UDP port.
+- The TCP connection is not used to proxy payload traffic; it only establishes the UDP relay information.
 
 `-split-destinations=true` is the strict-NAT-style mode. Each client keeps a map of destination addresses, and each destination gets its own dialed UDP socket, so different targets use different upstream source ports.
 

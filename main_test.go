@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"log"
 	"net"
@@ -594,6 +595,169 @@ func TestIncomingFilterEvictsLeastRecentlyUsedAllowedDestination(t *testing.T) {
 	}
 }
 
+func TestTCPUDPAssociateReturnsUDPPortAndRelaysUDP(t *testing.T) {
+	echoAddr, stopEcho := startUDPEchoServer(t)
+	defer stopEcho()
+
+	logger := log.New(io.Discard, "", 0)
+	p, err := newProxy("127.0.0.1:0", time.Minute, logger)
+	if err != nil {
+		t.Fatalf("newProxy returned error: %v", err)
+	}
+	defer p.closeListeners()
+
+	if err := p.enableTCPAssociateListener(); err != nil {
+		t.Fatalf("enableTCPAssociateListener returned error: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.serve()
+	}()
+
+	tcpConn, err := net.DialTCP("tcp", nil, p.tcpListener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatalf("DialTCP returned error: %v", err)
+	}
+	defer tcpConn.Close()
+
+	if _, err := tcpConn.Write([]byte{socks5Version, 0x01, socks5MethodNoAuth}); err != nil {
+		t.Fatalf("tcp greeting write returned error: %v", err)
+	}
+
+	greetingResponse := make([]byte, 2)
+	if _, err := io.ReadFull(tcpConn, greetingResponse); err != nil {
+		t.Fatalf("tcp greeting read returned error: %v", err)
+	}
+
+	if !bytes.Equal(greetingResponse, []byte{socks5Version, socks5MethodNoAuth}) {
+		t.Fatalf("unexpected greeting response: got %v", greetingResponse)
+	}
+
+	request := []byte{
+		socks5Version, socks5CommandUDPAssociate, 0x00, socks5AddressTypeIPv4,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+	}
+	if _, err := tcpConn.Write(request); err != nil {
+		t.Fatalf("udp associate request write returned error: %v", err)
+	}
+
+	replyIP, replyPort := readSocks5Reply(t, tcpConn)
+	if got, want := replyPort, p.listener.LocalAddr().(*net.UDPAddr).Port; got != want {
+		t.Fatalf("unexpected UDP port in associate reply: got %d want %d", got, want)
+	}
+
+	client, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatalf("ListenUDP returned error: %v", err)
+	}
+	defer client.Close()
+
+	proxyAddr := &net.UDPAddr{IP: replyIP, Port: replyPort}
+	udpRequest, err := buildSocks5UDPDatagram(echoAddr, []byte("hello via tcp adaptor"))
+	if err != nil {
+		t.Fatalf("buildSocks5UDPDatagram returned error: %v", err)
+	}
+
+	if _, err := client.WriteToUDP(udpRequest, proxyAddr); err != nil {
+		t.Fatalf("client WriteToUDP returned error: %v", err)
+	}
+
+	buffer := make([]byte, 2048)
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := client.ReadFromUDP(buffer)
+	if err != nil {
+		t.Fatalf("client ReadFromUDP returned error: %v", err)
+	}
+
+	addr, payload, err := parseSocks5UDPRequest(buffer[:n])
+	if err != nil {
+		t.Fatalf("parseSocks5UDPRequest returned error: %v", err)
+	}
+
+	if got, want := addr.String(), echoAddr.String(); got != want {
+		t.Fatalf("unexpected response source: got %s want %s", got, want)
+	}
+
+	if got, want := string(payload), "hello via tcp adaptor"; got != want {
+		t.Fatalf("unexpected response payload: got %q want %q", got, want)
+	}
+
+	p.closeListeners()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected serve to stop with an error after closing listeners")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy serve did not stop after closing listeners")
+	}
+}
+
+func TestTCPRejectsUnsupportedConnectCommand(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	p, err := newProxy("127.0.0.1:0", time.Minute, logger)
+	if err != nil {
+		t.Fatalf("newProxy returned error: %v", err)
+	}
+	defer p.closeListeners()
+
+	if err := p.enableTCPAssociateListener(); err != nil {
+		t.Fatalf("enableTCPAssociateListener returned error: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.serve()
+	}()
+
+	tcpConn, err := net.DialTCP("tcp", nil, p.tcpListener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatalf("DialTCP returned error: %v", err)
+	}
+	defer tcpConn.Close()
+
+	if _, err := tcpConn.Write([]byte{socks5Version, 0x01, socks5MethodNoAuth}); err != nil {
+		t.Fatalf("tcp greeting write returned error: %v", err)
+	}
+
+	greetingResponse := make([]byte, 2)
+	if _, err := io.ReadFull(tcpConn, greetingResponse); err != nil {
+		t.Fatalf("tcp greeting read returned error: %v", err)
+	}
+
+	request := []byte{
+		socks5Version, socks5CommandConnect, 0x00, socks5AddressTypeIPv4,
+		1, 2, 3, 4,
+		0x00, 0x50,
+	}
+	if _, err := tcpConn.Write(request); err != nil {
+		t.Fatalf("connect request write returned error: %v", err)
+	}
+
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(tcpConn, reply); err != nil {
+		t.Fatalf("connect reply read returned error: %v", err)
+	}
+
+	if got, want := reply[1], byte(socks5ReplyCommandUnsupported); got != want {
+		t.Fatalf("unexpected connect reply code: got 0x%02x want 0x%02x", got, want)
+	}
+
+	p.closeListeners()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected serve to stop with an error after closing listeners")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy serve did not stop after closing listeners")
+	}
+}
+
 func startUDPEchoServer(t *testing.T) (*net.UDPAddr, func()) {
 	t.Helper()
 
@@ -624,4 +788,42 @@ func startUDPEchoServer(t *testing.T) (*net.UDPAddr, func()) {
 		_ = conn.Close()
 		<-stopped
 	}
+}
+
+func readSocks5Reply(t *testing.T, conn net.Conn) (net.IP, int) {
+	t.Helper()
+
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		t.Fatalf("ReadFull reply header returned error: %v", err)
+	}
+
+	if got, want := header[0], byte(socks5Version); got != want {
+		t.Fatalf("unexpected reply version: got 0x%02x want 0x%02x", got, want)
+	}
+
+	if got, want := header[1], byte(socks5ReplySucceeded); got != want {
+		t.Fatalf("unexpected reply code: got 0x%02x want 0x%02x", got, want)
+	}
+
+	var ip net.IP
+	switch header[3] {
+	case socks5AddressTypeIPv4:
+		ip = make(net.IP, net.IPv4len)
+	case socks5AddressTypeIPv6:
+		ip = make(net.IP, net.IPv6len)
+	default:
+		t.Fatalf("unexpected reply address type: 0x%02x", header[3])
+	}
+
+	if _, err := io.ReadFull(conn, ip); err != nil {
+		t.Fatalf("ReadFull reply address returned error: %v", err)
+	}
+
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(conn, portBytes); err != nil {
+		t.Fatalf("ReadFull reply port returned error: %v", err)
+	}
+
+	return ip, int(binary.BigEndian.Uint16(portBytes))
 }
