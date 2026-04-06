@@ -16,12 +16,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/pion/transport/v4"
 	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/ptutil/safelog"
 	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2/common/messages"
+	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2/common/proxy"
 	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2/common/util"
 
 	"github.com/pion/transport/v4/stdnet"
@@ -41,18 +44,22 @@ const (
 )
 
 type ProbeHandler struct {
-	stunURL string
-	handle  func(string, http.ResponseWriter, *http.Request)
+	stunURL                                              string
+	handle                                               func(string, http.ResponseWriter, *http.Request, string, string)
+	strictInteractiveConnectivitySimulationSocks5Proxy   string
+	moderateInteractiveConnectivitySimulationSocks5Proxy string
 }
 
 func (h ProbeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.handle(h.stunURL, w, r)
+	h.handle(h.stunURL, w, r,
+		h.strictInteractiveConnectivitySimulationSocks5Proxy, h.moderateInteractiveConnectivitySimulationSocks5Proxy)
 }
 
 // Create a PeerConnection from an SDP offer. Blocks until the gathering of ICE
 // candidates is complete and the answer is available in LocalDescription.
 func makePeerConnectionFromOffer(stunURL string, sdp *webrtc.SessionDescription,
-	dataChanOpen chan struct{}, dataChanClosed chan struct{}, iceGatheringTimeout time.Duration) (*webrtc.PeerConnection, error) {
+	dataChanOpen chan struct{}, dataChanClosed chan struct{}, iceGatheringTimeout time.Duration,
+	socks5proxy *url.URL, removeLocalCandidate bool) (*webrtc.PeerConnection, error) {
 
 	settingsEngine := webrtc.SettingEngine{}
 
@@ -61,6 +68,9 @@ func makePeerConnectionFromOffer(stunURL string, sdp *webrtc.SessionDescription,
 		// but let's keep them just in case.
 		// FYI there is similar code in other files in this project.
 		keep = !util.IsLocal(ip) && !ip.IsLoopback() && !ip.IsUnspecified()
+		if removeLocalCandidate {
+			return false
+		}
 		return
 	})
 	// FYI this is `false` by default anyway as of pion/webrtc@4
@@ -69,7 +79,15 @@ func makePeerConnectionFromOffer(stunURL string, sdp *webrtc.SessionDescription,
 	// Use the SetNet setting https://pkg.go.dev/github.com/pion/webrtc/v3#SettingEngine.SetNet
 	// to functionally revert a new change in pion by silently ignoring
 	// when net.Interfaces() fails, rather than throwing an error
-	vnet, _ := stdnet.NewNet()
+	var vnet transport.Net
+	vnet, _ = stdnet.NewNet()
+	if socks5proxy != nil {
+		if err := proxy.CheckProxyProtocolSupport(socks5proxy); err != nil {
+			return nil, err
+		}
+		socksClient := proxy.NewSocks5UDPClient(socks5proxy)
+		vnet = proxy.NewTransportWrapper(&socksClient, vnet)
+	}
 	settingsEngine.SetNet(vnet)
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingsEngine))
 
@@ -131,8 +149,22 @@ func makePeerConnectionFromOffer(stunURL string, sdp *webrtc.SessionDescription,
 	return pc, nil
 }
 
-func probeHandler(stunURL string, w http.ResponseWriter, r *http.Request) {
+func probeHandler(stunURL string, w http.ResponseWriter, r *http.Request,
+	strictInteractiveConnectivitySimulationSocks5Proxy string,
+	moderateInteractiveConnectivitySimulationSocks5Proxy string) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	var removeLocalCandidate bool
+	var socks5proxy *url.URL
+	interactiveConnectivitySimulationKind := r.URL.Query().Get("InCoSim")
+	switch interactiveConnectivitySimulationKind {
+	case "moderate":
+		socks5proxy, _ = url.Parse(moderateInteractiveConnectivitySimulationSocks5Proxy)
+	case "strict":
+		fallthrough
+	default:
+		removeLocalCandidate = true
+		socks5proxy, _ = url.Parse(strictInteractiveConnectivitySimulationSocks5Proxy)
+	}
 	resp, err := io.ReadAll(http.MaxBytesReader(w, r.Body, readLimit))
 	if nil != err {
 		log.Println("Invalid data.")
@@ -163,7 +195,7 @@ func probeHandler(stunURL string, w http.ResponseWriter, r *http.Request) {
 	// TODO refactor: DRY this must be below `ResponseHeaderTimeout` in proxy
 	// https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/blob/e1d9b4ace69897521cc29585b5084c5f4d1ce874/proxy/lib/snowflake.go#L207
 	iceGatheringTimeout := 10 * time.Second
-	pc, err := makePeerConnectionFromOffer(stunURL, sdp, dataChanOpen, dataChanClosed, iceGatheringTimeout)
+	pc, err := makePeerConnectionFromOffer(stunURL, sdp, dataChanOpen, dataChanClosed, iceGatheringTimeout, socks5proxy, removeLocalCandidate)
 	if err != nil {
 		log.Printf("Error making WebRTC connection: %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -241,6 +273,8 @@ func main() {
 	var certFilename, keyFilename string
 	var unsafeLogging bool
 	var stunURL string
+	var strictInteractiveConnectivitySimulationSocks5Proxy string
+	var moderateInteractiveConnectivitySimulationSocks5Proxy string
 
 	flag.StringVar(&acmeEmail, "acme-email", "", "optional contact email for Let's Encrypt notifications")
 	flag.StringVar(&acmeHostnamesCommas, "acme-hostnames", "", "comma-separated hostnames for TLS certificate")
@@ -248,6 +282,12 @@ func main() {
 	flag.StringVar(&certFilename, "cert", "", "TLS certificate file")
 	flag.StringVar(&keyFilename, "key", "", "TLS private key file")
 	flag.StringVar(&addr, "addr", ":8443", "address to listen on")
+	flag.StringVar(&strictInteractiveConnectivitySimulationSocks5Proxy,
+		"strictInteractiveConnectivitySimulationSocks5Proxy", "socks5://127.0.0.1:1081",
+		"strict interactive connectivity simulation socks5 proxy")
+	flag.StringVar(&moderateInteractiveConnectivitySimulationSocks5Proxy,
+		"moderateInteractiveConnectivitySimulationSocks5Proxy", "socks5://127.0.0.1:1082",
+		"moderate interactive connectivity simulation socks5 proxy")
 	flag.BoolVar(&disableTLS, "disable-tls", false, "don't use HTTPS")
 	flag.BoolVar(&unsafeLogging, "unsafe-logging", false, "prevent logs from being scrubbed")
 	flag.StringVar(&stunURL, "stun", defaultStunUrls, "STUN servers to use for NAT traversal (comma-separated)")
@@ -263,7 +303,9 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
-	http.Handle("/probe", ProbeHandler{stunURL, probeHandler})
+	http.Handle("/probe", ProbeHandler{stunURL, probeHandler,
+		strictInteractiveConnectivitySimulationSocks5Proxy,
+		moderateInteractiveConnectivitySimulationSocks5Proxy})
 
 	server := http.Server{
 		Addr: addr,
