@@ -1,134 +1,216 @@
 <p align="center">
-  <img width="460" src="https://github.com/3andne/craftls/assets/52860475/26574ee5-abf3-4eca-98ac-130fef0e79eb">
+  <img width="512" src="https://raw.githubusercontent.com/rustls/rustls/main/admin/logo/rustls.svg">
 </p>
 
 <p align="center">
-Craftls is a fork of the Rustls library with customizable ClientHello fingerprint.
+Craftls is a fork of Rustls with customizable ClientHello fingerprints.
+</p>
+
+Craftls keeps Rustls' public `rustls` library name for drop-in use, while the package is published
+as `craftls`. This tree is synced with the current Rustls workspace layout and keeps the
+`rustls::craft` API for applying browser-style or custom ClientHello fingerprints:
+
+```rust
+let config = rustls::ClientConfig::builder(rustls_aws_lc_rs::DEFAULT_PROVIDER.into())
+    .with_root_certificates(root_store)
+    .with_no_client_auth()?
+    .with_fingerprint(rustls::craft::CHROME_108.builder());
+```
+
+<p align="center">
+Rustls is a modern TLS library written in Rust.
 </p>
 
 # Status
 
-Craftls is under active development. We aim to maintain
+Rustls is used in production at many organizations and projects. We aim to maintain
 reasonable API surface stability but the API may evolve as we make changes to accommodate
 new features or performance improvements.
+
+We have a [roadmap](ROADMAP.md) for our future plans. We also have [benchmarks](BENCHMARKING.md) to
+prevent performance regressions and to let you evaluate rustls on your target hardware.
+
+If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+[![Build Status](https://github.com/rustls/rustls/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/rustls/rustls/actions/workflows/build.yml?query=branch%3Amain)
+[![Coverage Status (codecov.io)](https://codecov.io/gh/rustls/rustls/branch/main/graph/badge.svg)](https://codecov.io/gh/rustls/rustls/)
+[![Documentation](https://docs.rs/rustls/badge.svg)](https://docs.rs/rustls/)
+[![Chat](https://img.shields.io/discord/976380008299917365?logo=discord)](https://discord.gg/MCSB76RU96)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/9034/badge)](https://www.bestpractices.dev/projects/9034)
+
+The maintainers pronounce "rustls" as rustles (rather than rust-TLS), but we don't feel strongly
+about it.
 
 ## Changelog
 
 The detailed list of changes in each release can be found at
-https://github.com/3andne/craftls/releases.
+https://github.com/rustls/rustls/releases.
 
 # Documentation
 
-https://docs.rs/craftls/
+https://docs.rs/rustls/
 
 # Approach
 
-`Craftls` is a TLS library that aims to be a drop-in replacement of `Rustls`, offering customizable `ClientHello` while maintaining robust security and ease of use.
+Rustls is a TLS library that aims to provide a good level of cryptographic security,
+requires no configuration to achieve that security, and provides no unsafe features or
+obsolete cryptography by default.
 
-## Current functionality (with default crate features)
+Rustls implements TLS1.2 and TLS1.3 for both clients and servers. See [the full
+list of protocol features](https://docs.rs/rustls/latest/rustls/manual/_04_features/index.html).
 
-* Capabilities inherited from [Rustls](https://github.com/rustls/rustls?tab=readme-ov-file#current-functionality-with-default-crate-features)
-* Customization options for `ClientHello` extensions
-* Customization options for `ClientHello` cipher suites.
-* Support for client-side Certificate Compression using `zlib`, `zstd`, and `brotli` compression methods ([rfc8879](https://datatracker.ietf.org/doc/html/rfc8879)).
-* ClientHello padding extension ([rfc7685](https://datatracker.ietf.org/doc/html/rfc7685)).
-* Grease extension ([rfc8701](https://datatracker.ietf.org/doc/html/rfc8701))
-* TLS ClientHello extension permutation ([chrome](https://chromestatus.com/feature/5124606246518784))
-* Predefined browser fingerprints
-  * `CHROME_108`
-  * `CHROME_112`
-  * `SAFARI_17_1`
-  * `FIREFOX_105`
+### Platform support
 
-## Non-features
+While Rustls itself is platform independent, it requires the use of cryptography primitives
+for implementing the cryptography algorithms used in TLS. In Rustls, a
+[`crypto::CryptoProvider`] represents a collection of crypto primitive implementations.
 
-We will not be supporting any non-features listed in [Rustls README](https://github.com/rustls/rustls?tab=readme-ov-file#non-features), including deprecated TLS versions and outdated cipher suites. 
+By providing a custom instance of the [`crypto::CryptoProvider`] struct, you
+can replace all cryptography dependencies of rustls.  This is a route to being portable
+to a wider set of architectures and environments, or compliance requirements.  See the
+[`crypto::CryptoProvider`] documentation for more details.
 
-While these non-features may be included in browser fingerprints for completeness, any server attempt to use them will result in the termination of the connection. Most modern and secure servers do not utilize these outdated options, so this measure should not impact regular use.
+[`crypto::CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html
+
+### Cryptography providers
+
+Since Rustls 0.22 it has been possible to choose the provider of the cryptographic primitives
+that Rustls uses. This may be appealing if you have specific platform, compliance or feature
+requirements.
+
+From 0.24, users must explicitly provide a crypto provider when constructing `ClientConfig` or
+`ServerConfig` instances. See the [`crypto::CryptoProvider`] documentation for more details.
+
+#### First-party providers
+
+The Rustls project currently maintains two cryptography providers:
+
+* [`rustls-aws-lc-rs`] - a provider that uses the [`aws-lc-rs`] crate for cryptography.
+While this provider can be harder to build on [some platforms][aws-lc-rs-platforms-faq], it provides excellent
+performance and a complete feature set (including post-quantum algorithms).
+* [`rustls-ring`] - a provider that uses the [`ring`] crate for cryptography. This
+provider is easier to build on a variety of platforms, but has a more limited feature set
+(for example, it does not support post-quantum algorithms).
+
+The Rustls team recommends using the [`rustls-aws-lc-rs`] crate for its complete feature set
+and performance. See [the aws-lc-rs FAQ][aws-lc-rs-platforms-faq] for more details of the
+platform/architecture support constraints in aws-lc-rs.
+
+See the documentation for [`crypto::CryptoProvider`] for details on how providers are
+selected.
+
+(For rustls versions prior to 0.24, both of these providers were shipped as part of the rustls
+crate, and Cargo features were used to select the preferred provider. The `aws-lc-rs` feature
+was enabled by default.)
+
+[`rustls-aws-lc-rs`]: https://crates.io/crates/rustls-aws-lc-rs
+[`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
+[aws-lc-rs-platforms-faq]: https://aws.github.io/aws-lc-rs/faq.html#can-i-run-aws-lc-rs-on-x-platform-or-architecture
+[`rustls-ring`]: https://crates.io/crates/rustls-ring
+[`ring`]: https://crates.io/crates/ring
+
+#### Third-party providers
+
+The community has also started developing third-party providers for Rustls:
+
+* [`boring-rustls-provider`] - a work-in-progress provider that uses [`boringssl`] for
+cryptography.
+* [`rustls-ccm`] - adds AES-CCM cipher suites (TLS 1.2 and 1.3) using [`RustCrypto`], for IoT/constrained-device protocols (IEEE 2030.5, Matter, RFC 7925).
+* [`rustls-graviola`] - a provider that uses [`graviola`] for cryptography.
+* [`rustls-mbedtls-provider`] - a provider that uses [`mbedtls`] for cryptography.
+* [`rustls-openssl`] - a provider that uses [OpenSSL] for cryptography.
+* [`rustls-rustcrypto`] - an experimental provider that uses the crypto primitives
+from [`RustCrypto`] for cryptography.
+* [`rustls-symcrypt`] - a provider that uses Microsoft's [SymCrypt] library.
+* [`rustls-wolfcrypt-provider`] - a work-in-progress provider that uses [`wolfCrypt`] for cryptography.
+
+[`rustls-ccm`]: https://github.com/jsulmont/rustls-ccm
+[`rustls-graviola`]: https://crates.io/crates/rustls-graviola
+[`graviola`]: https://github.com/ctz/graviola
+[`rustls-mbedtls-provider`]: https://github.com/fortanix/rustls-mbedtls-provider
+[`mbedtls`]: https://github.com/Mbed-TLS/mbedtls
+[`rustls-openssl`]: https://github.com/tofay/rustls-openssl
+[OpenSSL]: https://openssl-library.org/
+[`rustls-symcrypt`]: https://github.com/microsoft/rustls-symcrypt
+[SymCrypt]: https://github.com/microsoft/SymCrypt
+[`boring-rustls-provider`]: https://github.com/janrueth/boring-rustls-provider
+[`boringssl`]: https://github.com/google/boringssl
+[`rustls-rustcrypto`]: https://github.com/RustCrypto/rustls-rustcrypto
+[`RustCrypto`]: https://github.com/RustCrypto
+[`rustls-wolfcrypt-provider`]: https://github.com/wolfSSL/rustls-wolfcrypt-provider
+[`wolfCrypt`]: https://www.wolfssl.com/products/wolfcrypt
+
+See the [Making a custom CryptoProvider] section of the documentation for more information
+on this topic.
+
+[Making a custom CryptoProvider]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#making-a-custom-cryptoprovider
 
 # Example code
 
-See `examples/src/bin/craftclient.rs`
+Our [examples] directory contains demos that show how to handle I/O using the
+[`stream::Stream`] helper, as well as more complex asynchronous I/O using [`mio`].
+If you're already using Tokio for an async runtime you may prefer to use
+[`tokio-rustls`] instead of interacting with rustls directly.
 
-## Configuration
+The [`mio`] based examples are the most complete, and discussed below. Users
+new to Rustls may prefer to look at the simple client/server examples before
+diving in to the more complex MIO examples.
 
-### Direct Usage
+[examples]: examples/
+[`stream::Stream`]: https://docs.rs/rustls/latest/rustls/struct.Stream.html
+[`mio`]: https://docs.rs/mio/latest/mio/
+[`tokio-rustls`]: https://docs.rs/tokio-rustls/latest/tokio_rustls/
 
-To use `craftls` directly, just add `craftls` in your `Cargo.toml`.
+## Client example program
 
-### As a `rustls` Replacement
+The MIO client example program is named `tlsclient-mio`.
 
-If you wish to replace `rustls` with `craftls` in nested dependencies (dependencies of dependencies), you can use the [patch.crates-io] section in your Cargo.toml:
+Some sample runs:
 
-```toml
-[patch.crates-io]
-rustls = { git = 'https://github.com/3andne/craftls.git', tag = "your version" }
+```
+$ cargo run --bin tlsclient-mio -- --http mozilla-modern.badssl.com
+HTTP/1.1 200 OK
+Server: nginx/1.6.2 (Ubuntu)
+Date: Wed, 01 Jun 2016 18:44:00 GMT
+Content-Type: text/html
+Content-Length: 644
+(...)
 ```
 
-Make sure to substitute "your version" with the specific version tag of craftls you intend to use. **This patch will ensure that `craftls` is used in place of `rustls` throughout your project, including within libraries like `tokio-rustls`**.
+or
 
-## Usage
-
-`Craftls` is designed to be a drop-in replacement for `Rustls` with an additional feature for specifying TLS fingerprints. Below is a guide on how to configure the `ClientConfig` in `Craftls` to use a specific fingerprint.
-
-```rust
-let mut config: rustls::ClientConfig = rustls::ClientConfig::builder()
-    .with_root_certificates(root_store)
-    .with_no_client_auth()
-    .with_fingerprint( // Specifies the fingerprint we want to use, i.e., CHROME v108
-        rustls::craft::CHROME_108
-            .builder(),
-    );
+```
+$ cargo run --bin tlsclient-mio -- --http expired.badssl.com
+TLS error: InvalidCertificate(Expired)
+Connection closed
 ```
 
-After setting up the ClientConfig with the preferred fingerprint, you can proceed as you would with Rustls. The rest of the API remains consistent with the Rustls library.
+Run `cargo run --bin tlsclient-mio -- --help` for more options.
 
-### Use with http clients
+## Server example program
 
-Http clients such as `hyper` internally manage ALPN settings. They may raise issues if ALPN is set externally. Use the following configuration to avoid the panic:
+The MIO server example program is named `tlsserver-mio`.
 
-```rust
-let mut config: rustls::ClientConfig = rustls::ClientConfig::builder()
-    .with_root_certificates(root_store)
-    .with_no_client_auth()
-    .with_fingerprint(
-        rustls::craft::CHROME_108
-            .builder()
-            .do_not_override_alpn(), // let the http client manage the alpn
-    );
+Here's a sample run; we start a TLS echo server, then connect to it with
+`openssl` and `tlsclient-mio`:
+
+```
+$ cargo run --bin tlsserver-mio -- --certs test-ca/rsa-2048/end.fullchain --key test-ca/rsa-2048/end.key -p 8443 echo &
+$ echo hello world | openssl s_client -ign_eof -quiet -connect localhost:8443
+depth=2 CN = ponytown RSA CA
+verify error:num=19:self signed certificate in certificate chain
+hello world
+^C
+$ echo hello world | cargo run --bin tlsclient-mio -- --cafile test-ca/rsa-2048/ca.cert --port 8443 localhost
+hello world
+^C
 ```
 
-### Use with http/1.1 or non-http clients
-
-**Warning**: browsers are `h2` clients. `Http1.1` and non-http variations deviate from browsers standard browser behaviors and should be used carefully.
-
-```rust
-let mut config: rustls::ClientConfig = rustls::ClientConfig::builder()
-    .with_root_certificates(root_store)
-    .with_no_client_auth()
-    .with_fingerprint(
-        rustls::craft::CHROME_108
-            .test_alpn_http1 // alpn: ["http/1.1"]
-            .builder(),
-    );
-```
-
-Or
-
-```rust
-let mut config: rustls::ClientConfig = rustls::ClientConfig::builder()
-    .with_root_certificates(root_store)
-    .with_no_client_auth()
-    .with_fingerprint(
-        rustls::craft::CHROME_108
-            .test_no_alpn // no alpn extension
-            .builder(),
-    );
-```
+Run `cargo run --bin tlsserver-mio -- --help` for more options.
 
 # License
 
-Craftls is distributed under the following three licenses:
+Rustls is distributed under the following three licenses:
 
 - Apache License version 2.0.
 - MIT license.
@@ -138,12 +220,21 @@ These are included as LICENSE-APACHE, LICENSE-MIT and LICENSE-ISC
 respectively.  You may use this software under the terms of any
 of these licenses, at your option.
 
+# Project Membership
+
+- Joe Birr-Pixton ([@ctz], Project Founder - full-time funded by [Prossimo])
+- Dirkjan Ochtman ([@djc], Co-maintainer)
+- Daniel McCarney ([@cpu], Co-maintainer)
+- Josh Aas ([@bdaehlie], Project Management)
+
+[@ctz]: https://github.com/ctz
+[@djc]: https://github.com/djc
+[@cpu]: https://github.com/cpu
+[@bdaehlie]: https://github.com/bdaehlie
+[Prossimo]: https://www.memorysafety.org/initiative/rustls/
+
 # Code of conduct
 
 This project adopts the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
 Please email rustls-mod@googlegroups.com to report any instance of misconduct, or if you
 have any comments or questions on the Code of Conduct.
-
----
-
-Icons by [icons8](https://icons8.com/)

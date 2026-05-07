@@ -1,23 +1,47 @@
+//! This is an example server that uses rustls for TLS, and [mio] for I/O.
+//!
+//! It uses command line flags to demonstrate configuring a TLS server that may:
+//!  * Specify supported TLS protocol versions
+//!  * Customize cipher suite selection
+//!  * Perform optional or mandatory client certificate authentication
+//!  * Check client certificates for revocation status with CRLs
+//!  * Support session tickets
+//!  * Staple an OCSP response
+//!
+//! See `--help` output for more details.
+//!
+//! You may set the `SSLKEYLOGFILE` env var when using this example to write a
+//! log file with key material (insecure) for debugging purposes. See [`rustls::KeyLog`]
+//! for more information.
+//!
+//! Note that `unwrap()` is used to deal with networking errors; this is not something
+//! that is sensible outside of example code.
+//!
+//! [mio]: https://docs.rs/mio/latest/mio/
+
 use std::collections::HashMap;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, net};
 
-use docopt::Docopt;
+use clap::{Parser, Subcommand};
 use log::{debug, error};
 use mio::net::{TcpListener, TcpStream};
-use pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
-use serde::Deserialize;
-
-use rustls::crypto::{ring, CryptoProvider};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{self, RootCertStore};
+use rustls::crypto::{CryptoProvider, Identity};
+use rustls::enums::{ApplicationProtocol, ProtocolVersion};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
+use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
+use rustls::{Connection, RootCertStore, ServerConfig, ServerConnection};
+use rustls_aws_lc_rs as provider;
+use rustls_util::KeyLogFile;
 
 // Token for our listening socket.
 const LISTENER: mio::Token = mio::Token(0);
 
 // Which mode the server operates in.
-#[derive(Clone)]
+#[derive(Clone, Debug, Subcommand)]
 enum ServerMode {
     /// Write back received bytes
     Echo,
@@ -27,7 +51,7 @@ enum ServerMode {
     Http,
 
     /// Forward traffic to/from given port on localhost.
-    Forward(u16),
+    Forward { port: u16 },
 }
 
 /// This binds together a TCP listening socket, some outstanding
@@ -36,12 +60,12 @@ struct TlsServer {
     server: TcpListener,
     connections: HashMap<mio::Token, OpenConnection>,
     next_id: usize,
-    tls_config: Arc<rustls::ServerConfig>,
+    tls_config: Arc<ServerConfig>,
     mode: ServerMode,
 }
 
 impl TlsServer {
-    fn new(server: TcpListener, mode: ServerMode, cfg: Arc<rustls::ServerConfig>) -> Self {
+    fn new(server: TcpListener, mode: ServerMode, cfg: Arc<ServerConfig>) -> Self {
         Self {
             server,
             connections: HashMap::new(),
@@ -55,10 +79,9 @@ impl TlsServer {
         loop {
             match self.server.accept() {
                 Ok((socket, addr)) => {
-                    debug!("Accepting new connection from {:?}", addr);
+                    debug!("Accepting new connection from {addr:?}");
 
-                    let tls_conn =
-                        rustls::ServerConnection::new(Arc::clone(&self.tls_config)).unwrap();
+                    let tls_conn = ServerConnection::new(self.tls_config.clone()).unwrap();
                     let mode = self.mode.clone();
 
                     let token = mio::Token(self.next_id);
@@ -69,12 +92,9 @@ impl TlsServer {
                     self.connections
                         .insert(token, connection);
                 }
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(err) => {
-                    println!(
-                        "encountered error while accepting connection; err={:?}",
-                        err
-                    );
+                    println!("encountered error while accepting connection; err={err:?}");
                     return Err(err);
                 }
             }
@@ -108,7 +128,7 @@ struct OpenConnection {
     closing: bool,
     closed: bool,
     mode: ServerMode,
-    tls_conn: rustls::ServerConnection,
+    tls_conn: ServerConnection,
     back: Option<TcpStream>,
     sent_http_response: bool,
 }
@@ -116,8 +136,8 @@ struct OpenConnection {
 /// Open a plaintext TCP-level connection for forwarded connections.
 fn open_back(mode: &ServerMode) -> Option<TcpStream> {
     match *mode {
-        ServerMode::Forward(ref port) => {
-            let addr = net::SocketAddrV4::new(net::Ipv4Addr::new(127, 0, 0, 1), *port);
+        ServerMode::Forward { port } => {
+            let addr = net::SocketAddrV4::new(net::Ipv4Addr::new(127, 0, 0, 1), port);
             let conn = TcpStream::connect(net::SocketAddr::V4(addr)).unwrap();
             Some(conn)
         }
@@ -145,7 +165,7 @@ impl OpenConnection {
         socket: TcpStream,
         token: mio::Token,
         mode: ServerMode,
-        tls_conn: rustls::ServerConnection,
+        tls_conn: ServerConnection,
     ) -> Self {
         let back = open_back(&mode);
         Self {
@@ -189,12 +209,10 @@ impl OpenConnection {
 
     /// Close the backend connection for forwarded sessions.
     fn close_back(&mut self) {
-        if self.back.is_some() {
-            let back = self.back.as_mut().unwrap();
+        if let Some(back) = self.back.take() {
             back.shutdown(net::Shutdown::Both)
                 .unwrap();
         }
-        self.back = None;
     }
 
     fn do_tls_read(&mut self) {
@@ -205,7 +223,7 @@ impl OpenConnection {
                     return;
                 }
 
-                error!("read error {:?}", err);
+                error!("read error {err:?}");
                 self.closing = true;
                 return;
             }
@@ -219,7 +237,7 @@ impl OpenConnection {
 
         // Process newly-received TLS messages.
         if let Err(err) = self.tls_conn.process_new_packets() {
-            error!("cannot process packet: {:?}", err);
+            error!("cannot process packet: {err:?}");
 
             // last gasp write to send any alerts
             self.do_tls_write_and_handle_error();
@@ -231,6 +249,19 @@ impl OpenConnection {
     fn try_plain_read(&mut self) {
         // Read and process all available plaintext.
         if let Ok(io_state) = self.tls_conn.process_new_packets() {
+            if let Some(mut early_data) = self.tls_conn.early_data() {
+                let mut buf = Vec::new();
+                early_data
+                    .read_to_end(&mut buf)
+                    .unwrap();
+
+                if !buf.is_empty() {
+                    debug!("early data read {:?}", buf.len());
+                    self.incoming_plaintext(&buf);
+                    return;
+                }
+            }
+
             if io_state.plaintext_bytes_to_read() > 0 {
                 let mut buf = vec![0u8; io_state.plaintext_bytes_to_read()];
 
@@ -256,7 +287,7 @@ impl OpenConnection {
         let rc = try_read(back.read(&mut buf));
 
         if rc.is_err() {
-            error!("backend read failed: {:?}", rc);
+            error!("backend read failed: {rc:?}");
             self.closing = true;
             return;
         }
@@ -292,7 +323,7 @@ impl OpenConnection {
             ServerMode::Http => {
                 self.send_http_response_once();
             }
-            ServerMode::Forward(_) => {
+            ServerMode::Forward { .. } => {
                 self.back
                     .as_mut()
                     .unwrap()
@@ -323,7 +354,7 @@ impl OpenConnection {
     fn do_tls_write_and_handle_error(&mut self) {
         let rc = self.tls_write();
         if rc.is_err() {
-            error!("write failed {:?}", rc);
+            error!("write failed {rc:?}");
             self.closing = true;
         }
     }
@@ -334,13 +365,9 @@ impl OpenConnection {
             .register(&mut self.socket, self.token, event_set)
             .unwrap();
 
-        if self.back.is_some() {
+        if let Some(back) = &mut self.back {
             registry
-                .register(
-                    self.back.as_mut().unwrap(),
-                    self.token,
-                    mio::Interest::READABLE,
-                )
+                .register(back, self.token, mio::Interest::READABLE)
                 .unwrap();
         }
     }
@@ -357,10 +384,8 @@ impl OpenConnection {
             .deregister(&mut self.socket)
             .unwrap();
 
-        if self.back.is_some() {
-            registry
-                .deregister(self.back.as_mut().unwrap())
-                .unwrap();
+        if let Some(back) = self.back.as_mut() {
+            registry.deregister(back).unwrap();
         }
     }
 
@@ -384,153 +409,169 @@ impl OpenConnection {
     }
 }
 
-const USAGE: &str = "
-Runs a TLS server on :PORT.  The default PORT is 443.
-
-`echo' mode means the server echoes received data on each connection.
-
-`http' mode means the server blindly sends a HTTP response on each
-connection.
-
-`forward' means the server forwards plaintext to a connection made to
-localhost:fport.
-
-`--certs' names the full certificate chain, `--key' provides the
-RSA private key.
-
-Usage:
-  tlsserver-mio --certs CERTFILE --key KEYFILE [--suite SUITE ...] \
-     [--proto PROTO ...] [--protover PROTOVER ...] [options] echo
-  tlsserver-mio --certs CERTFILE --key KEYFILE [--suite SUITE ...] \
-     [--proto PROTO ...] [--protover PROTOVER ...] [options] http
-  tlsserver-mio --certs CERTFILE --key KEYFILE [--suite SUITE ...] \
-     [--proto PROTO ...] [--protover PROTOVER ...] [options] forward <fport>
-  tlsserver-mio (--version | -v)
-  tlsserver-mio (--help | -h)
-
-Options:
-    -p, --port PORT     Listen on PORT [default: 443].
-    --certs CERTFILE    Read server certificates from CERTFILE.
-                        This should contain PEM-format certificates
-                        in the right order (the first certificate should
-                        certify KEYFILE, the last should be a root CA).
-    --key KEYFILE       Read private key from KEYFILE.  This should be a RSA
-                        private key or PKCS8-encoded private key, in PEM format.
-    --ocsp OCSPFILE     Read DER-encoded OCSP response from OCSPFILE and staple
-                        to certificate.  Optional.
-    --auth CERTFILE     Enable client authentication, and accept certificates
-                        signed by those roots provided in CERTFILE.
-    --crl CRLFILE ...   Perform client certificate revocation checking using the DER-encoded
-                        CRLFILE. May be used multiple times.
-    --require-auth      Send a fatal alert if the client does not complete client
-                        authentication.
-    --resumption        Support session resumption.
-    --tickets           Support tickets.
-    --protover VERSION  Disable default TLS version list, and use
-                        VERSION instead.  May be used multiple times.
-    --suite SUITE       Disable default cipher suite list, and use
-                        SUITE instead.  May be used multiple times.
-    --proto PROTOCOL    Negotiate PROTOCOL using ALPN.
-                        May be used multiple times.
-    --verbose           Emit log output.
-    --version, -v       Show tool version.
-    --help, -h          Show this screen.
-";
-
-#[derive(Debug, Deserialize)]
+/// Runs a TLS server on :PORT. The default PORT is 443.
+///
+/// `echo` mode means the server echoes received data on each connection.
+///
+/// `http` mode means the server blindly sends a HTTP response on each connection.
+///
+/// `forward` means the server forwards plaintext to a connection made to `localhost:fport`.
+///
+/// `--certs` names the full certificate chain, `--key` provides the private key.
+#[derive(Debug, Parser)]
 struct Args {
-    cmd_echo: bool,
-    cmd_http: bool,
-    flag_port: Option<u16>,
-    flag_verbose: bool,
-    flag_protover: Vec<String>,
-    flag_suite: Vec<String>,
-    flag_proto: Vec<String>,
-    flag_certs: Option<String>,
-    flag_crl: Vec<String>,
-    flag_key: Option<String>,
-    flag_ocsp: Option<String>,
-    flag_auth: Option<String>,
-    flag_require_auth: bool,
-    flag_resumption: bool,
-    flag_tickets: bool,
-    arg_fport: Option<u16>,
+    #[command(subcommand)]
+    mode: ServerMode,
+    /// Listen on port.
+    #[clap(short, long, default_value = "443")]
+    port: u16,
+    /// Emit log output.
+    #[clap(short, long)]
+    verbose: bool,
+    /// Disable default TLS version list, and use the given versions instead.
+    #[clap(long)]
+    protover: Vec<String>,
+    /// Disable default cipher suite list, and use the given suites instead.
+    #[clap(long)]
+    suite: Vec<String>,
+    /// Negotiate the given protocols using ALPN.
+    #[clap(long)]
+    proto: Vec<Vec<u8>>,
+    /// Read server certificates from the given file. This should contain PEM-format certificates
+    /// in the right order (the first certificate should certify the end entity, matching the
+    /// private key, the last should be a root CA).
+    #[clap(long)]
+    certs: PathBuf,
+    /// Perform client certificate revocation checking using the DER-encoded CRLs from the given
+    /// files.
+    #[clap(long)]
+    crl: Vec<PathBuf>,
+    /// Read private key from the given file. This should be a private key in PEM format.
+    #[clap(long)]
+    key: PathBuf,
+    /// Read DER-encoded OCSP response from the given file and staple to certificate.
+    #[clap(long)]
+    ocsp: Option<PathBuf>,
+    /// Enable client authentication, and accept certificates signed by those roots provided in
+    /// the given file.
+    #[clap(long)]
+    auth: Option<PathBuf>,
+    /// Send a fatal alert if the client does not complete client authentication.
+    #[clap(long)]
+    require_auth: bool,
+    /// Disable stateful session resumption.
+    #[clap(long)]
+    no_resumption: bool,
+    /// Support tickets (stateless resumption).
+    #[clap(long)]
+    tickets: bool,
+    /// Support receiving this many bytes with 0-RTT.
+    #[clap(long, default_value = "0")]
+    max_early_data: u32,
 }
 
-fn find_suite(name: &str) -> Option<rustls::SupportedCipherSuite> {
-    for suite in rustls::crypto::ring::ALL_CIPHER_SUITES {
-        let sname = format!("{:?}", suite.suite()).to_lowercase();
+impl Args {
+    fn provider(&self) -> (Vec<ProtocolVersion>, CryptoProvider) {
+        let (versions, provider) = match lookup_versions(&self.protover).as_slice() {
+            versions @ [ProtocolVersion::TLSv1_2] => {
+                (versions.to_vec(), provider::DEFAULT_TLS12_PROVIDER)
+            }
+            versions @ [ProtocolVersion::TLSv1_3] => {
+                (versions.to_vec(), provider::DEFAULT_TLS13_PROVIDER)
+            }
+            _ => (
+                vec![ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3],
+                provider::DEFAULT_PROVIDER,
+            ),
+        };
 
-        if sname == name.to_string().to_lowercase() {
-            return Some(*suite);
+        let provider = match self.suite.as_slice() {
+            [] => provider,
+            _ => filter_suites(provider, &self.suite),
+        };
+
+        (versions, provider)
+    }
+}
+
+/// Alter `provider` to reduce the set of ciphersuites to just `suites`
+fn filter_suites(mut provider: CryptoProvider, suites: &[String]) -> CryptoProvider {
+    // first, check `suites` all name known suites, and will have some effect
+    let known_suites = provider
+        .tls12_cipher_suites
+        .iter()
+        .map(|cs| cs.common.suite)
+        .chain(
+            provider
+                .tls13_cipher_suites
+                .iter()
+                .map(|cs| cs.common.suite),
+        )
+        .map(|cs| format!("{:?}", cs).to_lowercase())
+        .collect::<Vec<String>>();
+
+    for s in suites {
+        if !known_suites.contains(&s.to_lowercase()) {
+            panic!(
+                "unsupported ciphersuite '{s}'; should be one of {known_suites}",
+                known_suites = known_suites.join(", ")
+            );
         }
     }
 
-    None
-}
+    // now discard non-named suites
+    provider
+        .tls12_cipher_suites
+        .to_mut()
+        .retain(|cs| {
+            let name = format!("{:?}", cs.common.suite).to_lowercase();
+            suites
+                .iter()
+                .any(|s| s.to_lowercase() == name)
+        });
+    provider
+        .tls13_cipher_suites
+        .to_mut()
+        .retain(|cs| {
+            let name = format!("{:?}", cs.common.suite).to_lowercase();
+            suites
+                .iter()
+                .any(|s| s.to_lowercase() == name)
+        });
 
-fn lookup_suites(suites: &[String]) -> Vec<rustls::SupportedCipherSuite> {
-    let mut out = Vec::new();
-
-    for csname in suites {
-        let scs = find_suite(csname);
-        match scs {
-            Some(s) => out.push(s),
-            None => panic!("cannot look up ciphersuite '{}'", csname),
-        }
-    }
-
-    out
+    provider
 }
 
 /// Make a vector of protocol versions named in `versions`
-fn lookup_versions(versions: &[String]) -> Vec<&'static rustls::SupportedProtocolVersion> {
+fn lookup_versions(versions: &[String]) -> Vec<ProtocolVersion> {
     let mut out = Vec::new();
 
     for vname in versions {
         let version = match vname.as_ref() {
-            "1.2" => &rustls::version::TLS12,
-            "1.3" => &rustls::version::TLS13,
-            _ => panic!(
-                "cannot look up version '{}', valid are '1.2' and '1.3'",
-                vname
-            ),
+            "1.2" => ProtocolVersion::TLSv1_2,
+            "1.3" => ProtocolVersion::TLSv1_3,
+            _ => panic!("cannot look up version '{vname}', valid are '1.2' and '1.3'"),
         };
-        out.push(version);
+        if !out.contains(&version) {
+            out.push(version);
+        }
     }
 
     out
 }
 
-fn load_certs(filename: &str) -> Vec<CertificateDer<'static>> {
-    let certfile = fs::File::open(filename).expect("cannot open certificate file");
-    let mut reader = BufReader::new(certfile);
-    rustls_pemfile::certs(&mut reader)
+fn load_certs(filename: &Path) -> Vec<CertificateDer<'static>> {
+    CertificateDer::pem_file_iter(filename)
+        .expect("cannot open certificate file")
         .map(|result| result.unwrap())
         .collect()
 }
 
-fn load_private_key(filename: &str) -> PrivateKeyDer<'static> {
-    let keyfile = fs::File::open(filename).expect("cannot open private key file");
-    let mut reader = BufReader::new(keyfile);
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return key.into(),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return key.into(),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return key.into(),
-            None => break,
-            _ => {}
-        }
-    }
-
-    panic!(
-        "no keys found in {:?} (encrypted keys not supported)",
-        filename
-    );
+fn load_private_key(filename: &Path) -> PrivateKeyDer<'static> {
+    PrivateKeyDer::from_pem_file(filename).expect("cannot read private key file")
 }
 
-fn load_ocsp(filename: &Option<String>) -> Vec<u8> {
+fn load_ocsp(filename: Option<&Path>) -> Vec<u8> {
     let mut ret = Vec::new();
 
     if let Some(name) = filename {
@@ -543,122 +584,110 @@ fn load_ocsp(filename: &Option<String>) -> Vec<u8> {
     ret
 }
 
-fn load_crls(filenames: &[String]) -> Vec<CertificateRevocationListDer<'static>> {
+fn load_crls(
+    filenames: impl Iterator<Item = impl AsRef<Path>>,
+) -> Vec<CertificateRevocationListDer<'static>> {
     filenames
-        .iter()
         .map(|filename| {
-            let mut der = Vec::new();
-            fs::File::open(filename)
-                .expect("cannot open CRL file")
-                .read_to_end(&mut der)
-                .unwrap();
-            CertificateRevocationListDer::from(der)
+            CertificateRevocationListDer::from_pem_file(filename).expect("cannot read CRL file")
         })
         .collect()
 }
 
-fn make_config(args: &Args) -> Arc<rustls::ServerConfig> {
-    let client_auth = if args.flag_auth.is_some() {
-        let roots = load_certs(args.flag_auth.as_ref().unwrap());
+fn make_config(args: &Args) -> Arc<ServerConfig> {
+    let (versions, provider) = args.provider();
+    let client_auth = if let Some(auth) = &args.auth {
+        let roots = load_certs(auth);
         let mut client_auth_roots = RootCertStore::empty();
         for root in roots {
             client_auth_roots.add(root).unwrap();
         }
-        let crls = load_crls(&args.flag_crl);
-        if args.flag_require_auth {
-            WebPkiClientVerifier::builder(client_auth_roots.into())
-                .with_crls(crls)
-                .build()
-                .unwrap()
+        let crls = load_crls(args.crl.iter());
+        if args.require_auth {
+            Arc::new(
+                WebPkiClientVerifier::builder(client_auth_roots.into(), &provider)
+                    .with_crls(crls)
+                    .build()
+                    .unwrap(),
+            )
         } else {
-            WebPkiClientVerifier::builder(client_auth_roots.into())
-                .with_crls(crls)
-                .allow_unauthenticated()
-                .build()
-                .unwrap()
+            Arc::new(
+                WebPkiClientVerifier::builder(client_auth_roots.into(), &provider)
+                    .with_crls(crls)
+                    .allow_unauthenticated()
+                    .build()
+                    .unwrap(),
+            )
         }
     } else {
         WebPkiClientVerifier::no_client_auth()
     };
 
-    let suites = if !args.flag_suite.is_empty() {
-        lookup_suites(&args.flag_suite)
-    } else {
-        rustls::crypto::ring::ALL_CIPHER_SUITES.to_vec()
-    };
+    let certs = load_certs(&args.certs);
+    let privkey = load_private_key(&args.key);
+    let ocsp = load_ocsp(args.ocsp.as_deref());
 
-    let versions = if !args.flag_protover.is_empty() {
-        lookup_versions(&args.flag_protover)
-    } else {
-        rustls::ALL_VERSIONS.to_vec()
-    };
+    let mut config = ServerConfig::builder(provider.into())
+        .with_client_cert_verifier(client_auth)
+        .with_single_cert_with_ocsp(
+            Arc::new(Identity::from_cert_chain(certs).unwrap()),
+            privkey,
+            Arc::from(ocsp),
+        )
+        .expect("bad certificates/private key");
 
-    let certs = load_certs(
-        args.flag_certs
-            .as_ref()
-            .expect("--certs option missing"),
-    );
-    let privkey = load_private_key(
-        args.flag_key
-            .as_ref()
-            .expect("--key option missing"),
-    );
-    let ocsp = load_ocsp(&args.flag_ocsp);
+    config.key_log = Arc::new(KeyLogFile::new());
 
-    let mut config = rustls::ServerConfig::builder_with_provider(
-        CryptoProvider {
-            cipher_suites: suites,
-            ..ring::default_provider()
-        }
-        .into(),
-    )
-    .with_protocol_versions(&versions)
-    .expect("inconsistent cipher-suites/versions specified")
-    .with_client_cert_verifier(client_auth)
-    .with_single_cert_with_ocsp(certs, privkey, ocsp)
-    .expect("bad certificates/private key");
-
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
-
-    if args.flag_resumption {
-        config.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+    if args.no_resumption {
+        config.session_storage = Arc::new(NoServerSessionStorage {});
     }
 
-    if args.flag_tickets {
-        config.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+    if args.tickets {
+        config.ticketer = Some(
+            provider::DEFAULT_PROVIDER
+                .ticketer_factory
+                .ticketer()
+                .unwrap(),
+        );
+    }
+
+    if args.max_early_data > 0 {
+        if !versions.contains(&ProtocolVersion::TLSv1_3) {
+            panic!("Early data is only available for servers supporting TLS1.3");
+        }
+        if args.no_resumption {
+            panic!("Early data requires resumption.");
+        }
+        if args.tickets {
+            panic!("Early data is not supported for stateless resumption (--tickets).");
+        }
+        config.max_early_data_size = args.max_early_data;
     }
 
     config.alpn_protocols = args
-        .flag_proto
+        .proto
         .iter()
-        .map(|proto| proto.as_bytes().to_vec())
-        .collect::<Vec<_>>();
+        .map(|bytes| ApplicationProtocol::from(bytes.as_slice()).to_owned())
+        .collect();
 
     Arc::new(config)
 }
 
 fn main() {
-    let version = env!("CARGO_PKG_NAME").to_string() + ", version: " + env!("CARGO_PKG_VERSION");
-
-    let args: Args = Docopt::new(USAGE)
-        .map(|d| d.help(true))
-        .map(|d| d.version(Some(version)))
-        .and_then(|d| d.deserialize())
-        .unwrap_or_else(|e| e.exit());
-
-    if args.flag_verbose {
+    let args = Args::parse();
+    if args.verbose {
         env_logger::Builder::new()
             .parse_filters("trace")
             .init();
     }
 
-    if !args.flag_crl.is_empty() && args.flag_auth.is_none() {
-        println!("-crl can only be provided with -auth enabled");
+    if !args.crl.is_empty() && args.auth.is_none() {
+        println!("--crl can only be provided with --auth enabled");
         return;
     }
 
     let mut addr: net::SocketAddr = "[::]:443".parse().unwrap();
-    addr.set_port(args.flag_port.unwrap_or(443));
+    addr.set_port(args.port);
 
     let config = make_config(&args);
 
@@ -669,19 +698,18 @@ fn main() {
         .register(&mut listener, LISTENER, mio::Interest::READABLE)
         .unwrap();
 
-    let mode = if args.cmd_echo {
-        ServerMode::Echo
-    } else if args.cmd_http {
-        ServerMode::Http
-    } else {
-        ServerMode::Forward(args.arg_fport.expect("fport required"))
-    };
-
-    let mut tlsserv = TlsServer::new(listener, mode, config);
+    let mut tlsserv = TlsServer::new(listener, args.mode, config);
 
     let mut events = mio::Events::with_capacity(256);
     loop {
-        poll.poll(&mut events, None).unwrap();
+        match poll.poll(&mut events, None) {
+            Ok(_) => {}
+            // Polling can be interrupted (e.g. by a debugger) - retry if so.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                panic!("poll failed: {e:?}")
+            }
+        }
 
         for event in events.iter() {
             match event.token() {

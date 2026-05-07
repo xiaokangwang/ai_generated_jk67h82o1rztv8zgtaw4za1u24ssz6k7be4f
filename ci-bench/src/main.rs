@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::hint::black_box;
+use core::hint::black_box;
+use core::mem;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,33 +11,34 @@ use std::time::Instant;
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
-use fxhash::FxHashMap;
 use itertools::Itertools;
 use rayon::iter::Either;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use rustls::client::Resumption;
-use rustls::crypto::{aws_lc_rs, ring};
+use rustls::crypto::{CipherSuite, CryptoProvider, GetRandomFailed, SecureRandom, TicketProducer};
+use rustls::enums::ProtocolVersion;
 use rustls::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
 use rustls::{
-    CipherSuite, ClientConfig, ClientConnection, ProtocolVersion, RootCertStore, ServerConfig,
+    ClientConfig, ClientConnection, Connection, HandshakeKind, RootCertStore, ServerConfig,
     ServerConnection,
 };
+use rustls_test::KeyType;
 
 use crate::benchmark::{
-    get_reported_instr_count, validate_benchmarks, Benchmark, BenchmarkKind, BenchmarkParams,
-    ResumptionKind,
+    AuthKeySource, Benchmark, BenchmarkKind, BenchmarkParams, ResumptionKind,
+    get_reported_instr_count,
 };
-use crate::cachegrind::CachegrindRunner;
 use crate::util::async_io::{self, AsyncRead, AsyncWrite};
 use crate::util::transport::{
     read_handshake_message, read_plaintext_to_end_bounded, send_handshake_message,
     write_all_plaintext_bounded,
 };
-use crate::util::KeyType;
+use crate::valgrind::{CallgrindRunner, CountInstructions, DhatRunner, MemoryDetails};
 
 mod benchmark;
-mod cachegrind;
 mod util;
+mod valgrind;
 
 /// The size in bytes of the plaintext sent in the transfer benchmark
 const TRANSFER_PLAINTEXT_SIZE: usize = 1024 * 1024 * 10; // 10 MB
@@ -56,11 +57,11 @@ const TRANSFER_PLAINTEXT_SIZE: usize = 1024 * 1024 * 10; // 10 MB
 /// `HashMap` by a `FxHashMap`, which brings the noise down to acceptable levels in a single run).
 const RESUMED_HANDSHAKE_RUNS: usize = 30;
 
-/// The threshold at which instruction count changes are considered relevant
-const CHANGE_THRESHOLD: f64 = 0.002; // 0.2%
-
 /// The name of the file where the instruction counts are stored after a `run-all` run
 const ICOUNTS_FILENAME: &str = "icounts.csv";
+
+/// The name of the file where the memory data are stored after a `run-all` run
+const MEMORY_FILENAME: &str = "memory.csv";
 
 /// Default size in bytes for internal buffers (256 KB)
 const DEFAULT_BUFFER_SIZE: usize = 262144;
@@ -79,20 +80,59 @@ pub enum Command {
         #[arg(short, long, default_value = "target/ci-bench")]
         output_dir: PathBuf,
     },
-    /// Run a single benchmark at the provided index (used by the bench runner to start each benchmark in its own process)
-    RunSingle { index: u32, side: Side },
+    /// Run a named benchmark and print the measured CPU instruction counts in CSV format
+    RunSingle {
+        /// The name of the benchmark.
+        bench: String,
+        #[arg(short, long, default_value = "target/ci-bench")]
+        output_dir: PathBuf,
+    },
+    /// Run a single benchmark at the provided name (used by the bench runner to start each benchmark in its own process)
+    RunPipe {
+        name: String,
+        side: Side,
+        measurement_mode: Mode,
+    },
     /// Run all benchmarks in walltime mode and print the measured timings in CSV format
     Walltime {
         #[arg(short, long)]
         iterations_per_scenario: usize,
     },
-    /// Compare the results from two previous benchmark runs and print a user-friendly markdown overview
+    /// Compare the icount results from two previous benchmark runs and print a user-friendly markdown overview
     Compare {
         /// Path to the directory with the results of a previous `run-all` execution
         baseline_dir: PathBuf,
         /// Path to the directory with the results of a previous `run-all` execution
         candidate_dir: PathBuf,
     },
+    /// Compare the memory results from two previous benchmark runs and print a user-friendly markdown overview
+    CompareMemory {
+        comparator: CompareMemoryOperand,
+        /// Path to the directory with the results of a previous `run-all` execution
+        baseline_dir: PathBuf,
+        /// Path to the directory with the results of a previous `run-all` execution
+        candidate_dir: PathBuf,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+pub enum CompareMemoryOperand {
+    #[default]
+    TotalBytes,
+    TotalBlocks,
+    PeakBytes,
+    PeakBlocks,
+}
+
+impl CompareMemoryOperand {
+    fn choose(&self, memory: MemoryDetails) -> u64 {
+        match self {
+            Self::TotalBytes => memory.heap_total_bytes,
+            Self::TotalBlocks => memory.heap_total_blocks,
+            Self::PeakBytes => memory.heap_peak_bytes,
+            Self::PeakBlocks => memory.heap_peak_blocks,
+        }
+    }
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -101,12 +141,18 @@ pub enum Side {
     Client,
 }
 
+#[derive(Copy, Clone, ValueEnum)]
+pub enum Mode {
+    Instruction,
+    Memory,
+}
+
 impl Side {
     /// Returns the string representation of the side
     pub fn as_str(self) -> &'static str {
         match self {
-            Side::Client => "client",
-            Side::Server => "server",
+            Self::Client => "client",
+            Self::Server => "server",
         }
     }
 }
@@ -118,25 +164,40 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::RunAll { output_dir } => {
             let executable = std::env::args().next().unwrap();
-            let results = run_all(executable, output_dir.clone(), &benchmarks)?;
-
-            // Output results in CSV (note: not using a library here to avoid extra dependencies)
-            let mut csv_file = File::create(output_dir.join(ICOUNTS_FILENAME))
-                .context("cannot create output csv file")?;
-            for (name, instr_count) in results {
-                writeln!(csv_file, "{name},{instr_count}")?;
-            }
+            let results = run_all(
+                executable,
+                output_dir.clone(),
+                &benchmarks.iter().collect::<Vec<_>>(),
+            )?;
+            output_csv(results, output_dir)?;
         }
-        Command::RunSingle { index, side } => {
-            // `u32::MAX` is used as a signal to do nothing and return. By "running" an empty
-            // benchmark we can measure the startup overhead.
-            if index == u32::MAX {
-                return Ok(());
-            }
+        Command::RunSingle { bench, output_dir } => {
+            let executable = std::env::args().next().unwrap();
+            let Some(benchmark) = benchmarks.get(bench.as_str()) else {
+                let mut output = String::new();
+                for bench in all_benchmarks()? {
+                    output.push_str(&format!(" - {:?}\n", bench.name()));
+                }
 
+                return Err(anyhow::anyhow!(
+                    "Benchmark {bench:?} not found\n\nAvailable are:\n{output}"
+                ));
+            };
+            let results = run_all(executable, output_dir.clone(), &[benchmark])?;
+            output_csv(results, output_dir)?;
+        }
+        Command::RunPipe {
+            name,
+            side,
+            measurement_mode,
+        } => {
             let bench = benchmarks
-                .get(index as usize)
-                .ok_or(anyhow::anyhow!("Benchmark not found: {index}"))?;
+                .get(name.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Benchmark not found: {name}"))?;
+
+            if let Some(warm_up) = bench.params.warm_up {
+                warm_up();
+            }
 
             let stdin_lock = io::stdin().lock();
             let stdout_lock = io::stdout().lock();
@@ -151,6 +212,13 @@ fn main() -> anyhow::Result<()> {
             // duration of the lock
             let mut stdin = unsafe { File::from_raw_fd(stdin_lock.as_raw_fd()) };
             let mut stdout = unsafe { File::from_raw_fd(stdout_lock.as_raw_fd()) };
+
+            // When measuring instructions, we do multiple resumed handshakes, for
+            // reasons explained in the comments to `RESUMED_HANDSHAKE_RUNS`.
+            let resumed_reps = match measurement_mode {
+                Mode::Instruction => RESUMED_HANDSHAKE_RUNS,
+                _ => 1,
+            };
 
             let handshake_buf = &mut [0u8; DEFAULT_BUFFER_SIZE];
             let resumption_kind = bench.kind.resumption_kind();
@@ -171,6 +239,7 @@ fn main() -> anyhow::Result<()> {
                                 ),
                             },
                             bench.kind,
+                            resumed_reps,
                         )
                         .await
                     }
@@ -185,6 +254,7 @@ fn main() -> anyhow::Result<()> {
                                 ),
                             },
                             bench.kind,
+                            resumed_reps,
                         )
                         .await
                     }
@@ -199,9 +269,9 @@ fn main() -> anyhow::Result<()> {
         Command::Walltime {
             iterations_per_scenario,
         } => {
-            let mut timings = vec![Vec::with_capacity(iterations_per_scenario); benchmarks.len()];
+            let mut timings = BTreeMap::new();
             for _ in 0..iterations_per_scenario {
-                for (i, bench) in benchmarks.iter().enumerate() {
+                for bench in &benchmarks {
                     let start = Instant::now();
 
                     // The variables below are used to initialize the client and server configs. We
@@ -228,6 +298,7 @@ fn main() -> anyhow::Result<()> {
                                 config: ServerSideStepper::make_config(params, resumption_kind),
                             },
                             bench.kind,
+                            RESUMED_HANDSHAKE_RUNS,
                         )
                         .await
                     };
@@ -245,6 +316,7 @@ fn main() -> anyhow::Result<()> {
                                 config: ClientSideStepper::make_config(params, resumption_kind),
                             },
                             bench.kind,
+                            RESUMED_HANDSHAKE_RUNS,
                         )
                         .await
                     };
@@ -256,13 +328,16 @@ fn main() -> anyhow::Result<()> {
                     server_result
                         .with_context(|| format!("server side of {} crashed", bench.name()))?;
 
-                    timings[i].push(start.elapsed());
+                    timings
+                        .entry(bench.name().to_string())
+                        .or_insert_with(|| Vec::with_capacity(iterations_per_scenario))
+                        .push(start.elapsed());
                 }
             }
 
             // Output the results
-            for (i, bench_timings) in timings.into_iter().enumerate() {
-                print!("{}", benchmarks[i].name());
+            for (name, bench_timings) in timings.into_iter() {
+                print!("{}", name);
                 for timing in bench_timings {
                     print!(",{}", timing.as_nanos())
                 }
@@ -273,31 +348,61 @@ fn main() -> anyhow::Result<()> {
             baseline_dir,
             candidate_dir,
         } => {
-            let baseline = read_results(&baseline_dir.join(ICOUNTS_FILENAME))?;
-            let candidate = read_results(&candidate_dir.join(ICOUNTS_FILENAME))?;
-            let result = compare_results(&baseline_dir, &candidate_dir, &baseline, &candidate)?;
-            print_report(&result);
+            let baseline = read_icount_results(&baseline_dir.join(ICOUNTS_FILENAME))?;
+            let candidate = read_icount_results(&candidate_dir.join(ICOUNTS_FILENAME))?;
+            let result =
+                compare_icount_results(&baseline_dir, &candidate_dir, &baseline, &candidate)?;
+            print_icount_report(&result);
+        }
+        Command::CompareMemory {
+            comparator,
+            baseline_dir,
+            candidate_dir,
+        } => {
+            let baseline = read_memory_results(&baseline_dir.join(MEMORY_FILENAME))?;
+            let candidate = read_memory_results(&candidate_dir.join(MEMORY_FILENAME))?;
 
-            if !result.noteworthy.is_empty() {
-                // Signal to the parent process that there are noteworthy instruction count
-                // differences (exit code 1 is already used when main returns an error)
-                eprintln!("Noteworthy instruction count differences found. Check the job summary for details.");
-                std::process::exit(2);
-            }
+            print_memory_report(&compare_memory_results(&baseline, &candidate, comparator)?);
         }
     }
 
     Ok(())
 }
 
+fn output_csv(
+    results: Vec<(String, CombinedMeasurement)>,
+    output_dir: PathBuf,
+) -> anyhow::Result<()> {
+    // Output results in CSV (note: not using a library here to avoid extra dependencies)
+    let mut csv_file =
+        File::create(output_dir.join(ICOUNTS_FILENAME)).context("cannot create output csv file")?;
+    for (name, combined) in &results {
+        writeln!(csv_file, "{name},{}", combined.instructions)?;
+    }
+
+    let mut csv_file =
+        File::create(output_dir.join(MEMORY_FILENAME)).context("cannot create output csv file")?;
+    for (name, combined) in results {
+        writeln!(
+            csv_file,
+            "{name},{},{},{},{}",
+            combined.memory.heap_total_bytes,
+            combined.memory.heap_total_blocks,
+            combined.memory.heap_peak_bytes,
+            combined.memory.heap_peak_blocks,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Returns all benchmarks
-fn all_benchmarks() -> anyhow::Result<Vec<Benchmark>> {
-    let mut benchmarks = Vec::new();
+fn all_benchmarks() -> anyhow::Result<BTreeSet<Benchmark>> {
+    let mut benchmarks = BTreeSet::new();
     for param in all_benchmarks_params() {
         add_benchmark_group(&mut benchmarks, param);
     }
 
-    validate_benchmarks(&benchmarks)?;
     Ok(benchmarks)
 }
 
@@ -305,81 +410,140 @@ fn all_benchmarks() -> anyhow::Result<Vec<Benchmark>> {
 fn all_benchmarks_params() -> Vec<BenchmarkParams> {
     let mut all = Vec::new();
 
-    for (provider, suites, ticketer, provider_name) in [
+    for (provider, ticketer, provider_name, warm_up) in [
         (
-            ring::default_provider(),
-            ring::ALL_CIPHER_SUITES,
-            &(ring_ticketer as fn() -> Arc<dyn rustls::server::ProducesTickets>),
+            derandomize(rustls_ring::DEFAULT_PROVIDER),
+            &(ring_ticketer as fn() -> Arc<dyn TicketProducer>),
             "ring",
+            None,
         ),
         (
-            aws_lc_rs::default_provider(),
-            aws_lc_rs::ALL_CIPHER_SUITES,
-            &(aws_lc_rs_ticketer as fn() -> Arc<dyn rustls::server::ProducesTickets>),
+            derandomize(rustls_aws_lc_rs::DEFAULT_PROVIDER),
+            &(aws_lc_rs_ticketer as fn() -> Arc<dyn TicketProducer>),
             "aws_lc_rs",
+            Some(warm_up_aws_lc_rs as fn()),
         ),
     ] {
-        for (key_type, suite_name, version, name) in [
+        for (key_type, suite_name, name) in [
             (
-                KeyType::Rsa,
+                KeyType::Rsa2048,
                 CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                &rustls::version::TLS12,
                 "1.2_rsa_aes",
             ),
             (
-                KeyType::Rsa,
+                KeyType::Rsa2048,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                &rustls::version::TLS13,
                 "1.3_rsa_aes",
             ),
             (
-                KeyType::Ecdsa,
+                KeyType::EcdsaP256,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                &rustls::version::TLS13,
-                "1.3_ecdsa_aes",
+                "1.3_ecdsap256_aes",
             ),
             (
-                KeyType::Rsa,
+                KeyType::EcdsaP384,
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                "1.3_ecdsap384_aes",
+            ),
+            (
+                KeyType::Rsa2048,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                &rustls::version::TLS13,
                 "1.3_rsa_chacha",
             ),
             (
-                KeyType::Ecdsa,
+                KeyType::EcdsaP256,
                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-                &rustls::version::TLS13,
-                "1.3_ecdsa_chacha",
+                "1.3_ecdsap256_chacha",
+            ),
+            (
+                KeyType::EcdsaP384,
+                CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                "1.3_ecdsap384_chacha",
             ),
         ] {
             all.push(BenchmarkParams::new(
-                provider.clone(),
+                select_suite(provider.clone(), suite_name),
                 ticketer,
-                key_type,
-                find_suite(suites, suite_name),
-                version,
+                AuthKeySource::KeyType(key_type),
                 format!("{provider_name}_{name}"),
+                warm_up,
             ));
         }
     }
 
+    let make_ticketer =
+        &((|| Arc::new(rustls_fuzzing_provider::Ticketer)) as fn() -> Arc<dyn TicketProducer>);
+
+    all.push(BenchmarkParams::new(
+        rustls_fuzzing_provider::PROVIDER_TLS13.into(),
+        make_ticketer,
+        AuthKeySource::FuzzingProvider,
+        "1.3_no_crypto".to_string(),
+        None,
+    ));
+
+    all.push(BenchmarkParams::new(
+        rustls_fuzzing_provider::PROVIDER_TLS12.into(),
+        make_ticketer,
+        AuthKeySource::FuzzingProvider,
+        "1.2_no_crypto".to_string(),
+        None,
+    ));
+
     all
 }
 
-fn find_suite(
-    all: &[rustls::SupportedCipherSuite],
-    name: CipherSuite,
-) -> rustls::SupportedCipherSuite {
-    *all.iter()
-        .find(|suite| suite.suite() == name)
-        .unwrap_or_else(|| panic!("cannot find cipher suite {name:?}"))
+fn ring_ticketer() -> Arc<dyn TicketProducer> {
+    rustls_ring::DEFAULT_PROVIDER
+        .ticketer_factory
+        .ticketer()
+        .unwrap()
 }
 
-fn ring_ticketer() -> Arc<dyn rustls::server::ProducesTickets> {
-    ring::Ticketer::new().unwrap()
+fn aws_lc_rs_ticketer() -> Arc<dyn TicketProducer> {
+    rustls_aws_lc_rs::DEFAULT_PROVIDER
+        .ticketer_factory
+        .ticketer()
+        .unwrap()
 }
 
-fn aws_lc_rs_ticketer() -> Arc<dyn rustls::server::ProducesTickets> {
-    aws_lc_rs::Ticketer::new().unwrap()
+fn select_suite(mut provider: CryptoProvider, name: CipherSuite) -> Arc<CryptoProvider> {
+    provider
+        .tls12_cipher_suites
+        .to_mut()
+        .retain(|suite| suite.common.suite == name);
+    provider
+        .tls13_cipher_suites
+        .to_mut()
+        .retain(|suite| suite.common.suite == name);
+    provider.into()
+}
+
+fn derandomize(base: CryptoProvider) -> CryptoProvider {
+    CryptoProvider {
+        secure_random: &NotRandom,
+        ..base
+    }
+}
+
+fn warm_up_aws_lc_rs() {
+    // "Warm up" provider's actual entropy source.  aws-lc-rs particularly
+    // has an expensive process here, which is one-time (per calling thread)
+    // so not useful to include in benchmark measurements.
+    rustls_aws_lc_rs::DEFAULT_PROVIDER
+        .secure_random
+        .fill(&mut [0u8])
+        .unwrap();
+}
+
+#[derive(Debug)]
+struct NotRandom;
+
+impl SecureRandom for NotRandom {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
+        buf.fill(0x5a);
+        Ok(())
+    }
 }
 
 /// Adds a group of benchmarks for the specified parameters
@@ -390,7 +554,7 @@ fn aws_lc_rs_ticketer() -> Arc<dyn rustls::server::ProducesTickets> {
 /// - Handshake with session id resumption
 /// - Handshake with ticket resumption
 /// - Transfer a 1MB data stream from the server to the client
-fn add_benchmark_group(benchmarks: &mut Vec<Benchmark>, params: BenchmarkParams) {
+fn add_benchmark_group(benchmarks: &mut BTreeSet<Benchmark>, params: BenchmarkParams) {
     let params_label = params.label.clone();
 
     // Create handshake benchmarks for all resumption kinds
@@ -401,46 +565,48 @@ fn add_benchmark_group(benchmarks: &mut Vec<Benchmark>, params: BenchmarkParams)
             params.clone(),
         );
 
-        let handshake_bench = if resumption_param != ResumptionKind::No {
-            // Since resumed handshakes include a first non-resumed handshake, we need to subtract
-            // the non-resumed handshake's instructions
-            handshake_bench
-                .exclude_setup_instructions(format!("handshake_no_resume_{params_label}"))
-        } else {
-            handshake_bench
-        };
-
-        benchmarks.push(handshake_bench);
+        assert!(benchmarks.insert(handshake_bench), "duplicate benchmark");
     }
 
     // Benchmark data transfer
-    benchmarks.push(
-        Benchmark::new(
+    assert!(
+        benchmarks.insert(Benchmark::new(
             format!("transfer_no_resume_{params_label}"),
             BenchmarkKind::Transfer,
-            params.clone(),
-        )
-        .exclude_setup_instructions(format!("handshake_no_resume_{params_label}")),
+            params
+        )),
+        "duplicate benchmark"
     );
 }
 
-/// Run all the provided benches under cachegrind to retrieve their instruction count
-pub fn run_all(
+/// Run all the provided benches under callgrind to retrieve their instruction count
+fn run_all(
     executable: String,
     output_dir: PathBuf,
-    benches: &[Benchmark],
-) -> anyhow::Result<Vec<(String, u64)>> {
+    benches: &[&Benchmark],
+) -> anyhow::Result<Vec<(String, CombinedMeasurement)>> {
+    for bench in benches {
+        if let Some(warm_up) = bench.params.warm_up {
+            warm_up();
+        }
+    }
+
     // Run the benchmarks in parallel
-    let cachegrind = CachegrindRunner::new(executable, output_dir)?;
-    let results: Vec<_> = benches
+    let cg_runner = CallgrindRunner::new(executable.clone(), output_dir.clone())?;
+    let cg_results: Vec<_> = benches
         .par_iter()
-        .enumerate()
-        .map(|(i, bench)| (bench, cachegrind.run_bench(i as u32, bench)))
+        .map(|bench| (bench, cg_runner.run_bench(bench)))
+        .collect();
+
+    let dh_runner = DhatRunner::new(executable, output_dir)?;
+    let dh_results: Vec<_> = benches
+        .par_iter()
+        .map(|bench| (bench, dh_runner.run_bench(bench)))
         .collect();
 
     // Report possible errors
-    let (errors, results): (Vec<_>, FxHashMap<_, _>) =
-        results
+    let (errors, cg_results): (Vec<_>, FxHashMap<_, _>) =
+        cg_results
             .into_iter()
             .partition_map(|(bench, result)| match result {
                 Err(_) => Either::Left(()),
@@ -452,16 +618,47 @@ pub fn run_all(
         // crashing
         anyhow::bail!("One or more benchmarks crashed");
     }
+    let (errors, dh_results): (Vec<_>, FxHashMap<_, _>) =
+        dh_results
+            .into_iter()
+            .partition_map(|(bench, result)| match result {
+                Err(_) => Either::Left(()),
+                Ok(heap_profile) => Either::Right((bench.name(), heap_profile)),
+            });
+    if !errors.is_empty() {
+        // Note: there is no need to explicitly report the names of each crashed benchmark, because
+        // names and other details are automatically printed to stderr by the child process upon
+        // crashing
+        anyhow::bail!("One or more benchmarks crashed");
+    }
 
     // Gather results keeping the original order of the benchmarks
     let mut measurements = Vec::new();
     for bench in benches {
-        let instr_counts = get_reported_instr_count(bench, &results);
-        measurements.push((bench.name_with_side(Side::Server), instr_counts.server));
-        measurements.push((bench.name_with_side(Side::Client), instr_counts.client));
+        let instr_counts = get_reported_instr_count(bench, &cg_results);
+        let memory = &dh_results[bench.name()];
+        measurements.push((
+            bench.name_with_side(Side::Server),
+            CombinedMeasurement {
+                instructions: instr_counts.server,
+                memory: memory.server,
+            },
+        ));
+        measurements.push((
+            bench.name_with_side(Side::Client),
+            CombinedMeasurement {
+                instructions: instr_counts.client,
+                memory: memory.client,
+            },
+        ));
     }
 
     Ok(measurements)
+}
+
+pub struct CombinedMeasurement {
+    instructions: u64,
+    memory: MemoryDetails,
 }
 
 /// Drives the different steps in a benchmark.
@@ -474,6 +671,7 @@ trait BenchStepper {
     async fn handshake(&mut self) -> anyhow::Result<Self::Endpoint>;
     async fn sync_before_resumed_handshake(&mut self) -> anyhow::Result<()>;
     async fn transmit_data(&mut self, endpoint: &mut Self::Endpoint) -> anyhow::Result<()>;
+    fn handshake_kind(&self, endpoint: &Self::Endpoint) -> HandshakeKind;
 }
 
 /// Stepper fields necessary for IO
@@ -492,30 +690,26 @@ struct ClientSideStepper<'a> {
 
 impl ClientSideStepper<'_> {
     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ClientConfig> {
-        assert_eq!(params.ciphersuite.version(), params.version);
-        let mut root_store = RootCertStore::empty();
-        let mut rootbuf =
-            io::BufReader::new(fs::File::open(params.key_type.path_for("ca.cert")).unwrap());
-        root_store.add_parsable_certificates(
-            rustls_pemfile::certs(&mut rootbuf).map(|result| result.unwrap()),
-        );
+        let cfg = ClientConfig::builder(params.provider.clone());
 
-        let mut cfg = ClientConfig::builder_with_provider(
-            rustls::crypto::CryptoProvider {
-                cipher_suites: vec![params.ciphersuite],
-                ..params.provider.clone()
+        let mut cfg = match params.auth_key {
+            AuthKeySource::KeyType(key_type) => {
+                let mut root_store = RootCertStore::empty();
+                root_store
+                    .add(key_type.ca_cert())
+                    .unwrap();
+
+                cfg.with_root_certificates(root_store)
+                    .with_no_client_auth()
+                    .unwrap()
             }
-            .into(),
-        )
-        .with_protocol_versions(&[params.version])
-        .unwrap()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
-        .with_fingerprint(
-            rustls::craft::CHROME_108
-                .test_alpn_http1
-                .builder(),
-        );
+
+            AuthKeySource::FuzzingProvider => cfg
+                .dangerous()
+                .with_custom_certificate_verifier(rustls_fuzzing_provider::server_verifier())
+                .with_no_client_auth()
+                .unwrap(),
+        };
 
         if resume != ResumptionKind::No {
             cfg.resumption = Resumption::in_memory_sessions(128);
@@ -533,7 +727,11 @@ impl BenchStepper for ClientSideStepper<'_> {
 
     async fn handshake(&mut self) -> anyhow::Result<Self::Endpoint> {
         let server_name = "localhost".try_into().unwrap();
-        let mut client = ClientConnection::new(self.config.clone(), server_name).unwrap();
+        let mut client = self
+            .config
+            .connect(server_name)
+            .build()
+            .unwrap();
         client.set_buffer_limit(None);
 
         loop {
@@ -569,6 +767,10 @@ impl BenchStepper for ClientSideStepper<'_> {
         assert_eq!(total_plaintext_read, TRANSFER_PLAINTEXT_SIZE);
         Ok(())
     }
+
+    fn handshake_kind(&self, endpoint: &Self::Endpoint) -> HandshakeKind {
+        endpoint.handshake_kind().unwrap()
+    }
 }
 
 /// A benchmark stepper for the server-side of the connection
@@ -579,19 +781,24 @@ struct ServerSideStepper<'a> {
 
 impl ServerSideStepper<'_> {
     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ServerConfig> {
-        assert_eq!(params.ciphersuite.version(), params.version);
+        let cfg = ServerConfig::builder(params.provider.clone());
 
-        let mut cfg = ServerConfig::builder_with_provider(params.provider.clone().into())
-            .with_protocol_versions(&[params.version])
-            .unwrap()
-            .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
-            .with_single_cert(params.key_type.get_chain(), params.key_type.get_key())
-            .expect("bad certs/private key?");
+        let mut cfg = match params.auth_key {
+            AuthKeySource::KeyType(key_type) => cfg
+                .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
+                .with_single_cert(key_type.identity(), key_type.key())
+                .expect("bad certs/private key?"),
+
+            AuthKeySource::FuzzingProvider => cfg
+                .with_client_cert_verifier(WebPkiClientVerifier::no_client_auth())
+                .with_server_credential_resolver(rustls_fuzzing_provider::server_cert_resolver())
+                .unwrap(),
+        };
 
         if resume == ResumptionKind::SessionId {
             cfg.session_storage = ServerSessionMemoryCache::new(128);
         } else if resume == ResumptionKind::Tickets {
-            cfg.ticketer = (params.ticketer)();
+            cfg.ticketer = Some((params.ticketer)());
         } else {
             cfg.session_storage = Arc::new(NoServerSessionStorage {});
         }
@@ -627,22 +834,31 @@ impl BenchStepper for ServerSideStepper<'_> {
         write_all_plaintext_bounded(endpoint, self.io.writer, TRANSFER_PLAINTEXT_SIZE).await?;
         Ok(())
     }
+
+    fn handshake_kind(&self, endpoint: &Self::Endpoint) -> HandshakeKind {
+        endpoint.handshake_kind().unwrap()
+    }
 }
 
 /// Runs the benchmark using the provided stepper
-async fn run_bench<T: BenchStepper>(mut stepper: T, kind: BenchmarkKind) -> anyhow::Result<()> {
-    let mut endpoint = stepper.handshake().await?;
-
+async fn run_bench<T: BenchStepper>(
+    mut stepper: T,
+    kind: BenchmarkKind,
+    resumed_reps: usize,
+) -> anyhow::Result<()> {
     match kind {
         BenchmarkKind::Handshake(ResumptionKind::No) => {
-            // Nothing else to do here, since the handshake already happened
-            black_box(endpoint);
+            // Just count instructions for one handshake.
+            let _count = CountInstructions::start();
+            black_box(stepper.handshake().await?);
         }
         BenchmarkKind::Handshake(_) => {
-            // The handshake performed above was non-resumed, because the client didn't have a
-            // session ID / ticket; from now on we can perform resumed handshakes. We do it multiple
-            // times, for reasons explained in the comments to `RESUMED_HANDSHAKE_RUNS`.
-            for _ in 0..RESUMED_HANDSHAKE_RUNS {
+            // The first handshake performed is non-resumed, because the client didn't have a
+            // session ID / ticket.  This is not measured.
+            stepper.handshake().await?;
+
+            let _count = CountInstructions::start();
+            for _ in 0..resumed_reps {
                 // Wait for the endpoints to sync (i.e. the server must have discarded the previous
                 // connection and be ready for a new handshake, otherwise the client will start a
                 // handshake before the server is ready and the bytes will be fed to the old
@@ -650,10 +866,14 @@ async fn run_bench<T: BenchStepper>(mut stepper: T, kind: BenchmarkKind) -> anyh
                 stepper
                     .sync_before_resumed_handshake()
                     .await?;
-                stepper.handshake().await?;
+                let endpoint = stepper.handshake().await?;
+                assert_eq!(stepper.handshake_kind(&endpoint), HandshakeKind::Resumed);
             }
         }
         BenchmarkKind::Transfer => {
+            // Measurement includes the transfer, but not the handshake.
+            let mut endpoint = stepper.handshake().await?;
+            let _count = CountInstructions::start();
             stepper
                 .transmit_data(&mut endpoint)
                 .await?;
@@ -665,16 +885,19 @@ async fn run_bench<T: BenchStepper>(mut stepper: T, kind: BenchmarkKind) -> anyh
 
 /// The results of a comparison between two `run-all` executions
 struct CompareResult {
-    /// Results that probably indicate a real change in performance and should be highlighted.
+    /// Results for benchmark scenarios we know are fairly deterministic.
     ///
-    /// The string is a detailed diff between the instruction counts obtained from cachegrind.
-    noteworthy: Vec<(Diff, String)>,
-    /// Results within the noise threshold
-    negligible: Vec<Diff>,
+    /// The string is a detailed diff between the instruction counts obtained from callgrind.
+    diffs: Vec<(Diff, String)>,
     /// Benchmark scenarios present in the candidate but missing in the baseline
     missing_in_baseline: Vec<String>,
-    /// Benchmark scenarios we know are extremely non-deterministic.
-    known_noisy: Vec<Diff>,
+}
+
+/// The results of a comparison between two `run-all` executions
+struct MemoryCompareResult {
+    diffs: Vec<MemoryDiff>,
+    /// Benchmark scenarios present in the candidate but missing in the baseline
+    missing_in_baseline: Vec<String>,
 }
 
 /// Contains information about instruction counts and their difference for a specific scenario
@@ -687,8 +910,19 @@ struct Diff {
     diff_ratio: f64,
 }
 
+/// Contains information about memory usage and a difference for a specific scenario & comparator
+#[derive(Clone)]
+struct MemoryDiff {
+    scenario: String,
+    baseline: MemoryDetails,
+    candidate: MemoryDetails,
+    comparator: CompareMemoryOperand,
+    diff: i64,
+    diff_ratio: f64,
+}
+
 /// Reads the (benchmark, instruction count) pairs from previous CSV output
-fn read_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
+fn read_icount_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
     let file = File::open(path).context(format!(
         "CSV file for comparison not found: {}",
         path.display()
@@ -702,11 +936,11 @@ fn read_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
         measurements.insert(
             parts
                 .next()
-                .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                 .to_string(),
             parts
                 .next()
-                .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+                .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
                 .parse()
                 .context("Unable to parse instruction count from CSV")?,
         );
@@ -715,9 +949,54 @@ fn read_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
     Ok(measurements)
 }
 
+/// Reads the (benchmark, instruction count) pairs from previous CSV output
+fn read_memory_results(path: &Path) -> anyhow::Result<HashMap<String, MemoryDetails>> {
+    let file = File::open(path).context(format!(
+        "CSV file for comparison not found: {}",
+        path.display()
+    ))?;
+
+    let mut measurements = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.context("Unable to read results from CSV file")?;
+        let line = line.trim();
+        let mut parts = line.split(',');
+        measurements.insert(
+            parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
+                .to_string(),
+            MemoryDetails {
+                heap_total_bytes: parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap total bytes from CSV")?,
+                heap_total_blocks: parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap total blocks from CSV")?,
+                heap_peak_bytes: parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap peak bytes from CSV")?,
+                heap_peak_blocks: parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("CSV is wrongly formatted"))?
+                    .parse()
+                    .context("Unable to parse heap peak blocks from CSV")?,
+            },
+        );
+    }
+
+    Ok(measurements)
+}
+
 /// Returns an internal representation of the comparison between the baseline and the candidate
 /// measurements
-fn compare_results(
+fn compare_icount_results(
     baseline_dir: &Path,
     candidate_dir: &Path,
     baseline: &HashMap<String, u64>,
@@ -725,7 +1004,6 @@ fn compare_results(
 ) -> anyhow::Result<CompareResult> {
     let mut diffs = Vec::new();
     let mut missing = Vec::new();
-    let mut known_noisy = Vec::new();
 
     for (scenario, &instr_count) in candidate {
         let Some(&baseline_instr_count) = baseline.get(scenario) else {
@@ -743,10 +1021,7 @@ fn compare_results(
             diff_ratio,
         };
 
-        match is_known_noisy(scenario) {
-            true => known_noisy.push(diff),
-            false => diffs.push(diff),
-        };
+        diffs.push(diff);
     }
 
     diffs.sort_by(|diff1, diff2| {
@@ -756,69 +1031,94 @@ fn compare_results(
             .total_cmp(&diff1.diff_ratio.abs())
     });
 
-    let (noteworthy, negligible) = split_on_threshold(&diffs);
-
-    let mut noteworthy_with_details = Vec::new();
-    for diff in noteworthy {
-        let detailed_diff = cachegrind::diff(baseline_dir, candidate_dir, &diff.scenario)?;
-        noteworthy_with_details.push((diff, detailed_diff));
+    let mut diffs_with_callgrind_diff = Vec::new();
+    for diff in diffs {
+        let detailed_diff = valgrind::callgrind_diff(baseline_dir, candidate_dir, &diff.scenario)?;
+        diffs_with_callgrind_diff.push((diff, detailed_diff));
     }
 
     Ok(CompareResult {
-        noteworthy: noteworthy_with_details,
-        negligible,
+        diffs: diffs_with_callgrind_diff,
         missing_in_baseline: missing,
-        known_noisy,
     })
 }
 
-fn is_known_noisy(scenario_name: &str) -> bool {
-    // aws-lc-rs RSA key validation is non-deterministic, and expensive in relative terms for
-    // "cheaper" tests, and only done for server-side tests.  Exclude these tests
-    // from comparison.
-    //
-    // Better solutions for this include:
-    // - https://github.com/rustls/rustls/issues/1494: exclude key validation in these tests.
-    //   Key validation is benchmarked separately elsewhere, and mostly amortised into
-    //   insignificance in real-world scenarios.
-    // - Find a way to make aws-lc-rs deterministic, such as by replacing its RNG with a
-    //   test-only one.
-    scenario_name.contains("_aws_lc_rs_")
-        && scenario_name.contains("_rsa_")
-        && scenario_name.ends_with("_server")
+/// Returns an internal representation of the comparison between the baseline and the candidate
+/// measurements
+fn compare_memory_results(
+    baseline: &HashMap<String, MemoryDetails>,
+    candidate: &HashMap<String, MemoryDetails>,
+    comparator: CompareMemoryOperand,
+) -> anyhow::Result<MemoryCompareResult> {
+    let mut diffs = Vec::new();
+    let mut missing = Vec::new();
+
+    for (scenario, &candidate_memory) in candidate {
+        let Some(&baseline_memory) = baseline.get(scenario) else {
+            missing.push(scenario.clone());
+            continue;
+        };
+
+        let candidate_count = comparator.choose(candidate_memory);
+        let baseline_count = comparator.choose(baseline_memory);
+
+        let diff = candidate_count as i64 - baseline_count as i64;
+        let diff_ratio = diff as f64 / baseline_count as f64;
+        let diff = MemoryDiff {
+            scenario: scenario.clone(),
+            baseline: baseline_memory,
+            candidate: candidate_memory,
+            comparator,
+            diff,
+            diff_ratio,
+        };
+
+        diffs.push(diff);
+    }
+
+    diffs.sort_by(|diff1, diff2| {
+        diff2
+            .diff_ratio
+            .abs()
+            .total_cmp(&diff1.diff_ratio.abs())
+    });
+
+    Ok(MemoryCompareResult {
+        diffs,
+        missing_in_baseline: missing,
+    })
 }
 
 /// Prints a report of the comparison to stdout, using GitHub-flavored markdown
-fn print_report(result: &CompareResult) {
+fn print_icount_report(result: &CompareResult) {
     println!("# Benchmark results");
 
     if !result.missing_in_baseline.is_empty() {
         println!("### ⚠️ Warning: missing benchmarks");
         println!();
-        println!("The following benchmark scenarios are present in the candidate but not in the baseline:");
+        println!(
+            "The following benchmark scenarios are present in the candidate but not in the baseline:"
+        );
         println!();
         for scenario in &result.missing_in_baseline {
             println!("* {scenario}");
         }
     }
 
-    println!("## Noteworthy instruction count differences");
-    if result.noteworthy.is_empty() {
-        println!(
-            "_There are no noteworthy instruction count differences (i.e. above {}%)_",
-            CHANGE_THRESHOLD * 100.0
-        );
+    println!("## Instruction count differences");
+    if result.diffs.is_empty() {
+        println!("_There are no instruction count differences_");
     } else {
         table(
             result
-                .noteworthy
+                .diffs
                 .iter()
                 .map(|(diff, _)| diff),
             true,
         );
         println!("<details>");
         println!("<summary>Details per scenario</summary>\n");
-        for (diff, detailed_diff) in &result.noteworthy {
+        for (diff, detailed_diff) in &result.diffs {
             println!("#### {}", diff.scenario);
             println!("```");
             println!("{detailed_diff}");
@@ -826,40 +1126,28 @@ fn print_report(result: &CompareResult) {
         }
         println!("</details>\n")
     }
-
-    println!("## Other instruction count differences");
-    if result.negligible.is_empty() {
-        println!("_There are no other instruction count differences_");
-    } else {
-        println!("<details>");
-        println!("<summary>Click to expand</summary>\n");
-        table(result.negligible.iter(), false);
-        println!("</details>\n")
-    }
-
-    if !result.known_noisy.is_empty() {
-        println!("### ‼️ Caution: ignored noisy benchmarks");
-        println!("<details>");
-        println!("<summary>Click to expand</summary>\n");
-        table(result.known_noisy.iter(), false);
-        println!("</details>\n")
-    }
 }
 
-/// Splits the diffs into two `Vec`s, the first one containing the diffs that exceed the threshold,
-/// the second one containing the rest.
-///
-/// Assumes that the diff slice is sorted by `diff_ratio` in descending order.
-fn split_on_threshold(diffs: &[Diff]) -> (Vec<Diff>, Vec<Diff>) {
-    match diffs
-        .iter()
-        .position(|diff| diff.diff_ratio.abs() < CHANGE_THRESHOLD)
-    {
-        None => (diffs.to_vec(), Vec::new()),
-        Some(first_below_threshold) => (
-            diffs[..first_below_threshold].to_vec(),
-            diffs[first_below_threshold..].to_vec(),
-        ),
+fn print_memory_report(result: &MemoryCompareResult) {
+    println!("# Memory measurement results");
+
+    if !result.missing_in_baseline.is_empty() {
+        println!("### ⚠️ Warning: missing benchmarks");
+        println!();
+        println!(
+            "The following benchmark scenarios are present in the candidate but not in the baseline:"
+        );
+        println!();
+        for scenario in &result.missing_in_baseline {
+            println!("* {scenario}");
+        }
+    }
+
+    println!("## Memory measurement differences");
+    if result.diffs.is_empty() {
+        println!("_There are no memory measurement differences_");
+    } else {
+        memory_table(&result.diffs, true);
     }
 }
 
@@ -879,6 +1167,36 @@ fn table<'a>(diffs: impl Iterator<Item = &'a Diff>, emoji_feedback: bool) {
             diff.scenario,
             diff.baseline,
             diff.candidate,
+            emoji,
+            diff.diff,
+            diff.diff_ratio * 100.0
+        )
+    }
+}
+
+/// Renders the diffs as a markdown table
+fn memory_table(diffs: &[MemoryDiff], emoji_feedback: bool) {
+    println!("| Scenario | Baseline | Candidate | Diff |");
+    println!("| --- | ---: | ---: | ---: |");
+    for diff in diffs {
+        let emoji = match emoji_feedback {
+            true if diff.diff_ratio > 0.01 => "⚠️ ",
+            true if diff.diff_ratio < -0.01 => "✅ ",
+            _ => "",
+        };
+
+        println!(
+            "| {} | Total {}B / {}# <br/> Peak {}B / {}# | Total {}B / {}# <br/> Peak {}B / {}# | {:?} {}{} ({:.2}%) |",
+            diff.scenario,
+            diff.baseline.heap_total_bytes,
+            diff.baseline.heap_total_blocks,
+            diff.baseline.heap_peak_bytes,
+            diff.baseline.heap_peak_blocks,
+            diff.candidate.heap_total_bytes,
+            diff.candidate.heap_total_blocks,
+            diff.candidate.heap_peak_bytes,
+            diff.candidate.heap_peak_blocks,
+            diff.comparator,
             emoji,
             diff.diff,
             diff.diff_ratio * 100.0

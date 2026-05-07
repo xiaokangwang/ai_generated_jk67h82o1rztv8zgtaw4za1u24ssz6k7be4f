@@ -1,64 +1,70 @@
+#![allow(missing_docs)]
+
 mod fingerprints;
 pub use fingerprints::*;
-use rand::{thread_rng, Rng};
 
-use crate::client::ClientConnectionData;
-use crate::common_state::Context;
-use crate::crypto::{ActiveKeyExchange, SupportedKxGroup};
-use crate::msgs::base::{Payload, PayloadU16};
-use crate::msgs::codec::{Codec, LengthPrefixedBuffer};
-use crate::msgs::enums::{ECPointFormat, ExtensionType, PSKKeyExchangeMode};
-use crate::msgs::handshake::{
-    CertificateStatusRequest, ClientExtension, KeyShareEntry, OcspCertificateStatusRequest,
-};
-use crate::msgs::handshake::{HelloRetryRequest, UnknownExtension};
-use crate::version::{TLS12, TLS13};
-use crate::versions::EnabledVersions;
-use crate::{
-    CipherSuite, ClientConfig, Error, NamedGroup, ProtocolVersion, SignatureScheme, ALL_VERSIONS,
-};
-use alloc::sync::Arc;
-use core::fmt::Debug;
-use std::boxed::Box;
-use std::vec;
-use std::{collections::HashMap, vec::Vec};
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::{self, Debug};
+use std::collections::HashMap;
 
-use static_init::dynamic;
+use crate::ClientConfig;
+use crate::compress;
+use crate::crypto::cipher::Payload;
+use crate::crypto::kx::{NamedGroup, StartedKeyExchange, SupportedKxGroup};
+use crate::crypto::{CipherSuite, SecureRandom, SignatureScheme};
+use crate::enums::{ApplicationProtocol, CertificateCompressionAlgorithm, ProtocolVersion};
+use crate::error::Error;
+use crate::msgs::{
+    ClientExtensions, ClientHelloPayload, ExtensionType, HelloRetryRequest, KeyShareEntry,
+    PskKeyExchangeModes,
+};
+use crate::msgs::{Codec, LengthPrefixedBuffer, ListLength, TlsListElement};
+use crate::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CraftOptions(Option<FingerprintBuilder>);
 
 impl CraftOptions {
-    fn get(&self) -> &FingerprintBuilder {
-        assert!(self.0.is_some(), "The tls client config doesn't contain a fingerprint, please consider calling ClientConfig::with_fingerprint(...)");
-        self.0.as_ref().unwrap()
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.0.is_some()
     }
 
-    pub(crate) fn patch_extension(
+    fn get(&self) -> Option<&FingerprintBuilder> {
+        self.0.as_ref()
+    }
+
+    pub(crate) fn patch_client_hello(
         &self,
-        cx: &mut Context<'_, ClientConnectionData>,
+        data: &mut CraftConnectionData,
         config: &ClientConfig,
         hrr: Option<&HelloRetryRequest>,
-        extension: &mut Vec<ClientExtension>,
-    ) {
-        self.get()
-            .fingerprint
-            .patch_extension(cx, config, hrr, extension)
-    }
+        hello: &mut ClientHelloPayload,
+    ) -> CraftPatchResult {
+        let Some(builder) = self.get() else {
+            return CraftPatchResult::default();
+        };
 
-    pub(crate) fn patch_cipher(
-        &self,
-        cx: &mut Context<'_, ClientConnectionData>,
-        config: &ClientConfig,
-        extension: &mut Vec<CipherSuite>,
-    ) {
-        if !config.craft.get().override_suite {
-            return;
-        }
-        self.get()
+        let result = builder
             .fingerprint
-            .patch_cipher(cx, extension)
+            .patch_client_hello(data, config, hrr, hello);
+
+        if builder.override_suite {
+            builder
+                .fingerprint
+                .patch_cipher(data, &mut hello.cipher_suites);
+        }
+
+        result
     }
+}
+
+#[derive(Default)]
+pub(crate) struct CraftPatchResult {
+    pub(crate) key_share: Option<(&'static dyn SupportedKxGroup, StartedKeyExchange)>,
 }
 
 #[allow(dead_code)]
@@ -83,77 +89,65 @@ impl GreaseSeed {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CraftConnectionData {
     grease_seed: GreaseSeed,
-    pub(crate) our_key_share_alt: Vec<Box<dyn ActiveKeyExchange>>,
-    pub(crate) extension_order: Vec<usize>,
-}
-
-impl Debug for CraftConnectionData {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CraftConnectionData")
-            .field("grease_seed", &self.grease_seed)
-            .field("our_key_share_alt", &"hidden")
-            .finish()
-    }
+    extension_order: Vec<usize>,
 }
 
 impl CraftConnectionData {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(secure_random: &dyn SecureRandom) -> Result<Self, Error> {
         use BoringSslGreaseIndex::*;
+
         let mut grease_seed = [0u16; NumOfGrease as usize];
-        thread_rng().fill(&mut grease_seed);
         for seed in grease_seed.iter_mut() {
-            let unit = (*seed & 0xf0u16) | 0x0au16;
+            let mut random = [0u8; 2];
+            secure_random.fill(&mut random)?;
+            let random = u16::from_be_bytes(random);
+            let unit = (random & 0xf0u16) | 0x0au16;
             *seed = unit << 8 | unit;
         }
         if grease_seed[Extension1 as usize] == grease_seed[Extension2 as usize] {
             grease_seed[Extension2 as usize] ^= 0x1010;
         }
-        Self {
+
+        Ok(Self {
             grease_seed: GreaseSeed(grease_seed),
-            our_key_share_alt: Vec::new(),
             extension_order: Vec::new(),
-        }
-    }
-
-    pub(crate) fn find_key_share(
-        &mut self,
-        target_group: NamedGroup,
-    ) -> Option<Box<dyn ActiveKeyExchange>> {
-        for i in 0..self.our_key_share_alt.len() {
-            if self.our_key_share_alt[i].group() == target_group {
-                return Some(self.our_key_share_alt.swap_remove(i));
-            }
-        }
-
-        None
+        })
     }
 }
 
-/// An enum representing either a valid value of type `T` or a GREASE (Generate Random Extensions And Sustain Extensibility) placeholder.
 #[derive(Debug)]
 pub enum GreaseOr<T> {
-    /// A GREASE placeholder value, which will be generated randomly per session.
     Grease,
-    /// A valid value of the generic type `T`.
     T(T),
 }
 
+impl<T: Clone> Clone for GreaseOr<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Grease => Self::Grease,
+            Self::T(t) => Self::T(t.clone()),
+        }
+    }
+}
+
+#[allow(dead_code)]
 impl<T: Clone> GreaseOr<T> {
     pub(crate) fn is_grease(&self) -> bool {
-        matches!(self, Grease)
+        matches!(self, Self::Grease)
     }
 
     pub(crate) fn val(&self) -> T {
         match self {
-            Grease => unimplemented!(),
+            Self::Grease => panic!("GREASE value does not have a fixed value"),
             Self::T(t) => t.clone(),
         }
     }
 }
 
-use GreaseOr::Grease;
+pub use GreaseOr::Grease;
 
 pub(crate) trait CreateUnknown: Clone + Debug {
     fn create_unknown(grease: u16) -> Self;
@@ -165,7 +159,7 @@ impl<T> GreaseOr<T> {
         T: CreateUnknown,
     {
         match self {
-            Grease => T::create_unknown(grease),
+            Self::Grease => T::create_unknown(grease),
             Self::T(t) => t.clone(),
         }
     }
@@ -177,30 +171,25 @@ impl<T> From<T> for GreaseOr<T> {
     }
 }
 
-/// A type that can either hold a valid `NamedGroup` or serve as a GREASE placeholder.
 pub type GreaseOrCurve = GreaseOr<NamedGroup>;
-
-/// A type that can either hold a valid `ProtocolVersion` or serve as a GREASE placeholder.
 pub type GreaseOrVersion = GreaseOr<ProtocolVersion>;
-
-/// A type that can either hold a valid `CipherSuite` or serve as a GREASE placeholder.
 pub type GreaseOrCipher = GreaseOr<CipherSuite>;
 
 impl CreateUnknown for NamedGroup {
     fn create_unknown(grease: u16) -> Self {
-        Self::Unknown(grease)
+        Self(grease)
     }
 }
 
 impl CreateUnknown for ProtocolVersion {
     fn create_unknown(grease: u16) -> Self {
-        Self::Unknown(grease)
+        Self(grease)
     }
 }
 
 impl CreateUnknown for CipherSuite {
     fn create_unknown(grease: u16) -> Self {
-        Self::Unknown(grease)
+        Self(grease)
     }
 }
 
@@ -210,344 +199,276 @@ struct CraftFakeKxGroup {
 }
 
 impl SupportedKxGroup for CraftFakeKxGroup {
+    fn start(&self) -> Result<StartedKeyExchange, Error> {
+        Err(Error::General(String::from(
+            "craftls fake key exchange group cannot start key exchange",
+        )))
+    }
+
     fn name(&self) -> NamedGroup {
         self.name
     }
-
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        todo!()
-    }
 }
 
-pub(crate) static FAKE_SECP256R1: &'static dyn SupportedKxGroup = &CraftFakeKxGroup {
+pub(crate) static FAKE_SECP256R1: &dyn SupportedKxGroup = &CraftFakeKxGroup {
     name: NamedGroup::secp256r1,
 };
-
-pub(crate) static FAKE_SECP384R1: &'static dyn SupportedKxGroup = &CraftFakeKxGroup {
+pub(crate) static FAKE_SECP384R1: &dyn SupportedKxGroup = &CraftFakeKxGroup {
     name: NamedGroup::secp384r1,
 };
-
-pub(crate) static FAKE_SECP521R1: &'static dyn SupportedKxGroup = &CraftFakeKxGroup {
+pub(crate) static FAKE_SECP521R1: &dyn SupportedKxGroup = &CraftFakeKxGroup {
     name: NamedGroup::secp521r1,
 };
-
-pub(crate) static FAKE_FFDHE2048: &'static dyn SupportedKxGroup = &CraftFakeKxGroup {
+pub(crate) static FAKE_FFDHE2048: &dyn SupportedKxGroup = &CraftFakeKxGroup {
     name: NamedGroup::FFDHE2048,
 };
-
-pub(crate) static FAKE_FFDHE3072: &'static dyn SupportedKxGroup = &CraftFakeKxGroup {
+pub(crate) static FAKE_FFDHE3072: &dyn SupportedKxGroup = &CraftFakeKxGroup {
     name: NamedGroup::FFDHE3072,
 };
 
 fn to_fake_curves(group: &NamedGroup) -> &'static dyn SupportedKxGroup {
-    match group {
+    match *group {
         NamedGroup::secp256r1 => FAKE_SECP256R1,
         NamedGroup::secp384r1 => FAKE_SECP384R1,
         NamedGroup::secp521r1 => FAKE_SECP521R1,
         NamedGroup::FFDHE2048 => FAKE_FFDHE2048,
         NamedGroup::FFDHE3072 => FAKE_FFDHE3072,
-        _ => unimplemented!(),
+        _ => panic!("unsupported fake key exchange group {group:?}"),
     }
 }
 
-/// Craft client extension provides customization to rustls client extensions, or offers some unavailable extensions in rustls.
 #[derive(Debug, Clone)]
 pub enum CraftExtension {
-    /// The first grease extension in the list
     Grease1,
-
-    /// The second grease extension in the list
     Grease2,
-
-    /// RenegotiationInfo extension that hard coded with `RenegotiationNever`
     RenegotiationInfo,
-
-    /// SupportedCurves that supports grease or NamedCurve
     SupportedCurves(&'static [GreaseOrCurve]),
-
-    /// SupportedVersions that supports grease or tls versions
     SupportedVersions(&'static [GreaseOrVersion]),
-
-    /// Hardcoded SignedCertificateTimestamp
     SignedCertificateTimestamp,
-
-    /// KeyShare that supports grease or NamedCurve
     KeyShare(&'static [GreaseOrCurve]),
-
-    /// Hardcoded fake BoringSSL ApplicationSettings.
     FakeApplicationSettings,
-
-    /// Hardcoded fake CompressCert extension that provides no compression algorithm
     FakeCompressCert,
-
-    /// CompressCert extension
-    CompressCert(&'static [crate::CertificateCompressionAlgorithm]),
-
-    /// Client Hello Padding extension that mimics the BoringSSL padding style
+    CompressCert(&'static [CertificateCompressionAlgorithm]),
     Padding,
-
-    /// ALPN extension
     Protocols(&'static [&'static [u8]]),
-
-    /// Fake DelegatedCredentials extension
     FakeDelegatedCredentials(&'static [SignatureScheme]),
-
-    /// Fake RecordSizeLimit extension
     FakeRecordSizeLimit(u16),
 }
 
-macro_rules! get_origin_ext {
-    ($extract:expr, $ext:path, $strict_mode:expr) => {
-        match $extract {
-            Some($ext(v)) => v,
-            _ => {
-                assert!(!$strict_mode);
-                return Err(());
-            }
-        }
-    };
-}
-
 impl CraftExtension {
-    fn make_ext(typ: ExtensionType, payload: Vec<u8>) -> ClientExtension {
-        ClientExtension::Unknown(UnknownExtension {
-            typ,
-            payload: Payload(payload),
-        })
-    }
-
-    fn to_rustls_extension(
+    fn to_wire_extension(
         &self,
-        cx: &mut Context<'_, ClientConnectionData>,
+        data: &mut CraftConnectionData,
         config: &ClientConfig,
-        ext_store: &mut HashMap<u16, ClientExtension>,
+        store: &mut HashMap<ExtensionType, CraftClientExtension>,
+        hello: &ClientHelloPayload,
         hrr: Option<&HelloRetryRequest>,
-    ) -> Result<ClientExtension, ()> {
-        let craft_config = config.craft.get();
-        Ok(match self {
-            Self::Grease1 => Self::make_ext(
-                cx.data
-                    .craft_connection_data
-                    .grease_seed
-                    .get(BoringSslGreaseIndex::Extension1)
-                    .into(),
+    ) -> Result<(CraftClientExtension, CraftPatchResult), ()> {
+        let craft_config = config.craft.get().ok_or(())?;
+        let mut result = CraftPatchResult::default();
+
+        let ext = match self {
+            Self::Grease1 => CraftClientExtension::raw(
+                ExtensionType(
+                    data.grease_seed
+                        .get(BoringSslGreaseIndex::Extension1),
+                ),
                 Vec::new(),
             ),
-            Self::Grease2 => Self::make_ext(
-                cx.data
-                    .craft_connection_data
-                    .grease_seed
-                    .get(BoringSslGreaseIndex::Extension2)
-                    .into(),
+            Self::Grease2 => CraftClientExtension::raw(
+                ExtensionType(
+                    data.grease_seed
+                        .get(BoringSslGreaseIndex::Extension2),
+                ),
                 vec![0],
             ),
-            Self::RenegotiationInfo => Self::make_ext(ExtensionType::RenegotiationInfo, vec![0]),
-            Self::SupportedCurves(curves) => {
-                let mut origin_curves = get_origin_ext!(
-                    ext_store.remove(&ExtensionType::EllipticCurves.get_u16()),
-                    ClientExtension::NamedGroups,
-                    craft_config.strict_mode
-                );
-                if config
-                    .craft
-                    .get()
-                    .override_supported_curves
-                {
-                    for (i, v) in curves.iter().enumerate() {
-                        if v.is_grease() {
-                            origin_curves.insert(
-                                i,
-                                cx.data
-                                    .craft_connection_data
-                                    .grease_seed
-                                    .get(BoringSslGreaseIndex::Group)
-                                    .into(),
-                            );
-                            break;
-                        }
-                    }
-                }
-                ClientExtension::NamedGroups(origin_curves)
+            Self::RenegotiationInfo => {
+                CraftClientExtension::raw(ExtensionType::RenegotiationInfo, vec![0])
             }
-            Self::SupportedVersions(versions) => {
-                let origin_versions = get_origin_ext!(
-                    ext_store.remove(&ExtensionType::SupportedVersions.get_u16()),
-                    ClientExtension::SupportedVersions,
-                    craft_config.strict_mode
-                );
-                ClientExtension::SupportedVersions(
-                    versions
+            Self::SupportedCurves(curves) => {
+                if !craft_config.override_supported_curves {
+                    store
+                        .remove(&ExtensionType::EllipticCurves)
+                        .ok_or(())?
+                } else {
+                    let groups = curves
                         .iter()
-                        .map(|v| {
-                            v.val_or(
-                                cx.data
-                                    .craft_connection_data
-                                    .grease_seed
-                                    .get(BoringSslGreaseIndex::Version),
+                        .map(|group| {
+                            group.val_or(
+                                data.grease_seed
+                                    .get(BoringSslGreaseIndex::Group),
                             )
                         })
-                        .filter(|v| {
-                            if !v.craft_is_unknown() && !origin_versions.contains(v) {
-                                assert!(
-                                    !craft_config.strict_mode,
-                                    "unknown version {:?}, all: {:?}",
-                                    v, origin_versions
-                                );
-                                false
-                            } else {
-                                true
-                            }
-                        })
-                        .collect(),
-                )
+                        .collect::<Vec<_>>();
+                    CraftClientExtension::encoded(ExtensionType::EllipticCurves, &groups)
+                }
             }
-            Self::SignedCertificateTimestamp => Self::make_ext(ExtensionType::SCT, vec![]),
+            Self::SupportedVersions(versions) => {
+                let mut payload = Vec::new();
+                {
+                    let inner = LengthPrefixedBuffer::new(
+                        ListLength::NonZeroU8 {
+                            empty_error: crate::error::InvalidMessage::IllegalEmptyList(
+                                "ProtocolVersions",
+                            ),
+                        },
+                        &mut payload,
+                    );
+                    for version in *versions {
+                        version
+                            .val_or(
+                                data.grease_seed
+                                    .get(BoringSslGreaseIndex::Version),
+                            )
+                            .encode(inner.buf);
+                    }
+                }
+                CraftClientExtension::raw(ExtensionType::SupportedVersions, payload)
+            }
+            Self::SignedCertificateTimestamp => {
+                CraftClientExtension::raw(ExtensionType::SCT, Vec::new())
+            }
             Self::KeyShare(key_share_spec) => {
-                if hrr.is_some()
-                    && hrr
-                        .unwrap()
-                        .get_requested_key_share_group()
-                        .is_some()
+                if hrr
+                    .and_then(|hrr| hrr.key_share)
+                    .is_some()
                     || !craft_config.override_keyshare
                 {
-                    return ext_store
-                        .remove(&ExtensionType::KeyShare.get_u16())
-                        .ok_or(());
-                }
-                let mut origin_ks = get_origin_ext!(
-                    ext_store.remove(&ExtensionType::KeyShare.get_u16()),
-                    ClientExtension::KeyShare,
-                    craft_config.strict_mode
-                )
-                .into_iter()
-                .next();
+                    store
+                        .remove(&ExtensionType::KeyShare)
+                        .ok_or(())?
+                } else {
+                    let mut origin = hello
+                        .key_shares
+                        .as_ref()
+                        .and_then(|shares| shares.first().cloned());
+                    let origin_group = origin.as_ref().map(|share| share.group);
+                    let mut shares = Vec::new();
 
-                let origin_ks_group = origin_ks.as_ref().unwrap().group;
-
-                let mut key_shares = vec![];
-
-                for group_spec in key_share_spec.iter() {
-                    key_shares.push(match group_spec {
-                        Grease => KeyShareEntry {
-                            group: group_spec.val_or(
-                                cx.data
-                                    .craft_connection_data
-                                    .grease_seed
-                                    .get(BoringSslGreaseIndex::Group),
-                            ),
-                            payload: PayloadU16(vec![0]),
-                        },
-                        GreaseOr::T(group) => {
-                            if origin_ks.is_some()
-                                && (origin_ks_group != config.provider.kx_groups[0].name()
-                                    || *group == origin_ks_group)
-                            {
-                                origin_ks.take().unwrap()
-                            } else if !key_shares
-                                .iter()
-                                .any(|ks: &KeyShareEntry| ks.group.get_u16() == group.get_u16())
-                            {
-                                let ks_data = match config
-                                    .find_kx_group(*group)
-                                    .and_then(|v| v.start().ok())
-                                {
-                                    Some(ks_data) => ks_data,
-                                    None => {
-                                        assert!(
-                                            !craft_config.strict_mode,
-                                            "unsupported group specified for psk"
-                                        );
-                                        continue;
+                    for group_spec in *key_share_spec {
+                        match group_spec {
+                            Grease => shares.push(KeyShareEntry::new(
+                                group_spec.val_or(
+                                    data.grease_seed
+                                        .get(BoringSslGreaseIndex::Group),
+                                ),
+                                vec![0],
+                            )),
+                            GreaseOr::T(group) => {
+                                if origin_group == Some(*group) {
+                                    if let Some(origin) = origin.take() {
+                                        shares.push(origin);
                                     }
-                                };
-                                let ks_ext = KeyShareEntry::new(*group, ks_data.pub_key());
+                                    continue;
+                                }
 
-                                cx.data
-                                    .craft_connection_data
-                                    .our_key_share_alt
-                                    .push(ks_data);
-                                ks_ext
-                            } else {
-                                continue;
+                                if shares
+                                    .iter()
+                                    .any(|share| share.group == *group)
+                                {
+                                    continue;
+                                }
+
+                                let Some(group_impl) = config
+                                    .provider()
+                                    .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+                                else {
+                                    assert!(
+                                        !craft_config.strict_mode,
+                                        "unsupported key share group {group:?}"
+                                    );
+                                    continue;
+                                };
+
+                                let Ok(started) = group_impl.start() else {
+                                    assert!(
+                                        !craft_config.strict_mode,
+                                        "failed to start key exchange for group {group:?}"
+                                    );
+                                    continue;
+                                };
+                                shares.push(KeyShareEntry::new(*group, started.pub_key()));
+                                if result.key_share.is_none() {
+                                    result.key_share = Some((group_impl, started));
+                                }
                             }
                         }
-                    });
-                }
+                    }
 
-                if let Some(origin_ks) = origin_ks {
-                    key_shares.push(origin_ks);
+                    if shares.is_empty() {
+                        return Err(());
+                    }
+                    CraftClientExtension::encoded(ExtensionType::KeyShare, &shares)
                 }
-
-                ClientExtension::KeyShare(key_shares)
             }
             Self::FakeApplicationSettings => {
-                Self::make_ext(17513.into(), vec![0, 3, 2, b'h', b'2'])
+                CraftClientExtension::raw(ExtensionType(17513), vec![0, 3, 2, b'h', b'2'])
             }
-            Self::Padding => {
-                ClientExtension::CraftPadding(CraftPadding {
-                    psk_len: if let Some(ClientExtension::PresharedKey(psk)) =
-                        ext_store.get(&ExtensionType::PreSharedKey.get_u16())
-                    {
-                        2 /* ext_type */ + 2 /* len */ + 2 /* ident_len */ + psk.identities.iter().map(|v| 2 /* len */ + v.identity.0.len() + 4 /* obfs ticket age */).sum::<usize>() + 2 /* binders len */ + psk.binders.iter().map(|b| 1 + b.0.0.len()).sum::<usize>()
-                    } else {
-                        0
-                    },
-                })
+            Self::FakeCompressCert => {
+                CraftClientExtension::raw(ExtensionType::CompressCertificate, vec![2, 0, 0])
             }
-            Self::FakeCompressCert => Self::make_ext(0x001b.into(), vec![2, 0, 0]),
             Self::CompressCert(algorithms) => {
                 if craft_config.strict_mode {
-                    config
+                    let offered = hello
                         .certificate_compression_algorithms
-                        .iter()
-                        .zip(algorithms.iter())
-                        .for_each(|(a, b)| {
-                            assert_eq!(a.alg, *b);
-                        });
+                        .as_deref()
+                        .unwrap_or_default();
+                    assert_eq!(offered, *algorithms);
                 }
-                ext_store
-                    .remove(&ExtensionType::CompressCertificate.get_u16())
+                store
+                    .remove(&ExtensionType::CompressCertificate)
                     .ok_or(())?
             }
+            Self::Padding => {
+                let psk_len = store
+                    .get(&ExtensionType::PreSharedKey)
+                    .map(|ext| 4 + ext.payload_len())
+                    .unwrap_or(0);
+                CraftClientExtension::padding(psk_len)
+            }
             Self::Protocols(protocols) => {
-                if craft_config.strict_mode
-                    && (protocols.len() != config.alpn_protocols.len()
-                        || protocols
-                            .iter()
-                            .zip(config.alpn_protocols.iter())
-                            .any(|(p1, p2)| p1 != &p2.as_slice()))
-                {
-                    panic!()
+                if craft_config.strict_mode {
+                    let offered = hello
+                        .protocols
+                        .as_deref()
+                        .unwrap_or_default();
+                    assert!(
+                        protocols.len() == offered.len()
+                            && protocols
+                                .iter()
+                                .zip(offered.iter())
+                                .all(|(a, b)| *a == b.as_ref())
+                    );
                 }
-                ext_store
-                    .remove(&ExtensionType::ALProtocolNegotiation.get_u16())
+                store
+                    .remove(&ExtensionType::ALProtocolNegotiation)
                     .ok_or(())?
             }
             Self::FakeDelegatedCredentials(delegated) => {
-                let mut buf = vec![];
+                let mut payload = Vec::new();
                 {
-                    let length_padded =
-                        LengthPrefixedBuffer::new(crate::msgs::codec::ListLength::U16, &mut buf);
-                    for sig in delegated.iter() {
-                        sig.encode(length_padded.buf);
+                    let list = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+                    for scheme in *delegated {
+                        scheme.encode(list.buf);
                     }
-                };
-                Self::make_ext(34.into(), buf)
+                }
+                CraftClientExtension::raw(ExtensionType(34), payload)
             }
             Self::FakeRecordSizeLimit(limit) => {
-                Self::make_ext(28.into(), limit.to_be_bytes().to_vec())
+                CraftClientExtension::raw(ExtensionType(28), limit.to_be_bytes().to_vec())
             }
-        })
+        };
+
+        Ok((ext, result))
     }
 }
 
-/// A boringssl-style client padding presented by Craftls.
 #[derive(Clone, Debug)]
 pub struct CraftPadding {
     psk_len: usize,
 }
 
-impl Codec for CraftPadding {
+impl Codec<'_> for CraftPadding {
     fn encode(&self, bytes: &mut Vec<u8>) {
         let unpadded = self.psk_len + bytes.len() - 4;
         if unpadded > 0xff && unpadded < 0x200 {
@@ -555,47 +476,166 @@ impl Codec for CraftPadding {
             if padding_len > 4 {
                 padding_len -= 4;
             } else {
-                padding_len = 1
+                padding_len = 1;
             }
             bytes.resize(bytes.len() + padding_len, 0);
         } else {
-            // A dirty trick to delete the already written ext type and size.
             bytes.resize(bytes.len() - 4, 0);
         }
     }
 
-    fn read(_: &mut crate::msgs::codec::Reader) -> Result<Self, crate::InvalidMessage> {
-        todo!()
+    fn read(_: &mut crate::msgs::Reader<'_>) -> Result<Self, crate::error::InvalidMessage> {
+        Err(crate::error::InvalidMessage::MissingData("CraftPadding"))
     }
 }
 
-/// `KeepExtension` gives fine-grained control over the inclusion of extensions originally generated by Rustls.
-/// It dictates whether to keep certain Rustls extensions, use them optionally, or provide a default if unavailable.
+#[derive(Debug, Clone)]
+pub enum ClientSessionTicket {
+    Request,
+    Offer(Payload<'static>),
+}
+
+#[derive(Debug, Clone)]
+pub struct PayloadU16(pub Vec<u8>);
+
+impl PayloadU16 {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        (self.0.len() as u16).encode(bytes);
+        bytes.extend_from_slice(&self.0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ECPointFormat(pub u8);
+
+impl ECPointFormat {
+    #[allow(non_upper_case_globals)]
+    pub const Uncompressed: Self = Self(0);
+}
+
+impl Codec<'_> for ECPointFormat {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.0.encode(bytes);
+    }
+
+    fn read(r: &mut crate::msgs::Reader<'_>) -> Result<Self, crate::error::InvalidMessage> {
+        Ok(Self(u8::read(r)?))
+    }
+}
+
+impl TlsListElement for ECPointFormat {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: crate::error::InvalidMessage::IllegalEmptyList("ECPointFormats"),
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PSKKeyExchangeMode(pub u8);
+
+impl PSKKeyExchangeMode {
+    pub const PSK_KE: Self = Self(0);
+    pub const PSK_DHE_KE: Self = Self(1);
+}
+
+impl Codec<'_> for PSKKeyExchangeMode {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.0.encode(bytes);
+    }
+
+    fn read(r: &mut crate::msgs::Reader<'_>) -> Result<Self, crate::error::InvalidMessage> {
+        Ok(Self(u8::read(r)?))
+    }
+}
+
+impl TlsListElement for PSKKeyExchangeMode {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: crate::error::InvalidMessage::IllegalEmptyList("PskKeyExchangeModes"),
+    };
+}
+
+#[derive(Debug, Clone)]
+pub struct OcspCertificateStatusRequest {
+    pub responder_ids: Vec<PayloadU16>,
+    pub extensions: PayloadU16,
+}
+
+#[derive(Debug, Clone)]
+pub enum CertificateStatusRequest {
+    Ocsp(OcspCertificateStatusRequest),
+}
+
+impl CertificateStatusRequest {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        match self {
+            Self::Ocsp(req) => {
+                1u8.encode(bytes);
+                {
+                    let responders = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+                    for responder in &req.responder_ids {
+                        responder.encode(responders.buf);
+                    }
+                }
+                req.extensions.encode(bytes);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ClientExtension {
+    EcPointFormats(Vec<ECPointFormat>),
+    SignatureAlgorithms(Vec<SignatureScheme>),
+    SessionTicket(ClientSessionTicket),
+    ExtendedMasterSecretRequest,
+    CertificateStatusRequest(CertificateStatusRequest),
+    PresharedKeyModes(Vec<PSKKeyExchangeMode>),
+}
+
+impl ClientExtension {
+    fn to_wire_extension(&self) -> CraftClientExtension {
+        match self {
+            Self::EcPointFormats(formats) => {
+                CraftClientExtension::encoded(ExtensionType::ECPointFormats, formats)
+            }
+            Self::SignatureAlgorithms(schemes) => {
+                CraftClientExtension::encoded(ExtensionType::SignatureAlgorithms, schemes)
+            }
+            Self::SessionTicket(ClientSessionTicket::Request) => {
+                CraftClientExtension::raw(ExtensionType::SessionTicket, Vec::new())
+            }
+            Self::SessionTicket(ClientSessionTicket::Offer(payload)) => {
+                CraftClientExtension::raw(ExtensionType::SessionTicket, payload.bytes().to_vec())
+            }
+            Self::ExtendedMasterSecretRequest => {
+                CraftClientExtension::raw(ExtensionType::ExtendedMasterSecret, Vec::new())
+            }
+            Self::CertificateStatusRequest(req) => {
+                let mut payload = Vec::new();
+                req.encode(&mut payload);
+                CraftClientExtension::raw(ExtensionType::StatusRequest, payload)
+            }
+            Self::PresharedKeyModes(modes) => CraftClientExtension::encoded(
+                ExtensionType::PSKKeyExchangeModes,
+                &PskKeyExchangeModes {
+                    psk_dhe: modes.contains(&PSKKeyExchangeMode::PSK_DHE_KE),
+                    psk: modes.contains(&PSKKeyExchangeMode::PSK_KE),
+                },
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum KeepExtension {
-    /// Specifies that the `ExtensionType` must be provided by Rustls. If the extension is not present, there might be a configuration or implementation error.
     Must(ExtensionType),
-    /// Specifies that the `ExtensionType` may be provided by Rustls. Its absence will not be considered
-    /// an error.
     Optional(ExtensionType),
-    /// Specifies that the `ExtensionType` should be provided by Rustls; if it is not available,
-    /// the specified `ClientExtension` will be used as a fallback.
     OrDefault(ExtensionType, ClientExtension),
 }
 
-/// `ExtensionSpec` outlines the types of client extensions that can be used in a fingerprint specification
 #[derive(Debug, Clone)]
 pub enum ExtensionSpec {
-    /// A `CraftExtension` represents an extension not inherently supported by Rustls or a customization not available in Rustls.
-    /// These extensions will be eventually be converted into Rustls `ClientExtension`s.
     Craft(CraftExtension),
-
-    /// A `ClientExtension` native to Rustls. Extensions specified here are directly included in the client hello message.
     Rustls(ClientExtension),
-
-    /// A `KeepExtension` dictates the retention policy for extensions that are generated by Rustls by default.
-    /// It allows for specifying whether certain Rustls-generated extensions should be kept as-is, used conditionally,
-    /// or replaced with a default if not present.
     Keep(KeepExtension),
 }
 
@@ -615,9 +655,9 @@ fn shuffle_extensions(extensions: &[ExtensionSpec], config: &ClientConfig) -> Ve
         }
     }
 
-    let mut random_buf = [0u8, 0, 0, 0];
-    let rand_gen = config.provider.secure_random;
+    let rand_gen = config.provider().secure_random;
     for i in (1..to_shuffle.len()).rev() {
+        let mut random_buf = [0u8; 4];
         rand_gen.fill(&mut random_buf).unwrap();
         let swap_idx = (u32::from_be_bytes(random_buf) as usize) % (i + 1);
         to_shuffle.swap(i, swap_idx);
@@ -630,28 +670,14 @@ fn shuffle_extensions(extensions: &[ExtensionSpec], config: &ClientConfig) -> Ve
     to_shuffle
 }
 
-/// Represents a TLS fingerprint
-///
-/// # Available Fingerprints:
-/// * [`CHROME_108`]
-/// * [`CHROME_112`]
-/// * [`SAFARI_17_1`]
-/// * [`FIREFOX_105`]
 #[derive(Debug, Clone, Default)]
 pub struct Fingerprint {
-    /// The TLS ClientHello extensions included in the fingerprint. Each `ExtensionSpec` determines the nature and handling
-    /// of an extension, whether it's a Craft extension, a native Rustls extension, or subject
-    /// to conditional inclusion based on Rustls' defaults.
     pub extensions: &'static [ExtensionSpec],
-    /// Indicates whether the list of extensions should be randomly reordered
-    /// before being sent in the ClientHello message. This shuffling process is introduced to mimic BoringSSL.
     pub shuffle_extensions: bool,
-    /// Specifies the list of ciphers included in the ClientHello.
     pub cipher: &'static [GreaseOrCipher],
 }
 
 impl Fingerprint {
-    /// Creates a fingerprint builder that allow you to tweak the fingerprint and patch the client config. See also [`crate::ClientConfig::with_fingerprint`]
     pub fn builder(&self) -> FingerprintBuilder {
         FingerprintBuilder {
             fingerprint: self.clone(),
@@ -665,121 +691,93 @@ impl Fingerprint {
         }
     }
 
-    fn patch_extension(
+    fn patch_client_hello(
         &self,
-        cx: &mut Context<'_, ClientConnectionData>,
+        data: &mut CraftConnectionData,
         config: &ClientConfig,
         hrr: Option<&HelloRetryRequest>,
-        extension: &mut Vec<ClientExtension>,
-    ) {
-        let craft_config = config.craft.get();
-        // if extension
-        //     .iter()
-        //     .any(|v| matches!(v, ClientExtension::EarlyData))
-        // {
-        //     assert!(!craft_config.strict_mode);
-        //     return;
-        // }
-
-        let mut ext_store = HashMap::new();
-        for ext in extension.drain(..) {
-            match ext {
-                ClientExtension::ServerName(_)
-                | ClientExtension::SessionTicket(_)
-                | ClientExtension::KeyShare(_)
-                | ClientExtension::PresharedKey(_)
-                | ClientExtension::Protocols(_)
-                | ClientExtension::NamedGroups(_)
-                | ClientExtension::SupportedVersions(_)
-                | ClientExtension::Cookie(_)
-                | ClientExtension::EarlyData
-                | ClientExtension::CompressCertificate(_) => {
-                    ext_store.insert(ext.get_type().get_u16(), ext);
-                }
-                _ => (),
-            }
-        }
-
-        use ExtensionSpec::*;
-        use KeepExtension::*;
-
-        if hrr.is_none()
-            && craft_config
-                .fingerprint
-                .shuffle_extensions
-        {
-            cx.data
-                .craft_connection_data
-                .extension_order = shuffle_extensions(self.extensions, config);
-        }
-
-        let order = {
-            let mut iter_a = None;
-            let mut iter_b = None;
-
-            let order = &cx
-                .data
-                .craft_connection_data
-                .extension_order;
-            if order.is_empty() {
-                iter_a = Some(0..self.extensions.len())
-            } else {
-                iter_b = Some(order.clone().into_iter())
-            }
-            iter_a
-                .into_iter()
-                .flatten()
-                .chain(iter_b.into_iter().flatten())
+        hello: &mut ClientHelloPayload,
+    ) -> CraftPatchResult {
+        let Some(craft_config) = config.craft.get() else {
+            return CraftPatchResult::default();
         };
 
+        let mut store = wire_extension_store(&hello.extensions);
+
+        if hrr.is_none() && self.shuffle_extensions {
+            data.extension_order = shuffle_extensions(self.extensions, config);
+        }
+
+        let order = if data.extension_order.is_empty() {
+            (0..self.extensions.len()).collect::<Vec<_>>()
+        } else {
+            data.extension_order.clone()
+        };
+
+        let mut result = CraftPatchResult::default();
+        let mut output = Vec::new();
         for idx in order {
-            let spec = &self.extensions[idx];
-            extension.push(match spec {
-                Craft(ext) => match ext.to_rustls_extension(cx, config, &mut ext_store, hrr) {
-                    Ok(ext) => ext,
-                    Err(_) => continue,
-                },
-                Rustls(ext) => ext.clone(),
-                Keep(Must(ext_type)) => match ext_store.remove(&ext_type.get_u16()) {
-                    Some(ext) => ext,
-                    None => {
-                        if matches!(ext_type, ExtensionType::ServerName) && config.enable_sni {
+            let Some(spec) = self.extensions.get(idx) else {
+                continue;
+            };
+
+            let extension = match spec {
+                ExtensionSpec::Craft(ext) => {
+                    let Ok((ext, patch_result)) =
+                        ext.to_wire_extension(data, config, &mut store, hello, hrr)
+                    else {
+                        continue;
+                    };
+                    if result.key_share.is_none() {
+                        result.key_share = patch_result.key_share;
+                    }
+                    ext
+                }
+                ExtensionSpec::Rustls(ext) => ext.to_wire_extension(),
+                ExtensionSpec::Keep(KeepExtension::Must(ext_type)) => {
+                    match store.remove(ext_type) {
+                        Some(ext) => ext,
+                        None => {
+                            if *ext_type == ExtensionType::ServerName && !config.enable_sni {
+                                continue;
+                            }
+                            assert!(
+                                !craft_config.strict_mode,
+                                "expected extension {ext_type:?}, but rustls did not generate it"
+                            );
                             continue;
                         }
-                        assert!(
-                            !craft_config.strict_mode,
-                            "expecting {:?}, but got nothing",
-                            ext_type
-                        );
-                        continue;
                     }
-                },
-                Keep(Optional(ext)) => match ext_store.remove(&ext.get_u16()) {
-                    Some(ext) => ext,
-                    None => {
+                }
+                ExtensionSpec::Keep(KeepExtension::Optional(ext_type)) => {
+                    let Some(ext) = store.remove(ext_type) else {
                         continue;
-                    }
-                },
-                Keep(OrDefault(ext, default_ext)) => ext_store
-                    .remove(&ext.get_u16())
-                    .unwrap_or_else(|| default_ext.clone()),
-            })
+                    };
+                    ext
+                }
+                ExtensionSpec::Keep(KeepExtension::OrDefault(ext_type, default_ext)) => store
+                    .remove(ext_type)
+                    .unwrap_or_else(|| default_ext.to_wire_extension()),
+            };
+
+            output.push(extension);
         }
+
+        hello.craft_extensions = Some(output);
+        result
     }
 
     pub(crate) fn patch_cipher(
         &self,
-        cx: &mut Context<'_, ClientConnectionData>,
-        extension: &mut Vec<CipherSuite>,
+        data: &mut CraftConnectionData,
+        cipher_suites: &mut Vec<CipherSuite>,
     ) {
-        *extension = self
+        *cipher_suites = self
             .cipher
             .iter()
-            .map(|c| {
-                c.val_or(
-                    cx.data
-                        .craft_connection_data
-                        .grease_seed
+            .map(|cipher| {
+                cipher.val_or(
+                    data.grease_seed
                         .get(BoringSslGreaseIndex::Cipher),
                 )
             })
@@ -788,10 +786,6 @@ impl Fingerprint {
 }
 
 #[derive(Debug, Clone)]
-/// A builder for constructing a [`Fingerprint`] with customizable configurations.
-/// The builder allows specific aspects of the TLS fingerprint to be overridden,
-/// ensuring that the final [`crate::ClientConfig`] and ClientHello align with desired specifications or
-/// testing conditions.
 pub struct FingerprintBuilder {
     fingerprint: Fingerprint,
     override_alpn: bool,
@@ -804,36 +798,21 @@ pub struct FingerprintBuilder {
 }
 
 impl FingerprintBuilder {
-    /// Disables the overriding of the ALPN settings.
-    /// Use this option when working with HTTP clients, such as `hyper`, that internally manage
-    /// ALPN settings; they may raise issues if ALPN is set externally. While this option skips
-    /// setting ALPN, it still validates the ALPN during TLS handshakes against expected values.
-    /// Non-compliance will lead to a panic, ensuring adherence to the specified ALPN requirements.
     pub fn do_not_override_alpn(mut self) -> Self {
         self.override_alpn = false;
         self
     }
 
-    /// Disables the override of key share configurations. Intended only for testing purposes,
-    /// this option allows the default key share behavior to be used, bypassing the key share settings
-    /// specified in the `Fingerprint`. This can help in testing scenarios where non-standard key
-    /// share configurations are to be evaluated or default behavior is required.
     pub fn dangerous_disable_override_keyshare(mut self) -> Self {
         self.override_keyshare = false;
         self
     }
 
-    /// Disables the override of cipher suites. Intended only for testing purposes
     pub fn dangerous_disable_override_suite(mut self) -> Self {
         self.override_suite = false;
         self
     }
 
-    /// Enters a craftls test mode that disables various overrides and strict checking against the [`Fingerprint`].
-    /// This mode is intended for testing and should be used with caution as it relaxes the
-    /// constraints normally enforced by the builder, potentially allowing configurations that
-    /// deviate from the specified `Fingerprint`. This can be useful for testing how the system
-    /// behaves under non-standard or unexpected configurations.
     pub fn dangerous_craft_test_mode(mut self) -> Self {
         self.strict_mode = false;
         self.override_alpn = false;
@@ -847,10 +826,6 @@ impl FingerprintBuilder {
     }
 
     pub(crate) fn patch_config(self, mut config: ClientConfig) -> ClientConfig {
-        if self.override_version {
-            assert_eq!(ALL_VERSIONS, &[&TLS13, &TLS12]);
-            config.versions = EnabledVersions::new(ALL_VERSIONS); // enable both tls 1.2 and 1.3
-        }
         for ext in self.fingerprint.extensions.iter() {
             match ext {
                 ExtensionSpec::Craft(CraftExtension::SupportedCurves(curves)) => {
@@ -858,73 +833,49 @@ impl FingerprintBuilder {
                         continue;
                     }
 
-                    let curves_need_modification = curves
-                        .iter()
-                        .filter(|c| !c.is_grease())
-                        .zip(config.provider.kx_groups.iter())
-                        .all(|(c1, c2)| c1.val() == c2.name());
-
-                    if !curves_need_modification {
-                        continue;
-                    }
-
-                    let mut provider = config.provider.as_ref().clone();
-
+                    let mut provider = config.provider().as_ref().clone();
+                    let mut kx_groups = provider.kx_groups.to_vec();
                     let mut grease_offset = 0;
                     for (idx, curve) in curves.iter().enumerate() {
                         match curve {
                             Grease => {
                                 grease_offset += 1;
-                                continue;
                             }
                             GreaseOr::T(curve) => {
-                                if let Some(old_idx) = provider
-                                    .kx_groups
+                                if let Some(old_idx) = kx_groups
                                     .iter()
                                     .position(|v| v.name() == *curve)
                                 {
-                                    if idx - grease_offset == old_idx {
-                                        continue;
+                                    if idx - grease_offset != old_idx {
+                                        kx_groups.swap(idx - grease_offset, old_idx);
                                     }
-                                    assert!(
-                                        idx - grease_offset < old_idx,
-                                        "idx {idx}, old_idx {old_idx}"
-                                    );
-                                    provider.kx_groups.swap(idx, old_idx);
                                 } else {
-                                    provider
-                                        .kx_groups
-                                        .insert(idx - grease_offset, to_fake_curves(curve))
+                                    kx_groups.insert(idx - grease_offset, to_fake_curves(curve));
                                 }
                             }
                         }
                     }
-                    config.provider = Arc::new(provider);
+                    provider.kx_groups = Cow::Owned(kx_groups);
+                    config.set_provider_for_craft(Arc::new(provider));
                 }
                 ExtensionSpec::Craft(CraftExtension::Protocols(protocols)) => {
-                    if !self.override_alpn {
-                        continue;
+                    if self.override_alpn {
+                        config.alpn_protocols = protocols
+                            .iter()
+                            .map(|protocol| ApplicationProtocol::from(protocol.to_vec()))
+                            .collect();
                     }
-                    config.alpn_protocols = protocols
-                        .iter()
-                        .map(|p| p.to_vec())
-                        .collect();
                 }
-                ExtensionSpec::Craft(CraftExtension::CompressCert(algos)) => {
-                    if !self.override_cert_compress {
-                        continue;
+                ExtensionSpec::Craft(CraftExtension::CompressCert(algorithms)) => {
+                    if self.override_cert_compress {
+                        config.cert_decompressors = compress::default_cert_decompressors()
+                            .iter()
+                            .copied()
+                            .filter(|decompressor| algorithms.contains(&decompressor.algorithm()))
+                            .collect();
                     }
-                    config.certificate_compression_algorithms = algos
-                        .iter()
-                        .map(|algo| match algo {
-                            crate::CertificateCompressionAlgorithm::Zlib => crate::ZLIB_DEFAULT,
-                            crate::CertificateCompressionAlgorithm::Brotli => crate::BROTLI_DEFAULT,
-                            crate::CertificateCompressionAlgorithm::Zstd => crate::ZSTD_DEFAULT,
-                            crate::CertificateCompressionAlgorithm::Unknown(_) => unimplemented!(),
-                        })
-                        .collect();
                 }
-                _ => (),
+                _ => {}
             }
         }
         config.craft = self.build();
@@ -932,25 +883,132 @@ impl FingerprintBuilder {
     }
 }
 
-/// Represents a collection of [`Fingerprint`] instances, each configured with different ALPN extensions.
 pub struct FingerprintSet {
-    /// The default `Fingerprint` variant configured for HTTP/2 (h2) clients.
-    /// This is the primary variant used for most scenarios and is designed to be consistent with browsers.
     pub main: Fingerprint,
-    /// A `Fingerprint` variant specifically tailored for clients that use HTTP/1.1 (http1).
-    /// This variant is useful for testing or scenarios where HTTP/2 support is unavailable.
     pub test_alpn_http1: Fingerprint,
-    /// A `Fingerprint` variant without any specific ALPN settings, suitable for use with both HTTP/1.1 and non-HTTP clients.
-    /// This variant provides a craftible option for testing or supporting clients where ALPN may not be applicable.
     pub test_no_alpn: Fingerprint,
 }
 
 impl core::ops::Deref for FingerprintSet {
     type Target = Fingerprint;
 
-    /// Provides implicit access to the [`FingerprintSet::main`] variant when a [`FingerprintSet`] is dereferenced.
-    /// This allows the `main` variant to be used as the default when no explicit selection is made from the set.
     fn deref(&self) -> &Self::Target {
         &self.main
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct CraftClientExtension {
+    typ: ExtensionType,
+    payload: CraftClientExtensionPayload,
+}
+
+impl Debug for CraftClientExtension {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CraftClientExtension")
+            .field("typ", &self.typ)
+            .field("payload_len", &self.payload_len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CraftClientExtensionPayload {
+    Raw(Vec<u8>),
+    Padding(CraftPadding),
+}
+
+impl CraftClientExtension {
+    fn raw(typ: ExtensionType, payload: Vec<u8>) -> Self {
+        Self {
+            typ,
+            payload: CraftClientExtensionPayload::Raw(payload),
+        }
+    }
+
+    fn encoded<T>(typ: ExtensionType, payload: &T) -> Self
+    where
+        T: Codec<'static>,
+    {
+        let mut bytes = Vec::new();
+        payload.encode(&mut bytes);
+        Self::raw(typ, bytes)
+    }
+
+    fn padding(psk_len: usize) -> Self {
+        Self {
+            typ: ExtensionType::Padding,
+            payload: CraftClientExtensionPayload::Padding(CraftPadding { psk_len }),
+        }
+    }
+
+    pub(crate) fn extension_type(&self) -> ExtensionType {
+        self.typ
+    }
+
+    fn payload_len(&self) -> usize {
+        match &self.payload {
+            CraftClientExtensionPayload::Raw(payload) => payload.len(),
+            CraftClientExtensionPayload::Padding(_) => 0,
+        }
+    }
+}
+
+impl Codec<'_> for CraftClientExtension {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.typ.encode(bytes);
+        let nested = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+        match &self.payload {
+            CraftClientExtensionPayload::Raw(payload) => nested.buf.extend_from_slice(payload),
+            CraftClientExtensionPayload::Padding(padding) => padding.encode(nested.buf),
+        }
+    }
+
+    fn read(_: &mut crate::msgs::Reader<'_>) -> Result<Self, crate::error::InvalidMessage> {
+        Err(crate::error::InvalidMessage::MissingData(
+            "CraftClientExtension",
+        ))
+    }
+}
+
+impl TlsListElement for CraftClientExtension {
+    const SIZE_LEN: ListLength = ListLength::U16;
+}
+
+fn wire_extension_store(
+    extensions: &ClientExtensions<'static>,
+) -> HashMap<ExtensionType, CraftClientExtension> {
+    let mut store = HashMap::new();
+    for typ in extensions.used_extensions_in_encoding_order() {
+        if let Some(ext) = encode_single_extension(extensions, typ) {
+            store.insert(typ, ext);
+        }
+    }
+    store
+}
+
+fn encode_single_extension(
+    extensions: &ClientExtensions<'static>,
+    typ: ExtensionType,
+) -> Option<CraftClientExtension> {
+    let mut one = ClientExtensions::default();
+    one.clone_one(extensions, typ);
+    let mut encoded = Vec::new();
+    one.encode(&mut encoded);
+    if encoded.len() < 6 {
+        return None;
+    }
+
+    let outer_len = u16::from_be_bytes([encoded[0], encoded[1]]) as usize;
+    if outer_len + 2 != encoded.len() {
+        return None;
+    }
+
+    let actual = ExtensionType(u16::from_be_bytes([encoded[2], encoded[3]]));
+    let payload_len = u16::from_be_bytes([encoded[4], encoded[5]]) as usize;
+    if actual != typ || payload_len + 6 != encoded.len() {
+        return None;
+    }
+
+    Some(CraftClientExtension::raw(typ, encoded[6..].to_vec()))
 }

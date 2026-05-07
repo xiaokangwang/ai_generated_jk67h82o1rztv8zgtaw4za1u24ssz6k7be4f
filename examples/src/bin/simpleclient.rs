@@ -1,6 +1,6 @@
 //! This is the simplest possible client using rustls that does something useful:
 //! it accepts the default configuration, loads some root certs, and then connects
-//! to google.com and issues a basic HTTP request.  The response is printed to stdout.
+//! to rust-lang.org and issues a basic HTTP request.  The response is printed to stdout.
 //!
 //! It makes use of rustls::Stream to treat the underlying TLS connection as a basic
 //! bi-directional stream -- the underlying IO is performed transparently.
@@ -8,35 +8,33 @@
 //! Note that `unwrap()` is used to deal with networking errors; this is not something
 //! that is sensible outside of example code.
 
-use std::io::{stdout, Read, Write};
+use std::io::{Read, Write, stdout};
 use std::net::TcpStream;
 use std::sync::Arc;
 
-use rustls::RootCertStore;
+use rustls::{ClientConfig, RootCertStore};
+use rustls_util::{KeyLogFile, Stream};
 
 fn main() {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(
-        webpki_roots::TLS_SERVER_ROOTS
-            .iter()
-            .cloned(),
-    );
-    let mut config = rustls::ClientConfig::builder()
+    let root_store = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
+
+    let mut config = ClientConfig::builder(rustls_aws_lc_rs::DEFAULT_PROVIDER.into())
         .with_root_certificates(root_store)
         .with_no_client_auth()
-        .with_fingerprint(
-            rustls::craft::CHROME_108
-                .test_alpn_http1
-                .builder(),
-        );
+        .unwrap();
 
     // Allow using SSLKEYLOGFILE.
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
+    config.key_log = Arc::new(KeyLogFile::new());
 
     let server_name = "www.rust-lang.org".try_into().unwrap();
-    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+    let mut conn = Arc::new(config)
+        .connect(server_name)
+        .build()
+        .unwrap();
     let mut sock = TcpStream::connect("www.rust-lang.org:443").unwrap();
-    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    let mut tls = Stream::new(&mut conn, &mut sock);
     tls.write_all(
         concat!(
             "GET / HTTP/1.1\r\n",

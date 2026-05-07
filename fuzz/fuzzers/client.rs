@@ -3,24 +3,39 @@
 extern crate libfuzzer_sys;
 extern crate rustls;
 
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use std::io;
 use std::sync::Arc;
 
+use rustls::{ClientConfig, Connection};
+
 fuzz_target!(|data: &[u8]| {
-    let root_store = RootCertStore::empty();
+    let _ = env_logger::try_init();
     let config = Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
+        ClientConfig::builder(rustls_fuzzing_provider::PROVIDER.into())
+            .dangerous()
+            .with_custom_certificate_verifier(rustls_fuzzing_provider::server_verifier())
             .with_no_client_auth()
-            .with_fingerprint(
-                rustls::craft::CHROME_108
-                    .test_alpn_http1
-                    .builder(),
-            ),
+            .unwrap(),
     );
-    let example_com = "example.com".try_into().unwrap();
-    let mut client = ClientConnection::new(config, example_com).unwrap();
-    let _ = client.read_tls(&mut io::Cursor::new(data));
-    let _ = client.process_new_packets();
+    let hostname = "localhost".try_into().unwrap();
+    let mut client = config
+        .connect(hostname)
+        .build()
+        .unwrap();
+
+    let mut stream = io::Cursor::new(data);
+    loop {
+        let rd = client.read_tls(&mut stream);
+        if client.process_new_packets().is_err() {
+            break;
+        }
+
+        if matches!(rd, Ok(0) | Err(_)) {
+            break;
+        }
+
+        // gather and discard written data
+        let mut wr = vec![];
+        client.write_tls(&mut &mut wr).unwrap();
+    }
 });

@@ -10,8 +10,8 @@ use core::fmt::Debug;
 /// You'll likely want some interior mutability in your
 /// implementation to make this useful.
 ///
-/// See [`KeyLogFile`](crate::KeyLogFile) that implements the standard
-/// `SSLKEYLOGFILE` environment variable behaviour.
+/// For the standard `SSLKEYLOGFILE` environment variable behavior,
+/// see the `KeyLogFile` implementation provided in the rustls-util crate.
 pub trait KeyLog: Debug + Send + Sync {
     /// Log the given `secret`.  `client_random` is provided for
     /// session identification.  `label` describes precisely what
@@ -32,7 +32,7 @@ pub trait KeyLog: Debug + Send + Sync {
     ///   in a TLSv1.3 session.
     ///
     /// These strings are selected to match the NSS key log format:
-    /// <https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format>
+    /// <https://nss-crypto.org/reference/security/nss/legacy/key_log_format/index.html>
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]);
 
     /// Indicates whether the secret with label `label` will be logged.
@@ -46,6 +46,7 @@ pub trait KeyLog: Debug + Send + Sync {
 }
 
 /// KeyLog that does exactly nothing.
+#[expect(clippy::exhaustive_structs)]
 #[derive(Debug)]
 pub struct NoKeyLog;
 

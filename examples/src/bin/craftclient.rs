@@ -2,18 +2,17 @@
 
 use rustls::craft::GreaseOr::Grease;
 use rustls::craft::{
-    CraftExtension, ExtensionSpec, Fingerprint, GreaseOrCurve, GreaseOrVersion, KeepExtension,
+    ClientExtension, CraftExtension, ECPointFormat, ExtensionSpec, Fingerprint, GreaseOrCurve,
+    GreaseOrVersion, KeepExtension, PSKKeyExchangeMode,
 };
-use rustls::internal::msgs::enums::{ECPointFormat, ExtensionType, PSKKeyExchangeMode};
-use rustls::internal::msgs::handshake::ClientExtension;
-use rustls::{craft, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme};
-use static_init::dynamic;
-use std::io::{stdout, Read, Write};
+use rustls::{ExtensionType, NamedGroup, ProtocolVersion, RootCertStore, SignatureScheme, craft};
+use rustls_util::Stream;
+use std::io::{Read, Write, stdout};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
-#[dynamic]
-pub static CUSTOM_EXTENSION: Vec<ExtensionSpec> = {
+pub static CUSTOM_EXTENSION: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
     use ExtensionSpec::*;
     use KeepExtension::*;
     vec![
@@ -54,32 +53,32 @@ pub static CUSTOM_EXTENSION: Vec<ExtensionSpec> = {
         ])),
         Craft(CraftExtension::Padding),
     ]
-};
+});
 
-#[dynamic]
-pub static CUSTOM_FINGERPRINT: Fingerprint = Fingerprint {
-    extensions: &CUSTOM_EXTENSION,
-    cipher: &craft::CHROME_CIPHER,
+pub static CUSTOM_FINGERPRINT: LazyLock<Fingerprint> = LazyLock::new(|| Fingerprint {
+    extensions: CUSTOM_EXTENSION.as_slice(),
+    cipher: craft::CHROME_CIPHER.as_slice(),
     shuffle_extensions: false,
-};
+});
 
 fn main() {
-    fn request(fingerprint: &'static Fingerprint) {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(
-            webpki_roots::TLS_SERVER_ROOTS
-                .iter()
-                .cloned(),
-        );
-        let config = rustls::ClientConfig::builder()
+    fn request(fingerprint: &Fingerprint) {
+        let root_store = RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
+        let config = rustls::ClientConfig::builder(rustls_aws_lc_rs::DEFAULT_PROVIDER.into())
             .with_root_certificates(root_store)
             .with_no_client_auth()
+            .unwrap()
             .with_fingerprint(fingerprint.builder());
 
         let server_name = "chat.openai.com".try_into().unwrap();
-        let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+        let mut conn = Arc::new(config)
+            .connect(server_name)
+            .build()
+            .unwrap();
         let mut sock = TcpStream::connect("chat.openai.com:443").unwrap();
-        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+        let mut tls = Stream::new(&mut conn, &mut sock);
         tls.write_all(
             concat!(
                 "GET /auth/login HTTP/1.1\r\n",
@@ -104,6 +103,6 @@ fn main() {
             .unwrap();
     }
 
-    request(&rustls::craft::CHROME_108.test_alpn_http1);
+    request(&craft::CHROME_108.test_alpn_http1);
     request(&CUSTOM_FINGERPRINT);
 }

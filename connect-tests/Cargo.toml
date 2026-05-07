@@ -7,9 +7,12 @@ description = "Rustls connectivity based integration tests."
 publish = false
 
 [dependencies]
-craftls = { path = "../rustls", features = [ "logging" ]}
+rustls = { path = "../rustls", package = "craftls", features = ["log"] }
 
 [dev-dependencies]
-hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "webpki-roots"] }
-regex = "1.0"
-ring = "0.17"
+regex = { workspace = true }
+ring = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

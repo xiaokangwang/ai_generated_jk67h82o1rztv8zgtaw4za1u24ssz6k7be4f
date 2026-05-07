@@ -1,12 +1,12 @@
-use crate::enums::ContentType;
-use crate::enums::ProtocolVersion;
-use crate::msgs::message::{BorrowedPlainMessage, PlainMessage};
 use crate::Error;
+use crate::crypto::cipher::{EncodedMessage, OutboundPlain, Payload};
+use crate::enums::{ContentType, ProtocolVersion};
+
 pub(crate) const MAX_FRAGMENT_LEN: usize = 16384;
 pub(crate) const PACKET_OVERHEAD: usize = 1 + 2 + 2;
 pub(crate) const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_LEN + PACKET_OVERHEAD;
 
-pub struct MessageFragmenter {
+pub(crate) struct MessageFragmenter {
     max_frag: usize,
 }
 
@@ -19,32 +19,38 @@ impl Default for MessageFragmenter {
 }
 
 impl MessageFragmenter {
-    /// Take the Message `msg` and re-fragment it into new
-    /// messages whose fragment is no more than max_frag.
+    /// Take `msg` and fragment it into new messages with the same type and version.
+    ///
+    /// Each returned message size is no more than `max_frag`.
+    ///
     /// Return an iterator across those messages.
-    /// Payloads are borrowed.
-    pub fn fragment_message<'a>(
+    ///
+    /// Payloads are borrowed from `msg`.
+    pub(crate) fn fragment_message<'a>(
         &self,
-        msg: &'a PlainMessage,
-    ) -> impl Iterator<Item = BorrowedPlainMessage<'a>> + 'a {
-        self.fragment_slice(msg.typ, msg.version, &msg.payload.0)
+        msg: &'a EncodedMessage<Payload<'_>>,
+    ) -> impl ExactSizeIterator<Item = EncodedMessage<OutboundPlain<'a>>> + 'a {
+        self.fragment_payload(msg.typ, msg.version, msg.payload.bytes().into())
     }
 
-    /// Enqueue borrowed fragments of (version, typ, payload) which
-    /// are no longer than max_frag onto the `out` deque.
-    pub(crate) fn fragment_slice<'a>(
+    /// Take `payload` and fragment it into new messages with given type and version.
+    ///
+    /// Each returned message size is no more than `max_frag`.
+    ///
+    /// Return an iterator across those messages.
+    ///
+    /// Payloads are borrowed from `payload`.
+    pub(crate) fn fragment_payload<'a>(
         &self,
         typ: ContentType,
         version: ProtocolVersion,
-        payload: &'a [u8],
-    ) -> impl Iterator<Item = BorrowedPlainMessage<'a>> + 'a {
-        payload
-            .chunks(self.max_frag)
-            .map(move |c| BorrowedPlainMessage {
-                typ,
-                version,
-                payload: c,
-            })
+        payload: OutboundPlain<'a>,
+    ) -> impl ExactSizeIterator<Item = EncodedMessage<OutboundPlain<'a>>> {
+        Chunker::new(payload, self.max_frag).map(move |payload| EncodedMessage {
+            typ,
+            version,
+            payload,
+        })
     }
 
     /// Set the maximum fragment size that will be produced.
@@ -55,7 +61,10 @@ impl MessageFragmenter {
     /// A `max_fragment_size` of `None` sets the highest allowable fragment size.
     ///
     /// Returns BadMaxFragmentSize if the size is smaller than 32 or larger than 16389.
-    pub fn set_max_fragment_size(&mut self, max_fragment_size: Option<usize>) -> Result<(), Error> {
+    pub(crate) fn set_max_fragment_size(
+        &mut self,
+        max_fragment_size: Option<usize>,
+    ) -> Result<(), Error> {
         self.max_frag = match max_fragment_size {
             Some(sz @ 32..=MAX_FRAGMENT_SIZE) => sz - PACKET_OVERHEAD,
             None => MAX_FRAGMENT_LEN,
@@ -65,16 +74,49 @@ impl MessageFragmenter {
     }
 }
 
+/// An iterator over borrowed fragments of a payload
+struct Chunker<'a> {
+    payload: OutboundPlain<'a>,
+    limit: usize,
+}
+
+impl<'a> Chunker<'a> {
+    fn new(payload: OutboundPlain<'a>, limit: usize) -> Self {
+        Self { payload, limit }
+    }
+}
+
+impl<'a> Iterator for Chunker<'a> {
+    type Item = OutboundPlain<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.payload.is_empty() {
+            return None;
+        }
+
+        let (before, after) = self.payload.split_at(self.limit);
+        self.payload = after;
+        Some(before)
+    }
+}
+
+impl ExactSizeIterator for Chunker<'_> {
+    fn len(&self) -> usize {
+        self.payload.len().div_ceil(self.limit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+    use std::vec;
+
     use super::{MessageFragmenter, PACKET_OVERHEAD};
-    use crate::enums::ContentType;
-    use crate::enums::ProtocolVersion;
-    use crate::msgs::base::Payload;
-    use crate::msgs::message::{BorrowedPlainMessage, PlainMessage};
+    use crate::crypto::cipher::{EncodedMessage, OutboundPlain, Payload};
+    use crate::enums::{ContentType, ProtocolVersion};
 
     fn msg_eq(
-        m: &BorrowedPlainMessage,
+        m: &EncodedMessage<OutboundPlain<'_>>,
         total_len: usize,
         typ: &ContentType,
         version: &ProtocolVersion,
@@ -82,7 +124,7 @@ mod tests {
     ) {
         assert_eq!(&m.typ, typ);
         assert_eq!(&m.version, version);
-        assert_eq!(m.payload, bytes);
+        assert_eq!(m.payload.to_vec(), bytes);
 
         let buf = m.to_unencrypted_opaque().encode();
 
@@ -94,7 +136,7 @@ mod tests {
         let typ = ContentType::Handshake;
         let version = ProtocolVersion::TLSv1_2;
         let data: Vec<u8> = (1..70u8).collect();
-        let m = PlainMessage {
+        let m = EncodedMessage {
             typ,
             version,
             payload: Payload::new(data),
@@ -138,7 +180,7 @@ mod tests {
 
     #[test]
     fn non_fragment() {
-        let m = PlainMessage {
+        let m = EncodedMessage {
             typ: ContentType::Handshake,
             version: ProtocolVersion::TLSv1_2,
             payload: Payload::new(b"\x01\x02\x03\x04\x05\x06\x07\x08".to_vec()),
@@ -158,5 +200,36 @@ mod tests {
             &ProtocolVersion::TLSv1_2,
             b"\x01\x02\x03\x04\x05\x06\x07\x08",
         );
+    }
+
+    #[test]
+    fn fragment_multiple_slices() {
+        let typ = ContentType::Handshake;
+        let version = ProtocolVersion::TLSv1_2;
+        let payload_owner: Vec<&[u8]> = vec![&[b'a'; 8], &[b'b'; 12], &[b'c'; 32], &[b'd'; 20]];
+        let borrowed_payload = OutboundPlain::new(&payload_owner);
+        let mut frag = MessageFragmenter::default();
+        frag.set_max_fragment_size(Some(37)) // 32 + packet overhead
+            .unwrap();
+
+        let fragments = frag
+            .fragment_payload(typ, version, borrowed_payload)
+            .collect::<Vec<_>>();
+        assert_eq!(fragments.len(), 3);
+        msg_eq(
+            &fragments[0],
+            37,
+            &typ,
+            &version,
+            b"aaaaaaaabbbbbbbbbbbbcccccccccccc",
+        );
+        msg_eq(
+            &fragments[1],
+            37,
+            &typ,
+            &version,
+            b"ccccccccccccccccccccdddddddddddd",
+        );
+        msg_eq(&fragments[2], 13, &typ, &version, b"dddddddd");
     }
 }

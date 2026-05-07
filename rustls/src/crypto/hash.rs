@@ -1,6 +1,8 @@
-pub use crate::msgs::enums::HashAlgorithm;
-
 use alloc::boxed::Box;
+
+use pki_types::FipsStatus;
+
+use super::enums::HashAlgorithm;
 
 /// Describes a single cryptographic hash function.
 ///
@@ -18,6 +20,11 @@ pub trait Hash: Send + Sync {
 
     /// Which hash function this is, eg, `HashAlgorithm::SHA256`.
     fn algorithm(&self) -> HashAlgorithm;
+
+    /// Return the FIPS validation status of this implementation.
+    fn fips(&self) -> FipsStatus {
+        FipsStatus::Unvalidated
+    }
 }
 
 /// A hash output, stored as a value.

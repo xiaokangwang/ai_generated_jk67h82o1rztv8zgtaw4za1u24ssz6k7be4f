@@ -4,36 +4,27 @@
 //!
 //! For a more complete server demonstration, see `tlsserver-mio.rs`.
 
+use core::ops::Add;
+use core::time::Duration;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::ops::Add;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{fs, thread};
 
-use docopt::Docopt;
-use pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use serde_derive::Deserialize;
-
-use rustls::server::{Acceptor, ClientHello, ServerConfig, WebPkiClientVerifier};
+use clap::Parser;
+use rcgen::{Issuer, KeyPair, SerialNumber};
 use rustls::RootCertStore;
+use rustls::crypto::{CryptoProvider, Identity};
+use rustls::pki_types::{CertificateRevocationListDer, PrivatePkcs8KeyDer};
+use rustls::server::{Acceptor, ClientHello, ServerConfig, WebPkiClientVerifier};
+use rustls_aws_lc_rs::DEFAULT_PROVIDER;
+use rustls_util::{KeyLogFile, complete_io};
 
 fn main() {
-    let version = concat!(
-        env!("CARGO_PKG_NAME"),
-        ", version: ",
-        env!("CARGO_PKG_VERSION")
-    )
-    .to_string();
+    let args = Args::parse();
 
-    let args: Args = Docopt::new(USAGE)
-        .map(|d| d.help(true))
-        .map(|d| d.version(Some(version)))
-        .and_then(|d| d.deserialize())
-        .unwrap_or_else(|e| e.exit());
-
-    if args.flag_verbose {
+    if args.verbose {
         env_logger::Builder::new()
             .parse_filters("trace")
             .init();
@@ -53,43 +44,21 @@ fn main() {
     // Write out the parts of the test PKI a client will need to connect:
     // * The CA certificate for validating the server certificate.
     // * The client certificate and key for its presented mTLS identity.
+    write_pem(&args.ca_path, &test_pki.ca_cert.1.pem());
+    write_pem(&args.client_cert_path, &test_pki.client_cert.0.cert.pem());
     write_pem(
-        &args
-            .flag_ca_path
-            .unwrap_or("ca-cert.pem".to_string()),
-        &test_pki
-            .ca_cert
-            .serialize_pem()
-            .unwrap(),
-    );
-    write_pem(
-        &args
-            .flag_client_cert_path
-            .unwrap_or("client-cert.pem".to_string()),
+        &args.client_key_path,
         &test_pki
             .client_cert
-            .serialize_pem_with_signer(&test_pki.ca_cert)
-            .unwrap(),
-    );
-    write_pem(
-        &args
-            .flag_client_key_path
-            .unwrap_or("client-key.pem".to_string()),
-        &test_pki
-            .client_cert
-            .serialize_private_key_pem(),
+            .0
+            .signing_key
+            .serialize_pem(),
     );
 
     // Write out an initial DER CRL that has no revoked certificates.
-    let update_seconds = args
-        .flag_crl_update_seconds
-        .unwrap_or(5);
-    let crl_path = args
-        .flag_crl_path
-        .unwrap_or("crl.der".to_string());
-    let mut crl_der = File::create(crl_path.clone()).unwrap();
+    let mut crl_der = File::create(args.crl_path.clone()).unwrap();
     crl_der
-        .write_all(&test_pki.crl(Vec::default(), update_seconds))
+        .write_all(&test_pki.crl(Vec::default(), args.crl_update_seconds))
         .unwrap();
 
     // Spawn a thread that will periodically update the CRL. In a real server you would
@@ -98,15 +67,14 @@ fn main() {
     // For this demo we spawn a thread that flips between writing a CRL that lists the client
     // certificate as revoked and a CRL that has no revoked certificates.
     let crl_updater = CrlUpdater {
-        sleep_duration: Duration::from_secs(update_seconds),
-        crl_path: PathBuf::from(crl_path.clone()),
+        sleep_duration: Duration::from_secs(args.crl_update_seconds),
+        crl_path: PathBuf::from(args.crl_path.clone()),
         pki: test_pki.clone(),
     };
     thread::spawn(move || crl_updater.run());
 
     // Start a TLS server accepting connections as they arrive.
-    let listener =
-        std::net::TcpListener::bind(format!("[::]:{}", args.flag_port.unwrap_or(4443))).unwrap();
+    let listener = std::net::TcpListener::bind(format!("[::]:{}", args.port)).unwrap();
     for stream in listener.incoming() {
         let mut stream = stream.unwrap();
         let mut acceptor = Acceptor::default();
@@ -115,31 +83,41 @@ fn main() {
         // connection.
         let accepted = loop {
             acceptor.read_tls(&mut stream).unwrap();
-            if let Some(accepted) = acceptor.accept().unwrap() {
-                break accepted;
+
+            match acceptor.accept() {
+                Ok(Some(accepted)) => break accepted,
+                Ok(None) => continue,
+                Err((e, mut alert)) => {
+                    alert.write_all(&mut stream).unwrap();
+                    panic!("error accepting connection: {e}");
+                }
             }
         };
 
         // Generate a server config for the accepted connection, optionally customizing the
         // configuration based on the client hello.
-        let config = test_pki.server_config(&crl_path, accepted.client_hello());
-        let mut conn = accepted
-            .into_connection(config)
-            .unwrap();
+        let config = test_pki.server_config(&args.crl_path, accepted.client_hello());
+        let mut conn = match accepted.into_connection(config) {
+            Ok(conn) => conn,
+            Err((e, mut alert)) => {
+                alert.write_all(&mut stream).unwrap();
+                panic!("error completing accepting connection: {e}");
+            }
+        };
 
         // Proceed with handling the ServerConnection
         // Important: We do no error handling here, but you should!
-        _ = conn.complete_io(&mut stream);
+        _ = complete_io(&mut stream, &mut conn);
     }
 }
 
 /// A test PKI with a CA certificate, server certificate, and client certificate.
 struct TestPki {
+    provider: Arc<CryptoProvider>,
     roots: Arc<RootCertStore>,
-    ca_cert: rcgen::Certificate,
-    client_cert: rcgen::Certificate,
-    server_cert_der: CertificateDer<'static>,
-    server_key_der: PrivateKeyDer<'static>,
+    ca_cert: (Issuer<'static, KeyPair>, rcgen::Certificate),
+    client_cert: (rcgen::CertifiedKey<KeyPair>, SerialNumber),
+    server_cert: rcgen::CertifiedKey<KeyPair>,
 }
 
 impl TestPki {
@@ -147,7 +125,7 @@ impl TestPki {
     fn new() -> Self {
         // Create an issuer CA cert.
         let alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-        let mut ca_params = rcgen::CertificateParams::new(Vec::new());
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         ca_params
             .distinguished_name
             .push(rcgen::DnType::OrganizationName, "Rustls Server Acceptor");
@@ -160,44 +138,54 @@ impl TestPki {
             rcgen::KeyUsagePurpose::DigitalSignature,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        ca_params.alg = alg;
-        let ca_cert = rcgen::Certificate::from_params(ca_params).unwrap();
+        let ca_key = KeyPair::generate_for(alg).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca = Issuer::new(ca_params, ca_key);
 
         // Create a server end entity cert issued by the CA.
-        let mut server_ee_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+        let mut server_ee_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         server_ee_params.is_ca = rcgen::IsCa::NoCa;
         server_ee_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-        server_ee_params.alg = alg;
-        let server_cert = rcgen::Certificate::from_params(server_ee_params).unwrap();
-        let server_cert_der = CertificateDer::from(
-            server_cert
-                .serialize_der_with_signer(&ca_cert)
-                .unwrap(),
-        );
-        let server_key_der = PrivatePkcs8KeyDer::from(server_cert.serialize_private_key_der());
+        let ee_key = KeyPair::generate_for(alg).unwrap();
+        let server_cert = server_ee_params
+            .signed_by(&ee_key, &ca)
+            .unwrap();
 
         // Create a client end entity cert issued by the CA.
-        let mut client_ee_params = rcgen::CertificateParams::new(Vec::new());
+        let mut client_ee_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         client_ee_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Example Client");
         client_ee_params.is_ca = rcgen::IsCa::NoCa;
         client_ee_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        client_ee_params.alg = alg;
-        client_ee_params.serial_number = Some(rcgen::SerialNumber::from(vec![0xC0, 0xFF, 0xEE]));
-        let client_cert = rcgen::Certificate::from_params(client_ee_params).unwrap();
+        let client_serial = SerialNumber::from(vec![0xC0, 0xFF, 0xEE]);
+        client_ee_params.serial_number = Some(client_serial);
+        let client_key = KeyPair::generate_for(alg).unwrap();
+        let client_cert = client_ee_params
+            .signed_by(&client_key, &ca)
+            .unwrap();
 
         // Create a root cert store that includes the CA certificate.
         let mut roots = RootCertStore::empty();
         roots
-            .add(CertificateDer::from(ca_cert.serialize_der().unwrap()))
+            .add(ca_cert.der().clone())
             .unwrap();
         Self {
+            provider: Arc::new(DEFAULT_PROVIDER),
             roots: roots.into(),
-            ca_cert,
-            client_cert,
-            server_cert_der,
-            server_key_der: server_key_der.into(),
+            ca_cert: (ca, ca_cert),
+            client_cert: (
+                rcgen::CertifiedKey {
+                    cert: client_cert,
+                    signing_key: client_key,
+                },
+                client_ee_params.serial_number.unwrap(),
+            ),
+            server_cert: rcgen::CertifiedKey {
+                cert: server_cert,
+                signing_key: ee_key,
+            },
         }
     }
 
@@ -208,7 +196,7 @@ impl TestPki {
     ///
     /// Since the presented client certificate is not available in the `ClientHello` the server
     /// must know ahead of time which CRLs it cares about.
-    fn server_config(&self, crl_path: &str, _hello: ClientHello) -> Arc<ServerConfig> {
+    fn server_config(&self, crl_path: &str, _hello: ClientHello<'_>) -> Arc<ServerConfig> {
         // Read the latest CRL from disk. The CRL is being periodically updated by the crl_updater
         // thread.
         let mut crl_file = File::open(crl_path).unwrap();
@@ -216,36 +204,44 @@ impl TestPki {
         crl_file.read_to_end(&mut crl).unwrap();
 
         // Construct a fresh verifier using the test PKI roots, and the updated CRL.
-        let verifier = WebPkiClientVerifier::builder(self.roots.clone())
-            .with_crls([CertificateRevocationListDer::from(crl)])
-            .build()
-            .unwrap();
+        let verifier = Arc::new(
+            WebPkiClientVerifier::builder(self.roots.clone(), &self.provider)
+                .with_crls([CertificateRevocationListDer::from(crl)])
+                .build()
+                .unwrap(),
+        );
 
         // Build a server config using the fresh verifier. If necessary, this could be customized
         // based on the ClientHello (e.g. selecting a different certificate, or customizing
         // supported algorithms/protocol versions).
-        let mut server_config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder(self.provider.clone())
             .with_client_cert_verifier(verifier)
             .with_single_cert(
-                vec![self.server_cert_der.clone()],
+                Arc::from(
+                    Identity::from_cert_chain(vec![self.server_cert.cert.der().clone()]).unwrap(),
+                ),
                 PrivatePkcs8KeyDer::from(
-                    self.server_key_der
-                        .secret_der()
-                        .to_owned(),
+                    self.server_cert
+                        .signing_key
+                        .serialize_der(),
                 )
                 .into(),
             )
             .unwrap();
 
         // Allow using SSLKEYLOGFILE.
-        server_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        server_config.key_log = Arc::new(KeyLogFile::new());
 
         Arc::new(server_config)
     }
 
     /// Issue a certificate revocation list (CRL) for the revoked `serials` provided (may be empty).
     /// The CRL will be signed by the test PKI CA and returned in DER serialized form.
-    fn crl(&self, serials: Vec<rcgen::SerialNumber>, next_update_seconds: u64) -> Vec<u8> {
+    fn crl(
+        &self,
+        serials: Vec<SerialNumber>,
+        next_update_seconds: u64,
+    ) -> CertificateRevocationListDer<'static> {
         // In a real use-case you would want to set this to the current date/time.
         let now = rcgen::date_time_ymd(2023, 1, 1);
 
@@ -261,19 +257,18 @@ impl TestPki {
             .collect();
 
         // Create a new CRL signed by the CA cert.
-        let crl = rcgen::CertificateRevocationListParams {
+        let crl_params = rcgen::CertificateRevocationListParams {
             this_update: now,
             next_update: now.add(Duration::from_secs(next_update_seconds)),
-            crl_number: rcgen::SerialNumber::from(1234),
+            crl_number: SerialNumber::from(1234),
             issuing_distribution_point: None,
             revoked_certs,
             key_identifier_method: rcgen::KeyIdMethod::Sha256,
-            alg: &rcgen::PKCS_ECDSA_P256_SHA256,
         };
-        rcgen::CertificateRevocationList::from_params(crl)
+        crl_params
+            .signed_by(&self.ca_cert.0)
             .unwrap()
-            .serialize_der_with_signer(&self.ca_cert)
-            .unwrap()
+            .into()
     }
 }
 
@@ -297,13 +292,7 @@ impl CrlUpdater {
             thread::sleep(self.sleep_duration);
 
             let revoked_certs = if revoked {
-                vec![self
-                    .pki
-                    .client_cert
-                    .get_params()
-                    .serial_number
-                    .clone()
-                    .unwrap()]
+                vec![self.pki.client_cert.1.clone()]
             } else {
                 Vec::default()
             };
@@ -328,33 +317,41 @@ impl CrlUpdater {
     }
 }
 
-const USAGE: &str = "
-Runs a TLS server on :PORT.  The default PORT is 4443.
-
-Usage:
-  server_acceptor [options]
-  server_acceptor  (--version | -v)
-  server_acceptor  (--help | -h)
-
-Options:
-    -p, --port PORT                 Listen on PORT [default: 4443].
-    --verbose                       Emit log output.
-    --crl-update-seconds SECONDS    Update the CRL after SECONDS [default: 5].
-    --ca-path PATH                  Write the CA cert PEM to PATH [default: ca-cert.pem].
-    --client-cert-path PATH         Write the client cert PEM to PATH [default: client-cert.pem].
-    --client-key-path PATH          Write the client key PEM to PATH [default: client-key.pem].
-    --crl-path PATH                 Write the DER CRL content to PATH [default: crl.der].
-    --version, -v                   Show tool version.
-    --help, -h                      Show this screen.
-";
-
-#[derive(Debug, Deserialize)]
+/// Runs a TLS server on :PORT.  The default PORT is 4443.
+///
+/// This example generates its own keys, certificates, and revocation
+/// lists.  These are written into the current working directory.
+/// Periodically the revocation lists are updated to flip between
+/// the client identity being included or excluded in the revocation
+/// list.
+#[derive(Debug, Parser)]
+#[clap(version)]
 struct Args {
-    flag_port: Option<u16>,
-    flag_verbose: bool,
-    flag_crl_update_seconds: Option<u64>,
-    flag_ca_path: Option<String>,
-    flag_client_cert_path: Option<String>,
-    flag_client_key_path: Option<String>,
-    flag_crl_path: Option<String>,
+    /// Listen on this port
+    #[clap(long, default_value = "4443")]
+    port: u16,
+
+    /// Emit log output
+    #[clap(long)]
+    verbose: bool,
+
+    /// Update the CRL after this many seconds
+    #[clap(long, default_value = "5")]
+    crl_update_seconds: u64,
+
+    /// Write the CA cert PEM to this path
+    #[clap(long, default_value = "ca-cert.pem")]
+    ca_path: String,
+
+    /// Write the client cert PEM to this path
+    #[clap(long, default_value = "client-cert.pem")]
+    client_cert_path: String,
+
+    /// Write the client key PEM to this path
+    #[clap(long, default_value = "client-key.pem")]
+    client_key_path: String,
+
+    /// Write the DER CRL content to this path
+    #[clap(long, default_value = "crl.der")]
+    crl_path: String,
 }

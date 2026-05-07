@@ -1,15 +1,41 @@
-use std::io::{self, BufReader, Read, Write};
+//! This is an example client that uses rustls for TLS, and [mio] for I/O.
+//!
+//! It uses command line flags to demonstrate configuring a TLS client that may:
+//!  * Specify supported TLS protocol versions
+//!  * Customize cipher suite selection
+//!  * Perform client certificate authentication
+//!  * Disable session tickets
+//!  * Disable SNI
+//!  * Disable certificate validation (insecure)
+//!
+//! See `--help` output for more details.
+//!
+//! You may set the `SSLKEYLOGFILE` env var when using this example to write a
+//! log file with key material (insecure) for debugging purposes. See [`rustls::KeyLog`]
+//! for more information.
+//!
+//! Note that `unwrap()` is used to deal with networking errors; this is not something
+//! that is sensible outside of example code.
+//!
+//! [mio]: https://docs.rs/mio/latest/mio/
+
+use std::borrow::Cow;
+use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::{fs, process, str};
+use std::{process, str};
 
-use docopt::Docopt;
+use clap::Parser;
 use mio::net::TcpStream;
-use pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use serde::Deserialize;
-
-use rustls::crypto::CryptoProvider;
-use rustls::RootCertStore;
+use rustls::client::Tls12Resumption;
+use rustls::crypto::kx::SupportedKxGroup;
+use rustls::crypto::{CryptoProvider, Identity};
+use rustls::enums::{ApplicationProtocol, ProtocolVersion};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore};
+use rustls_aws_lc_rs as provider;
+use rustls_util::KeyLogFile;
 
 const CLIENT: mio::Token = mio::Token(0);
 
@@ -19,20 +45,19 @@ struct TlsClient {
     socket: TcpStream,
     closing: bool,
     clean_closure: bool,
-    tls_conn: rustls::ClientConnection,
+    tls_conn: ClientConnection,
 }
 
 impl TlsClient {
-    fn new(
-        sock: TcpStream,
-        server_name: ServerName<'static>,
-        cfg: Arc<rustls::ClientConfig>,
-    ) -> Self {
+    fn new(sock: TcpStream, server_name: ServerName<'static>, cfg: Arc<ClientConfig>) -> Self {
         Self {
             socket: sock,
             closing: false,
             clean_closure: false,
-            tls_conn: rustls::ClientConnection::new(cfg, server_name).unwrap(),
+            tls_conn: cfg
+                .connect(server_name)
+                .build()
+                .unwrap(),
         }
     }
 
@@ -54,7 +79,7 @@ impl TlsClient {
         }
     }
 
-    fn read_source_to_end(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
+    fn read_source_to_end(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
         let mut buf = Vec::new();
         let len = rd.read_to_end(&mut buf)?;
         self.tls_conn
@@ -73,7 +98,7 @@ impl TlsClient {
                 if error.kind() == io::ErrorKind::WouldBlock {
                     return;
                 }
-                println!("TLS read error: {:?}", error);
+                println!("TLS read error: {error:?}");
                 self.closing = true;
                 return;
             }
@@ -95,7 +120,7 @@ impl TlsClient {
         let io_state = match self.tls_conn.process_new_packets() {
             Ok(io_state) => io_state,
             Err(err) => {
-                println!("TLS error: {:?}", err);
+                println!("TLS error: {err}");
                 self.closing = true;
                 return;
             }
@@ -165,7 +190,7 @@ impl TlsClient {
         self.closing
     }
 }
-impl io::Write for TlsClient {
+impl Write for TlsClient {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.tls_conn.writer().write(bytes)
     }
@@ -175,209 +200,278 @@ impl io::Write for TlsClient {
     }
 }
 
-impl io::Read for TlsClient {
+impl Read for TlsClient {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.tls_conn.reader().read(bytes)
     }
 }
 
-const USAGE: &str = "
-Connects to the TLS server at hostname:PORT.  The default PORT
-is 443.  By default, this reads a request from stdin (to EOF)
-before making the connection.  --http replaces this with a
-basic HTTP GET request for /.
-
-If --cafile is not supplied, a built-in set of CA certificates
-are used from the webpki-roots crate.
-
-Usage:
-  tlsclient-mio [options] [--suite SUITE ...] [--proto PROTO ...] [--protover PROTOVER ...] <hostname>
-  tlsclient-mio (--version | -v)
-  tlsclient-mio (--help | -h)
-
-Options:
-    -p, --port PORT     Connect to PORT [default: 443].
-    --http              Send a basic HTTP GET request for /.
-    --cafile CAFILE     Read root certificates from CAFILE.
-    --auth-key KEY      Read client authentication key from KEY.
-    --auth-certs CERTS  Read client authentication certificates from CERTS.
-                        CERTS must match up with KEY.
-    --protover VERSION  Disable default TLS version list, and use
-                        VERSION instead.  May be used multiple times.
-    --suite SUITE       Disable default cipher suite list, and use
-                        SUITE instead.  May be used multiple times.
-    --proto PROTOCOL    Send ALPN extension containing PROTOCOL.
-                        May be used multiple times to offer several protocols.
-    --no-tickets        Disable session ticket support.
-    --no-sni            Disable server name indication support.
-    --insecure          Disable certificate verification.
-    --verbose           Emit log output.
-    --max-frag-size M   Limit outgoing messages to M bytes.
-    --version, -v       Show tool version.
-    --help, -h          Show this screen.
-";
-
-#[derive(Debug, Deserialize)]
+/// Connects to the TLS server at hostname:PORT.  The default PORT
+/// is 443.  By default, this reads a request from stdin (to EOF)
+/// before making the connection.  --http replaces this with a
+/// basic HTTP GET request for /.
+///
+/// If --cafile is not supplied, a built-in set of CA certificates
+/// are used from the webpki-roots crate.
+#[derive(Debug, Parser)]
 struct Args {
-    flag_port: Option<u16>,
-    flag_http: bool,
-    flag_verbose: bool,
-    flag_protover: Vec<String>,
-    flag_suite: Vec<String>,
-    flag_proto: Vec<String>,
-    flag_max_frag_size: Option<usize>,
-    flag_cafile: Option<String>,
-    flag_no_tickets: bool,
-    flag_no_sni: bool,
-    flag_insecure: bool,
-    flag_auth_key: Option<String>,
-    flag_auth_certs: Option<String>,
-    arg_hostname: String,
+    /// Connect to this port
+    #[clap(long, default_value = "443")]
+    port: u16,
+
+    /// Send a basic HTTP GET request for /
+    #[clap(long)]
+    http: bool,
+
+    /// Emit log output
+    #[clap(long)]
+    verbose: bool,
+
+    /// Disable default TLS version list, and use
+    /// VERSION instead.  May be used multiple times.
+    #[clap(long)]
+    protover: Vec<String>,
+
+    /// Disable default cipher suite list, and use
+    /// SUITE instead.  May be used multiple times.
+    #[clap(long)]
+    suite: Vec<String>,
+
+    /// Disable default key exchange list, and use KX instead. Maybe be used multiple times.
+    #[clap(long)]
+    key_exchange: Vec<String>,
+
+    /// Send ALPN extension containing PROTOCOL.
+    /// May be used multiple times to offer several protocols.
+    #[clap(long)]
+    proto: Vec<String>,
+
+    /// Limit outgoing messages to this many bytes
+    #[clap(long)]
+    max_frag_size: Option<usize>,
+
+    /// Read root certificates from this file
+    #[clap(long)]
+    cafile: Option<String>,
+
+    /// Disable session ticket support
+    #[clap(long)]
+    no_tickets: bool,
+
+    /// Disable server name indication support
+    #[clap(long)]
+    no_sni: bool,
+
+    /// Disable certificate verification
+    #[clap(long)]
+    insecure: bool,
+
+    /// Read client authentication key from KEY.
+    #[clap(long)]
+    auth_key: Option<String>,
+
+    /// Read client authentication certificates from CERTS.
+    /// CERTS must match up with KEY.
+    #[clap(long)]
+    auth_certs: Option<String>,
+
+    /// Which hostname/address to connect to
+    hostname: String,
 }
 
-/// Find a ciphersuite with the given name
-fn find_suite(name: &str) -> Option<rustls::SupportedCipherSuite> {
-    for suite in rustls::crypto::ring::ALL_CIPHER_SUITES {
-        let sname = format!("{:?}", suite.suite()).to_lowercase();
+impl Args {
+    fn provider(&self) -> CryptoProvider {
+        let kx_groups = match self.key_exchange.as_slice() {
+            [] => Cow::Borrowed(provider::DEFAULT_KX_GROUPS),
+            items => Cow::Owned(
+                items
+                    .iter()
+                    .map(|kx| find_key_exchange(kx))
+                    .collect::<Vec<&'static dyn SupportedKxGroup>>(),
+            ),
+        };
 
-        if sname == name.to_string().to_lowercase() {
-            return Some(*suite);
+        let provider = match lookup_versions(&self.protover).as_slice() {
+            [ProtocolVersion::TLSv1_2] => provider::DEFAULT_TLS12_PROVIDER,
+            [ProtocolVersion::TLSv1_3] => provider::DEFAULT_TLS13_PROVIDER,
+            _ => provider::DEFAULT_PROVIDER,
+        };
+
+        let provider = CryptoProvider {
+            kx_groups,
+            ..provider
+        };
+
+        match self.suite.as_slice() {
+            [] => provider,
+            _ => filter_suites(provider, &self.suite),
+        }
+    }
+}
+
+/// Find a key exchange with the given name
+fn find_key_exchange(name: &str) -> &'static dyn SupportedKxGroup {
+    for kx_group in provider::ALL_KX_GROUPS {
+        let kx_name = format!("{:?}", kx_group.name()).to_lowercase();
+
+        if kx_name == name.to_string().to_lowercase() {
+            return *kx_group;
         }
     }
 
-    None
+    panic!("cannot find key exchange with name '{name}'");
 }
 
-/// Make a vector of ciphersuites named in `suites`
-fn lookup_suites(suites: &[String]) -> Vec<rustls::SupportedCipherSuite> {
-    let mut out = Vec::new();
+/// Alter `provider` to reduce the set of ciphersuites to just `suites`
+fn filter_suites(mut provider: CryptoProvider, suites: &[String]) -> CryptoProvider {
+    // first, check `suites` all name known suites, and will have some effect
+    let known_suites = provider
+        .tls12_cipher_suites
+        .iter()
+        .map(|cs| cs.common.suite)
+        .chain(
+            provider
+                .tls13_cipher_suites
+                .iter()
+                .map(|cs| cs.common.suite),
+        )
+        .map(|cs| format!("{:?}", cs).to_lowercase())
+        .collect::<Vec<String>>();
 
-    for csname in suites {
-        let scs = find_suite(csname);
-        match scs {
-            Some(s) => out.push(s),
-            None => panic!("cannot look up ciphersuite '{}'", csname),
+    for s in suites {
+        if !known_suites.contains(&s.to_lowercase()) {
+            panic!(
+                "unsupported ciphersuite '{s}'; should be one of {known_suites}",
+                known_suites = known_suites.join(", ")
+            );
         }
     }
 
-    out
+    // now discard non-named suites
+    provider
+        .tls12_cipher_suites
+        .to_mut()
+        .retain(|cs| {
+            let name = format!("{:?}", cs.common.suite).to_lowercase();
+            suites
+                .iter()
+                .any(|s| s.to_lowercase() == name)
+        });
+    provider
+        .tls13_cipher_suites
+        .to_mut()
+        .retain(|cs| {
+            let name = format!("{:?}", cs.common.suite).to_lowercase();
+            suites
+                .iter()
+                .any(|s| s.to_lowercase() == name)
+        });
+
+    provider
 }
 
 /// Make a vector of protocol versions named in `versions`
-fn lookup_versions(versions: &[String]) -> Vec<&'static rustls::SupportedProtocolVersion> {
+fn lookup_versions(versions: &[String]) -> Vec<ProtocolVersion> {
     let mut out = Vec::new();
 
     for vname in versions {
         let version = match vname.as_ref() {
-            "1.2" => &rustls::version::TLS12,
-            "1.3" => &rustls::version::TLS13,
-            _ => panic!(
-                "cannot look up version '{}', valid are '1.2' and '1.3'",
-                vname
-            ),
+            "1.2" => ProtocolVersion::TLSv1_2,
+            "1.3" => ProtocolVersion::TLSv1_3,
+            _ => panic!("cannot look up version '{vname}', valid are '1.2' and '1.3'"),
         };
-        out.push(version);
+        if !out.contains(&version) {
+            out.push(version);
+        }
     }
 
     out
 }
 
 fn load_certs(filename: &str) -> Vec<CertificateDer<'static>> {
-    let certfile = fs::File::open(filename).expect("cannot open certificate file");
-    let mut reader = BufReader::new(certfile);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_file_iter(filename)
+        .expect("cannot open certificate file")
         .map(|result| result.unwrap())
         .collect()
 }
 
 fn load_private_key(filename: &str) -> PrivateKeyDer<'static> {
-    let keyfile = fs::File::open(filename).expect("cannot open private key file");
-    let mut reader = BufReader::new(keyfile);
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return key.into(),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return key.into(),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return key.into(),
-            None => break,
-            _ => {}
-        }
-    }
-
-    panic!(
-        "no keys found in {:?} (encrypted keys not supported)",
-        filename
-    );
+    PrivateKeyDer::from_pem_file(filename).expect("cannot read private key file")
 }
 
 mod danger {
-    use pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::client::danger::HandshakeSignatureValid;
-    use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
-    use rustls::DigitallySignedStruct;
+    use core::hash::Hasher;
+    use std::sync::Arc;
+
+    use rustls::client::danger::{
+        HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
+        SignatureVerificationInput,
+    };
+    use rustls::crypto::{
+        CryptoProvider, SignatureScheme, verify_tls12_signature, verify_tls13_signature,
+    };
+    use rustls::enums::CertificateType;
+    use rustls::{DistinguishedName, Error};
 
     #[derive(Debug)]
-    pub struct NoCertificateVerification {}
+    pub(super) struct NoCertificateVerification(CryptoProvider);
 
-    impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp: &[u8],
-            _now: UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
+    impl NoCertificateVerification {
+        pub(super) fn new(provider: CryptoProvider) -> Self {
+            Self(provider)
+        }
+    }
+
+    impl ServerVerifier for NoCertificateVerification {
+        fn verify_identity(&self, _identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
+            Ok(PeerVerified::assertion())
         }
 
         fn verify_tls12_signature(
             &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls12_signature(
-                message,
-                cert,
-                dss,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-            )
+            input: &SignatureVerificationInput<'_>,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls12_signature(input, &self.0.signature_verification_algorithms)
         }
 
         fn verify_tls13_signature(
             &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls13_signature(
-                message,
-                cert,
-                dss,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-            )
+            input: &SignatureVerificationInput<'_>,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls13_signature(input, &self.0.signature_verification_algorithms)
         }
 
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0
                 .signature_verification_algorithms
                 .supported_schemes()
+        }
+
+        fn request_ocsp_response(&self) -> bool {
+            false
+        }
+
+        fn hash_config(&self, _: &mut dyn Hasher) {}
+
+        fn supported_certificate_types(&self) -> &'static [CertificateType] {
+            &[CertificateType::X509]
+        }
+
+        fn root_hint_subjects(&self) -> Option<Arc<[DistinguishedName]>> {
+            None
         }
     }
 }
 
 /// Build a `ClientConfig` from our arguments
-fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
+fn make_config(args: &Args) -> Arc<ClientConfig> {
     let mut root_store = RootCertStore::empty();
 
-    if args.flag_cafile.is_some() {
-        let cafile = args.flag_cafile.as_ref().unwrap();
-
-        let certfile = fs::File::open(cafile).expect("Cannot open CA file");
-        let mut reader = BufReader::new(certfile);
+    if let Some(cafile) = args.cafile.as_ref() {
         root_store.add_parsable_certificates(
-            rustls_pemfile::certs(&mut reader).map(|result| result.unwrap()),
+            CertificateDer::pem_file_iter(cafile)
+                .expect("Cannot open CA file")
+                .map(|result| result.unwrap()),
         );
     } else {
         root_store.extend(
@@ -387,38 +481,17 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
         );
     }
 
-    let suites = if !args.flag_suite.is_empty() {
-        lookup_suites(&args.flag_suite)
-    } else {
-        rustls::crypto::ring::DEFAULT_CIPHER_SUITES.to_vec()
-    };
+    let config = ClientConfig::builder(args.provider().into()).with_root_certificates(root_store);
 
-    let versions = if !args.flag_protover.is_empty() {
-        lookup_versions(&args.flag_protover)
-    } else {
-        rustls::DEFAULT_VERSIONS.to_vec()
-    };
-
-    let config = rustls::ClientConfig::builder_with_provider(
-        CryptoProvider {
-            cipher_suites: suites,
-            ..rustls::crypto::ring::default_provider()
-        }
-        .into(),
-    )
-    .with_protocol_versions(&versions)
-    .expect("inconsistent cipher-suite/versions selected")
-    .with_root_certificates(root_store);
-
-    let mut config = match (&args.flag_auth_key, &args.flag_auth_certs) {
+    let mut config = match (&args.auth_key, &args.auth_certs) {
         (Some(key_file), Some(certs_file)) => {
             let certs = load_certs(certs_file);
             let key = load_private_key(key_file);
             config
-                .with_client_auth_cert(certs, key)
+                .with_client_auth_cert(Arc::new(Identity::from_cert_chain(certs).unwrap()), key)
                 .expect("invalid client auth certs/key")
         }
-        (None, None) => config.with_no_client_auth(),
+        (None, None) => config.with_no_client_auth().unwrap(),
         (_, _) => {
             panic!("must provide --auth-certs and --auth-key together");
         }
@@ -429,29 +502,31 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
             .builder(),
     );
 
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
+    config.key_log = Arc::new(KeyLogFile::new());
 
-    if args.flag_no_tickets {
+    if args.no_tickets {
         config.resumption = config
             .resumption
-            .tls12_resumption(rustls::client::Tls12Resumption::SessionIdOnly);
+            .tls12_resumption(Tls12Resumption::SessionIdOnly);
     }
 
-    if args.flag_no_sni {
+    if args.no_sni {
         config.enable_sni = false;
     }
 
     config.alpn_protocols = args
-        .flag_proto
+        .proto
         .iter()
-        .map(|proto| proto.as_bytes().to_vec())
+        .map(|proto| ApplicationProtocol::from(proto.as_bytes()).to_owned())
         .collect();
-    config.max_fragment_size = args.flag_max_frag_size;
+    config.max_fragment_size = args.max_frag_size;
 
-    if args.flag_insecure {
+    if args.insecure {
         config
             .dangerous()
-            .set_certificate_verifier(Arc::new(danger::NoCertificateVerification {}));
+            .set_certificate_verifier(Arc::new(danger::NoCertificateVerification::new(
+                provider::DEFAULT_PROVIDER,
+            )));
     }
 
     Arc::new(config)
@@ -460,40 +535,32 @@ fn make_config(args: &Args) -> Arc<rustls::ClientConfig> {
 /// Parse some arguments, then make a TLS client connection
 /// somewhere.
 fn main() {
-    let version = env!("CARGO_PKG_NAME").to_string() + ", version: " + env!("CARGO_PKG_VERSION");
+    let args = Args::parse();
 
-    let args: Args = Docopt::new(USAGE)
-        .map(|d| d.help(true))
-        .map(|d| d.version(Some(version)))
-        .and_then(|d| d.deserialize())
-        .unwrap_or_else(|e| e.exit());
-
-    if args.flag_verbose {
+    if args.verbose {
         env_logger::Builder::new()
             .parse_filters("trace")
             .init();
     }
 
-    let port = args.flag_port.unwrap_or(443);
-
     let config = make_config(&args);
 
-    let sock_addr = (args.arg_hostname.as_str(), port)
+    let sock_addr = (args.hostname.as_str(), args.port)
         .to_socket_addrs()
         .unwrap()
         .next()
         .unwrap();
     let sock = TcpStream::connect(sock_addr).unwrap();
-    let server_name = ServerName::try_from(args.arg_hostname.as_str())
+    let server_name = ServerName::try_from(args.hostname.as_str())
         .expect("invalid DNS name")
         .to_owned();
     let mut tlsclient = TlsClient::new(sock, server_name, config);
 
-    if args.flag_http {
+    if args.http {
         let httpreq = format!(
             "GET / HTTP/1.0\r\nHost: {}\r\nConnection: \
                                close\r\nAccept-Encoding: identity\r\n\r\n",
-            args.arg_hostname
+            args.hostname
         );
         tlsclient
             .write_all(httpreq.as_bytes())
@@ -510,7 +577,14 @@ fn main() {
     tlsclient.register(poll.registry());
 
     loop {
-        poll.poll(&mut events, None).unwrap();
+        match poll.poll(&mut events, None) {
+            Ok(_) => {}
+            // Polling can be interrupted (e.g. by a debugger) - retry if so.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                panic!("poll failed: {e:?}")
+            }
+        }
 
         for ev in events.iter() {
             tlsclient.ready(ev);

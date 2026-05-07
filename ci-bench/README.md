@@ -2,7 +2,7 @@
 
 This crate is meant for CI benchmarking. It has two modes of operation:
 
-1. Measure CPU instructions using `cachegrind`.
+1. Measure CPU instructions using `callgrind`.
 2. Measure wall-time (runs each benchmark multiple times, leaving it to the caller to do statistical
    analysis).
 
@@ -35,10 +35,10 @@ handshake_no_resume_1.3_rsa_aes_client,4212770
 ...
 ```
 
-In the `cachegrind` subdirectory you will find output files emitted by the `cachegrind` tool, which
+In the `callgrind` subdirectory you will find output files emitted by the `callgrind` tool, which
 are useful to report detailed instruction count differences when comparing two benchmark runs. This
-subdirectory also contains log information from cachegrind itself (in `.log` files), which can be
-used to diagnose unexpected cachegrind crashes.
+subdirectory also contains log information from callgrind itself (in `.log` files), which can be
+used to diagnose unexpected callgrind crashes.
 
 ### Running all benchmarks in wall-time mode
 
@@ -60,8 +60,9 @@ handshake_no_resume_ring_1.3_rsa_aes,1010150,1400602,936029
 ### Comparing results from an instruction count benchmark run
 
 Use `cargo run --release -- compare foo bar`. It will output a report using GitHub-flavored markdown
-(used by the CI itself to give feedback about PRs). We currently consider differences of 0.2% to be
-significant, but might tweak it in the future after we gain experience with the benchmarking setup.
+for local use. Note that not all reported differences are significant. When you need to know if a
+result is significant you should rely on the CI benchmark report, which automatically categorizes
+results into significant / negligible based on historic data.
 
 ### Supported scenarios
 
@@ -85,27 +86,23 @@ here are some high-level considerations that can help you hack on the crate.
 ### Environment configuration
 
 An important goal of this benchmarking setup is that it should run with minimal noise. Measuring CPU
-instructions using `cachegrind` yields excellent results, regardless of your environment. The
+instructions using `callgrind` yields excellent results, regardless of your environment. The
 wall-time benchmarks, however, require a more elaborate benchmarking environment: running them on a
 laptop is too noisy, but running them on a carefully configured bare-metal server yields accurate
 measurements (up to 1% resolution, according to our tests).
 
 ### Instruction count mode
 
-Using `cachegrind` has some architectural consequences because it operates at the process level
-(i.e. it can count CPU instructions for a whole process, but not for a single function). The most
-important consequences when running in instruction count mode are:
+Instruction counting is done with `callgrind`, and is precise in the sense that only operations
+we want to measure are included.  We tell `callgrind` to start with collection disabled,
+with `--collect-atstart=no`.  Then we use
+[client requests](https://valgrind.org/docs/manual/cl-manual.html#cl-manual.clientrequests) via
+the [crabgrind crate](https://docs.rs/crabgrind/latest/crabgrind/) to enable and disable collection
+(see `callgrind::CountInstructions`).
 
-- Since we want to measure server and client instruction counts separately, the benchmark runner
-  spawns two child processes for each benchmark (one for the client, one for the server) and pipes
-  their stdio to each other for communication (i.e. stdio acts as the transport layer).
-- There is a no-op "benchmark" that measures the overhead of starting up the child process, so
-  we can subtract it from the instruction count of the real benchmarks and reduce noise.
-- Since we want to measure individual portions of code (e.g. data transfer after the handshake),
-  there is a mechanism to subtract the instructions that are part of a benchmark's setup.
-  Specifically, a benchmark can be configured to have another benchmark's instruction count
-  subtracted from it. We are currently using this to subtract the handshake instructions from the
-  data transfer benchmark.
+Since we want to measure server and client instruction counts separately, the benchmark runner
+spawns two child processes for each benchmark (one for the client, one for the server) and pipes
+their stdio to each other for communication (i.e. stdio acts as the transport layer).
 
 If you need to debug benchmarks in instruction count mode, here are a few tricks that might help:
 
@@ -135,7 +132,7 @@ The solution was to:
    that complete after a single `poll`. This way we avoid using an async runtime, which could
    introduce non-determinism.
 3. Use non-blocking operations under the hood in wall-time mode, which simulate IO through shared
-   in-memory buffers. The server and client `Future`s are polled in turns, so again we we avoid
+   in-memory buffers. The server and client `Future`s are polled in turns, so again we avoid
    pulling in an async runtime and keep things as deterministic as possible.
 
 ### Why measure CPU instructions
@@ -153,3 +150,15 @@ when reviewing a PR.
 
 For more information, including the alternatives we considered, check out [this comment]
 (https://github.com/rustls/rustls/issues/1385#issuecomment-1668023152) in the issue tracker.
+
+### Why measure wall-time
+
+While instruction counts are a useful proxy to detect changes in runtime performance, they do not
+account for important factors such as cache misses and branch mispredictions. As an example,
+consider two equivalent functions that calculate an aggregate value based on a `Vec<u64>`: if they
+use roughly the same code, yet a different memory access pattern, that could result in a similar
+instruction count, yet significantly different runtime.
+
+The bigger the change in code, the higher the chance that memory layout and access patterns are
+significantly affected. For that reason, having wall-time measurements is important as a complement
+to instruction counts.
