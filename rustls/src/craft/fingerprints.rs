@@ -137,7 +137,10 @@ pub static CHROME_108_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
             &[CertificateCompressionAlgorithm::Brotli],
             &[CertificateCompressionAlgorithm]
         ))),
-        Craft(CraftExtension::FakeApplicationSettings),
+        Craft(CraftExtension::ApplicationSettings {
+            codepoint: ApplicationSettingsCodepoint::Old,
+            protocols: &[b"h2"],
+        }),
         Craft(CraftExtension::Grease2),
         Craft(CraftExtension::Padding),
         Keep(Optional(ExtensionType::PreSharedKey)),
@@ -406,12 +409,15 @@ pub static FIREFOX_105_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
         ])),
         Craft(CraftExtension::Protocols(&[b"h2", b"http/1.1"])),
         Rustls(ClientExtension::CertificateStatusRequest(ocsp_req())),
-        Craft(CraftExtension::FakeDelegatedCredentials(&[
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-        ])),
+        Craft(CraftExtension::DelegatedCredentials(static_ref!(
+            &[
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_NISTP256_SHA256),
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_NISTP384_SHA384),
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_NISTP521_SHA512),
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_SHA1_Legacy),
+            ],
+            &[GreaseOrSignatureScheme]
+        ))),
         Craft(CraftExtension::KeyShare(static_ref!(
             &[
                 GreaseOrCurve::T(NamedGroup::X25519),
@@ -432,7 +438,7 @@ pub static FIREFOX_105_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
         Rustls(ClientExtension::PresharedKeyModes(vec![
             PSKKeyExchangeMode::PSK_DHE_KE,
         ])),
-        Craft(CraftExtension::FakeRecordSizeLimit(0x4001)),
+        Craft(CraftExtension::RecordSizeLimit(0x4001)),
         Craft(CraftExtension::Padding),
         Keep(Optional(ExtensionType::PreSharedKey)),
     ]

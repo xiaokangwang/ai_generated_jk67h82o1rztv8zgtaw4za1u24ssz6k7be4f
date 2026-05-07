@@ -2056,7 +2056,10 @@ dependencies = [
  "craftls",
  "regex",
  "ring",
+ "rustls-aws-lc-rs",
+ "rustls-util",
  "tokio",
+ "webpki-roots",
 ]
 
 [[package]]

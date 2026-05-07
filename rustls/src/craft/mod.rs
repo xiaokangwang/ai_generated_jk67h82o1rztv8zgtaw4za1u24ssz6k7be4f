@@ -16,11 +16,13 @@ use crate::compress;
 use crate::crypto::cipher::Payload;
 use crate::crypto::kx::{NamedGroup, StartedKeyExchange, SupportedKxGroup};
 use crate::crypto::{CipherSuite, SecureRandom, SignatureScheme};
-use crate::enums::{ApplicationProtocol, CertificateCompressionAlgorithm, ProtocolVersion};
+use crate::enums::{
+    ApplicationProtocol, CertificateCompressionAlgorithm, CertificateType, ProtocolVersion,
+};
 use crate::error::Error;
 use crate::msgs::{
-    ClientExtensions, ClientHelloPayload, ExtensionType, HelloRetryRequest, KeyShareEntry,
-    PskKeyExchangeModes,
+    ClientExtensions, ClientHelloPayload, ExtensionType, HandshakeMessagePayload, HandshakePayload,
+    HelloRetryRequest, KeyShareEntry, PskKeyExchangeModes,
 };
 use crate::msgs::{Codec, LengthPrefixedBuffer, ListLength, TlsListElement};
 use crate::sync::Arc;
@@ -67,6 +69,32 @@ pub(crate) struct CraftPatchResult {
     pub(crate) key_share: Option<(&'static dyn SupportedKxGroup, StartedKeyExchange)>,
 }
 
+pub(crate) fn refresh_psk_binder(hmp: &mut HandshakeMessagePayload<'_>) {
+    let HandshakePayload::ClientHello(hello) = &mut hmp.0 else {
+        return;
+    };
+    if hello.preshared_key_offer.is_none() {
+        return;
+    }
+
+    let Some(psk_extension) =
+        encode_single_extension(&hello.extensions, ExtensionType::PreSharedKey)
+    else {
+        return;
+    };
+    let Some(craft_extensions) = &mut hello.craft_extensions else {
+        return;
+    };
+    let Some(craft_psk_extension) = craft_extensions
+        .iter_mut()
+        .find(|extension| extension.typ == ExtensionType::PreSharedKey)
+    else {
+        return;
+    };
+
+    *craft_psk_extension = psk_extension;
+}
+
 #[allow(dead_code)]
 #[repr(usize)]
 enum BoringSslGreaseIndex {
@@ -75,6 +103,9 @@ enum BoringSslGreaseIndex {
     Extension1,
     Extension2,
     Version,
+    SignatureAlgorithm,
+    Alpn,
+    PskKeyExchangeMode,
     TicketExtension,
     EchConfigId,
     NumOfGrease,
@@ -86,6 +117,11 @@ struct GreaseSeed([u16; BoringSslGreaseIndex::NumOfGrease as usize]);
 impl GreaseSeed {
     fn get(&self, idx: BoringSslGreaseIndex) -> u16 {
         self.0[idx as usize]
+    }
+
+    fn get_psk_key_exchange_mode(&self) -> u8 {
+        let random = (self.get(BoringSslGreaseIndex::PskKeyExchangeMode) >> 8) as u8;
+        0x0b + ((random >> 5) * 0x1f)
     }
 }
 
@@ -174,6 +210,7 @@ impl<T> From<T> for GreaseOr<T> {
 pub type GreaseOrCurve = GreaseOr<NamedGroup>;
 pub type GreaseOrVersion = GreaseOr<ProtocolVersion>;
 pub type GreaseOrCipher = GreaseOr<CipherSuite>;
+pub type GreaseOrSignatureScheme = GreaseOr<SignatureScheme>;
 
 impl CreateUnknown for NamedGroup {
     fn create_unknown(grease: u16) -> Self {
@@ -190,6 +227,62 @@ impl CreateUnknown for ProtocolVersion {
 impl CreateUnknown for CipherSuite {
     fn create_unknown(grease: u16) -> Self {
         Self(grease)
+    }
+}
+
+impl CreateUnknown for SignatureScheme {
+    fn create_unknown(grease: u16) -> Self {
+        Self(grease)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum GreaseOrProtocol {
+    Grease,
+    Protocol(&'static [u8]),
+}
+
+impl From<&'static [u8]> for GreaseOrProtocol {
+    fn from(value: &'static [u8]) -> Self {
+        Self::Protocol(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GreaseOrPskKeyExchangeMode {
+    Grease,
+    T(PSKKeyExchangeMode),
+}
+
+impl GreaseOrPskKeyExchangeMode {
+    fn val_or(&self, grease: u8) -> PSKKeyExchangeMode {
+        match self {
+            Self::Grease => PSKKeyExchangeMode(grease),
+            Self::T(mode) => *mode,
+        }
+    }
+}
+
+impl From<PSKKeyExchangeMode> for GreaseOrPskKeyExchangeMode {
+    fn from(value: PSKKeyExchangeMode) -> Self {
+        Self::T(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ApplicationSettingsCodepoint {
+    New,
+    Old,
+    Custom(ExtensionType),
+}
+
+impl ApplicationSettingsCodepoint {
+    fn extension_type(self) -> ExtensionType {
+        match self {
+            Self::New => ExtensionType::ApplicationSettings,
+            Self::Old => ExtensionType::ApplicationSettingsOld,
+            Self::Custom(typ) => typ,
+        }
     }
 }
 
@@ -242,17 +335,166 @@ pub enum CraftExtension {
     Grease1,
     Grease2,
     RenegotiationInfo,
+    Raw(ExtensionType, &'static [u8]),
     SupportedCurves(&'static [GreaseOrCurve]),
     SupportedVersions(&'static [GreaseOrVersion]),
+    SignatureAlgorithms(&'static [GreaseOrSignatureScheme]),
+    SignatureAlgorithmsCert(&'static [GreaseOrSignatureScheme]),
     SignedCertificateTimestamp,
     KeyShare(&'static [GreaseOrCurve]),
+    NextProtocolNegotiation,
+    ChannelId,
+    UseSrtp {
+        profiles: &'static [u16],
+        mki: &'static [u8],
+    },
     FakeApplicationSettings,
+    ApplicationSettings {
+        codepoint: ApplicationSettingsCodepoint,
+        protocols: &'static [&'static [u8]],
+    },
     FakeCompressCert,
     CompressCert(&'static [CertificateCompressionAlgorithm]),
     Padding,
     Protocols(&'static [&'static [u8]]),
+    ProtocolsWithGrease(&'static [GreaseOrProtocol]),
+    DelegatedCredentials(&'static [GreaseOrSignatureScheme]),
     FakeDelegatedCredentials(&'static [SignatureScheme]),
+    RecordSizeLimit(u16),
     FakeRecordSizeLimit(u16),
+    PresharedKeyModes(&'static [GreaseOrPskKeyExchangeMode]),
+    PostHandshakeAuth,
+    ClientCertificateTypes(&'static [CertificateType]),
+    ServerCertificateTypes(&'static [CertificateType]),
+    CertificateAuthorities(&'static [&'static [u8]]),
+    QuicTransportParameters(&'static [u8]),
+    QuicTransportParametersLegacy(&'static [u8]),
+    TrustAnchors(&'static [&'static [u8]]),
+    Pake(&'static [u8]),
+}
+
+fn encode_protocol_list(protocols: &[&[u8]]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+        for protocol in protocols {
+            append_opaque_u8(list.buf, protocol);
+        }
+    }
+    payload
+}
+
+fn encode_protocol_list_with_grease(
+    protocols: &[GreaseOrProtocol],
+    grease_protocol: u16,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+        for protocol in protocols {
+            match protocol {
+                GreaseOrProtocol::Grease => {
+                    2u8.encode(list.buf);
+                    grease_protocol.encode(list.buf);
+                }
+                GreaseOrProtocol::Protocol(protocol) => append_opaque_u8(list.buf, protocol),
+            }
+        }
+    }
+    payload
+}
+
+fn encode_application_settings(protocols: &[&[u8]]) -> Vec<u8> {
+    encode_protocol_list(protocols)
+}
+
+fn encode_signature_scheme_list(schemes: &[GreaseOrSignatureScheme], grease: u16) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+        for scheme in schemes {
+            scheme.val_or(grease).encode(list.buf);
+        }
+    }
+    payload
+}
+
+fn encode_psk_key_exchange_modes(modes: &[GreaseOrPskKeyExchangeMode], grease: u8) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(
+            ListLength::NonZeroU8 {
+                empty_error: crate::error::InvalidMessage::IllegalEmptyList("PskKeyExchangeModes"),
+            },
+            &mut payload,
+        );
+        for mode in modes {
+            mode.val_or(grease).encode(list.buf);
+        }
+    }
+    payload
+}
+
+fn encode_certificate_types(types: &[CertificateType]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(
+            ListLength::NonZeroU8 {
+                empty_error: crate::error::InvalidMessage::IllegalEmptyList("CertificateTypes"),
+            },
+            &mut payload,
+        );
+        for typ in types {
+            typ.encode(list.buf);
+        }
+    }
+    payload
+}
+
+fn encode_use_srtp(profiles: &[u16], mki: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let profile_ids = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+        for profile in profiles {
+            profile.encode(profile_ids.buf);
+        }
+    }
+    append_opaque_u8(&mut payload, mki);
+    payload
+}
+
+fn encode_certificate_authorities(authorities: &[&[u8]]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+        for authority in authorities {
+            append_opaque_u16(list.buf, authority);
+        }
+    }
+    payload
+}
+
+fn encode_trust_anchors(anchors: &[&[u8]]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+        for anchor in anchors {
+            append_opaque_u8(list.buf, anchor);
+        }
+    }
+    payload
+}
+
+fn append_opaque_u8(out: &mut Vec<u8>, payload: &[u8]) {
+    let len = u8::try_from(payload.len()).expect("u8 length-prefixed payload too large");
+    len.encode(out);
+    out.extend_from_slice(payload);
+}
+
+fn append_opaque_u16(out: &mut Vec<u8>, payload: &[u8]) {
+    let len = u16::try_from(payload.len()).expect("u16 length-prefixed payload too large");
+    len.encode(out);
+    out.extend_from_slice(payload);
 }
 
 impl CraftExtension {
@@ -285,6 +527,7 @@ impl CraftExtension {
             Self::RenegotiationInfo => {
                 CraftClientExtension::raw(ExtensionType::RenegotiationInfo, vec![0])
             }
+            Self::Raw(typ, payload) => CraftClientExtension::raw(*typ, payload.to_vec()),
             Self::SupportedCurves(curves) => {
                 if !craft_config.override_supported_curves {
                     store
@@ -304,27 +547,49 @@ impl CraftExtension {
                 }
             }
             Self::SupportedVersions(versions) => {
-                let mut payload = Vec::new();
-                {
-                    let inner = LengthPrefixedBuffer::new(
-                        ListLength::NonZeroU8 {
-                            empty_error: crate::error::InvalidMessage::IllegalEmptyList(
-                                "ProtocolVersions",
-                            ),
-                        },
-                        &mut payload,
-                    );
-                    for version in *versions {
-                        version
-                            .val_or(
-                                data.grease_seed
-                                    .get(BoringSslGreaseIndex::Version),
-                            )
-                            .encode(inner.buf);
+                if !craft_config.override_version {
+                    store
+                        .remove(&ExtensionType::SupportedVersions)
+                        .ok_or(())?
+                } else {
+                    let mut payload = Vec::new();
+                    {
+                        let inner = LengthPrefixedBuffer::new(
+                            ListLength::NonZeroU8 {
+                                empty_error: crate::error::InvalidMessage::IllegalEmptyList(
+                                    "ProtocolVersions",
+                                ),
+                            },
+                            &mut payload,
+                        );
+                        for version in *versions {
+                            version
+                                .val_or(
+                                    data.grease_seed
+                                        .get(BoringSslGreaseIndex::Version),
+                                )
+                                .encode(inner.buf);
+                        }
                     }
+                    CraftClientExtension::raw(ExtensionType::SupportedVersions, payload)
                 }
-                CraftClientExtension::raw(ExtensionType::SupportedVersions, payload)
             }
+            Self::SignatureAlgorithms(schemes) => CraftClientExtension::raw(
+                ExtensionType::SignatureAlgorithms,
+                encode_signature_scheme_list(
+                    schemes,
+                    data.grease_seed
+                        .get(BoringSslGreaseIndex::SignatureAlgorithm),
+                ),
+            ),
+            Self::SignatureAlgorithmsCert(schemes) => CraftClientExtension::raw(
+                ExtensionType::SignatureAlgorithmsCert,
+                encode_signature_scheme_list(
+                    schemes,
+                    data.grease_seed
+                        .get(BoringSslGreaseIndex::SignatureAlgorithm),
+                ),
+            ),
             Self::SignedCertificateTimestamp => {
                 CraftClientExtension::raw(ExtensionType::SCT, Vec::new())
             }
@@ -401,23 +666,44 @@ impl CraftExtension {
                     CraftClientExtension::encoded(ExtensionType::KeyShare, &shares)
                 }
             }
-            Self::FakeApplicationSettings => {
-                CraftClientExtension::raw(ExtensionType(17513), vec![0, 3, 2, b'h', b'2'])
+            Self::NextProtocolNegotiation => {
+                CraftClientExtension::raw(ExtensionType::NextProtocolNegotiation, Vec::new())
             }
+            Self::ChannelId => CraftClientExtension::raw(ExtensionType::ChannelId, Vec::new()),
+            Self::UseSrtp { profiles, mki } => {
+                CraftClientExtension::raw(ExtensionType::UseSRTP, encode_use_srtp(profiles, mki))
+            }
+            Self::FakeApplicationSettings => CraftClientExtension::raw(
+                ExtensionType::ApplicationSettingsOld,
+                encode_application_settings(&[b"h2"]),
+            ),
+            Self::ApplicationSettings {
+                codepoint,
+                protocols,
+            } => CraftClientExtension::raw(
+                codepoint.extension_type(),
+                encode_application_settings(protocols),
+            ),
             Self::FakeCompressCert => {
                 CraftClientExtension::raw(ExtensionType::CompressCertificate, vec![2, 0, 0])
             }
             Self::CompressCert(algorithms) => {
-                if craft_config.strict_mode {
-                    let offered = hello
-                        .certificate_compression_algorithms
-                        .as_deref()
-                        .unwrap_or_default();
-                    assert_eq!(offered, *algorithms);
+                if !craft_config.override_cert_compress {
+                    store
+                        .remove(&ExtensionType::CompressCertificate)
+                        .ok_or(())?
+                } else {
+                    if craft_config.strict_mode {
+                        let offered = hello
+                            .certificate_compression_algorithms
+                            .as_deref()
+                            .unwrap_or_default();
+                        assert_eq!(offered, *algorithms);
+                    }
+                    store
+                        .remove(&ExtensionType::CompressCertificate)
+                        .ok_or(())?
                 }
-                store
-                    .remove(&ExtensionType::CompressCertificate)
-                    .ok_or(())?
             }
             Self::Padding => {
                 let psk_len = store
@@ -427,23 +713,54 @@ impl CraftExtension {
                 CraftClientExtension::padding(psk_len)
             }
             Self::Protocols(protocols) => {
-                if craft_config.strict_mode {
-                    let offered = hello
-                        .protocols
-                        .as_deref()
-                        .unwrap_or_default();
-                    assert!(
-                        protocols.len() == offered.len()
-                            && protocols
-                                .iter()
-                                .zip(offered.iter())
-                                .all(|(a, b)| *a == b.as_ref())
-                    );
+                if !craft_config.override_alpn {
+                    store
+                        .remove(&ExtensionType::ALProtocolNegotiation)
+                        .ok_or(())?
+                } else {
+                    if craft_config.strict_mode {
+                        let offered = hello
+                            .protocols
+                            .as_deref()
+                            .unwrap_or_default();
+                        assert!(
+                            protocols.len() == offered.len()
+                                && protocols
+                                    .iter()
+                                    .zip(offered.iter())
+                                    .all(|(a, b)| *a == b.as_ref())
+                        );
+                    }
+                    CraftClientExtension::raw(
+                        ExtensionType::ALProtocolNegotiation,
+                        encode_protocol_list(protocols),
+                    )
                 }
-                store
-                    .remove(&ExtensionType::ALProtocolNegotiation)
-                    .ok_or(())?
             }
+            Self::ProtocolsWithGrease(protocols) => {
+                if !craft_config.override_alpn {
+                    store
+                        .remove(&ExtensionType::ALProtocolNegotiation)
+                        .ok_or(())?
+                } else {
+                    CraftClientExtension::raw(
+                        ExtensionType::ALProtocolNegotiation,
+                        encode_protocol_list_with_grease(
+                            protocols,
+                            data.grease_seed
+                                .get(BoringSslGreaseIndex::Alpn),
+                        ),
+                    )
+                }
+            }
+            Self::DelegatedCredentials(delegated) => CraftClientExtension::raw(
+                ExtensionType::DelegatedCredential,
+                encode_signature_scheme_list(
+                    delegated,
+                    data.grease_seed
+                        .get(BoringSslGreaseIndex::SignatureAlgorithm),
+                ),
+            ),
             Self::FakeDelegatedCredentials(delegated) => {
                 let mut payload = Vec::new();
                 {
@@ -452,11 +769,51 @@ impl CraftExtension {
                         scheme.encode(list.buf);
                     }
                 }
-                CraftClientExtension::raw(ExtensionType(34), payload)
+                CraftClientExtension::raw(ExtensionType::DelegatedCredential, payload)
             }
-            Self::FakeRecordSizeLimit(limit) => {
-                CraftClientExtension::raw(ExtensionType(28), limit.to_be_bytes().to_vec())
+            Self::RecordSizeLimit(limit) => CraftClientExtension::raw(
+                ExtensionType::RecordSizeLimit,
+                limit.to_be_bytes().to_vec(),
+            ),
+            Self::FakeRecordSizeLimit(limit) => CraftClientExtension::raw(
+                ExtensionType::RecordSizeLimit,
+                limit.to_be_bytes().to_vec(),
+            ),
+            Self::PresharedKeyModes(modes) => CraftClientExtension::raw(
+                ExtensionType::PSKKeyExchangeModes,
+                encode_psk_key_exchange_modes(
+                    modes,
+                    data.grease_seed
+                        .get_psk_key_exchange_mode(),
+                ),
+            ),
+            Self::PostHandshakeAuth => {
+                CraftClientExtension::raw(ExtensionType::PostHandshakeAuth, Vec::new())
             }
+            Self::ClientCertificateTypes(types) => CraftClientExtension::raw(
+                ExtensionType::ClientCertificateType,
+                encode_certificate_types(types),
+            ),
+            Self::ServerCertificateTypes(types) => CraftClientExtension::raw(
+                ExtensionType::ServerCertificateType,
+                encode_certificate_types(types),
+            ),
+            Self::CertificateAuthorities(authorities) => CraftClientExtension::raw(
+                ExtensionType::CertificateAuthorities,
+                encode_certificate_authorities(authorities),
+            ),
+            Self::QuicTransportParameters(params) => {
+                CraftClientExtension::raw(ExtensionType::TransportParameters, params.to_vec())
+            }
+            Self::QuicTransportParametersLegacy(params) => CraftClientExtension::raw(
+                ExtensionType::QuicTransportParametersLegacy,
+                params.to_vec(),
+            ),
+            Self::TrustAnchors(anchors) => CraftClientExtension::raw(
+                ExtensionType::TrustAnchors,
+                encode_trust_anchors(anchors),
+            ),
+            Self::Pake(payload) => CraftClientExtension::raw(ExtensionType::Pake, payload.to_vec()),
         };
 
         Ok((ext, result))
@@ -468,9 +825,33 @@ pub struct CraftPadding {
     psk_len: usize,
 }
 
+impl CraftPadding {
+    fn encode_extension(&self, typ: ExtensionType, bytes: &mut Vec<u8>) {
+        let unpadded = self.psk_len + bytes.len();
+        if !(unpadded > 0xff && unpadded < 0x200) {
+            return;
+        }
+
+        typ.encode(bytes);
+        let nested = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+        let mut padding_len = 0x200 - unpadded;
+        if padding_len > 4 {
+            padding_len -= 4;
+        } else {
+            padding_len = 1;
+        }
+        nested
+            .buf
+            .resize(nested.buf.len() + padding_len, 0);
+    }
+}
+
 impl Codec<'_> for CraftPadding {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        let unpadded = self.psk_len + bytes.len() - 4;
+        let Some(unpadded_len) = bytes.len().checked_sub(4) else {
+            return;
+        };
+        let unpadded = self.psk_len + unpadded_len;
         if unpadded > 0xff && unpadded < 0x200 {
             let mut padding_len = 0x200 - unpadded;
             if padding_len > 4 {
@@ -583,22 +964,31 @@ impl CertificateStatusRequest {
 
 #[derive(Debug, Clone)]
 pub enum ClientExtension {
+    Raw(ExtensionType, Vec<u8>),
     EcPointFormats(Vec<ECPointFormat>),
     SignatureAlgorithms(Vec<SignatureScheme>),
+    SignatureAlgorithmsCert(Vec<SignatureScheme>),
     SessionTicket(ClientSessionTicket),
     ExtendedMasterSecretRequest,
     CertificateStatusRequest(CertificateStatusRequest),
     PresharedKeyModes(Vec<PSKKeyExchangeMode>),
+    PostHandshakeAuth,
+    ClientCertificateTypes(Vec<CertificateType>),
+    ServerCertificateTypes(Vec<CertificateType>),
 }
 
 impl ClientExtension {
     fn to_wire_extension(&self) -> CraftClientExtension {
         match self {
+            Self::Raw(typ, payload) => CraftClientExtension::raw(*typ, payload.clone()),
             Self::EcPointFormats(formats) => {
                 CraftClientExtension::encoded(ExtensionType::ECPointFormats, formats)
             }
             Self::SignatureAlgorithms(schemes) => {
                 CraftClientExtension::encoded(ExtensionType::SignatureAlgorithms, schemes)
+            }
+            Self::SignatureAlgorithmsCert(schemes) => {
+                CraftClientExtension::encoded(ExtensionType::SignatureAlgorithmsCert, schemes)
             }
             Self::SessionTicket(ClientSessionTicket::Request) => {
                 CraftClientExtension::raw(ExtensionType::SessionTicket, Vec::new())
@@ -620,6 +1010,17 @@ impl ClientExtension {
                     psk_dhe: modes.contains(&PSKKeyExchangeMode::PSK_DHE_KE),
                     psk: modes.contains(&PSKKeyExchangeMode::PSK_KE),
                 },
+            ),
+            Self::PostHandshakeAuth => {
+                CraftClientExtension::raw(ExtensionType::PostHandshakeAuth, Vec::new())
+            }
+            Self::ClientCertificateTypes(types) => CraftClientExtension::raw(
+                ExtensionType::ClientCertificateType,
+                encode_certificate_types(types),
+            ),
+            Self::ServerCertificateTypes(types) => CraftClientExtension::raw(
+                ExtensionType::ServerCertificateType,
+                encode_certificate_types(types),
             ),
         }
     }
@@ -803,6 +1204,21 @@ impl FingerprintBuilder {
         self
     }
 
+    pub fn do_not_override_versions(mut self) -> Self {
+        self.override_version = false;
+        self
+    }
+
+    pub fn do_not_override_certificate_compression(mut self) -> Self {
+        self.override_cert_compress = false;
+        self
+    }
+
+    pub fn dangerous_disable_override_supported_curves(mut self) -> Self {
+        self.override_supported_curves = false;
+        self
+    }
+
     pub fn dangerous_disable_override_keyshare(mut self) -> Self {
         self.override_keyshare = false;
         self
@@ -863,6 +1279,19 @@ impl FingerprintBuilder {
                         config.alpn_protocols = protocols
                             .iter()
                             .map(|protocol| ApplicationProtocol::from(protocol.to_vec()))
+                            .collect();
+                    }
+                }
+                ExtensionSpec::Craft(CraftExtension::ProtocolsWithGrease(protocols)) => {
+                    if self.override_alpn {
+                        config.alpn_protocols = protocols
+                            .iter()
+                            .filter_map(|protocol| match protocol {
+                                GreaseOrProtocol::Grease => None,
+                                GreaseOrProtocol::Protocol(protocol) => {
+                                    Some(ApplicationProtocol::from(protocol.to_vec()))
+                                }
+                            })
                             .collect();
                     }
                 }
@@ -956,11 +1385,16 @@ impl CraftClientExtension {
 
 impl Codec<'_> for CraftClientExtension {
     fn encode(&self, bytes: &mut Vec<u8>) {
+        if let CraftClientExtensionPayload::Padding(padding) = &self.payload {
+            padding.encode_extension(self.typ, bytes);
+            return;
+        }
+
         self.typ.encode(bytes);
         let nested = LengthPrefixedBuffer::new(ListLength::U16, bytes);
         match &self.payload {
             CraftClientExtensionPayload::Raw(payload) => nested.buf.extend_from_slice(payload),
-            CraftClientExtensionPayload::Padding(padding) => padding.encode(nested.buf),
+            CraftClientExtensionPayload::Padding(_) => unreachable!(),
         }
     }
 

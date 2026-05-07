@@ -826,6 +826,7 @@ fn emit_client_hello_for_retry(
                 tls13_session.secret.bytes(),
             );
             tls13::fill_in_psk_binder(&key_schedule, &transcript_buffer, &mut chp);
+            crate::craft::refresh_psk_binder(&mut chp);
             Some((tls13_session.suite, key_schedule))
         }
 

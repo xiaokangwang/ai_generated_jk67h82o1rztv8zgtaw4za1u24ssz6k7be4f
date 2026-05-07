@@ -12,7 +12,10 @@ rustls = { path = "../rustls", package = "craftls", features = ["log"] }
 [dev-dependencies]
 regex = { workspace = true }
 ring = { workspace = true }
+rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
+rustls-util = { path = "../rustls-util" }
 tokio = { workspace = true }
+webpki-roots = { workspace = true }
 
 [lints]
 workspace = true

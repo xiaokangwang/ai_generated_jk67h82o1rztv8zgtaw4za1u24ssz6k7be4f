@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+mod craft_client_interop;
 mod early_exporter;
 mod ffdhe;
 mod ffdhe_kx_with_openssl;
