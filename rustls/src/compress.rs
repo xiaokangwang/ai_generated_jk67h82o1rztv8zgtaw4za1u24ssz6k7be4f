@@ -50,6 +50,8 @@ pub fn default_cert_decompressors() -> &'static [&'static dyn CertDecompressor] 
         BROTLI_DECOMPRESSOR,
         #[cfg(feature = "zlib")]
         ZLIB_DECOMPRESSOR,
+        #[cfg(feature = "zstd")]
+        ZSTD_DECOMPRESSOR,
     ]
 }
 
@@ -75,6 +77,8 @@ pub fn default_cert_compressors() -> &'static [&'static dyn CertCompressor] {
         BROTLI_COMPRESSOR,
         #[cfg(feature = "zlib")]
         ZLIB_COMPRESSOR,
+        #[cfg(feature = "zstd")]
+        ZSTD_COMPRESSOR,
     ]
 }
 
@@ -267,6 +271,75 @@ mod feat_brotli {
 #[cfg(feature = "brotli")]
 pub use feat_brotli::{BROTLI_COMPRESSOR, BROTLI_DECOMPRESSOR};
 
+#[cfg(feature = "zstd")]
+mod feat_zstd {
+    use std::io::{Cursor, Write};
+
+    use super::*;
+
+    /// A certificate decompressor for the zstd algorithm using the `zstd` crate.
+    pub const ZSTD_DECOMPRESSOR: &dyn CertDecompressor = &ZstdDecompressor;
+
+    #[derive(Debug)]
+    struct ZstdDecompressor;
+
+    impl CertDecompressor for ZstdDecompressor {
+        fn decompress(&self, input: &[u8], output: &mut [u8]) -> Result<(), DecompressionFailed> {
+            let mut in_cursor = Cursor::new(input);
+            let mut out_cursor = Cursor::new(output);
+
+            zstd::stream::copy_decode(&mut in_cursor, &mut out_cursor)
+                .map_err(|_| DecompressionFailed)?;
+
+            if out_cursor.position() as usize != out_cursor.into_inner().len() {
+                return Err(DecompressionFailed);
+            }
+
+            Ok(())
+        }
+
+        fn algorithm(&self) -> CertificateCompressionAlgorithm {
+            CertificateCompressionAlgorithm::Zstd
+        }
+    }
+
+    /// A certificate compressor for the zstd algorithm using the `zstd` crate.
+    pub const ZSTD_COMPRESSOR: &dyn CertCompressor = &ZstdCompressor;
+
+    #[derive(Debug)]
+    struct ZstdCompressor;
+
+    impl CertCompressor for ZstdCompressor {
+        fn compress(
+            &self,
+            input: Vec<u8>,
+            level: CompressionLevel,
+        ) -> Result<Vec<u8>, CompressionFailed> {
+            let level = match level {
+                CompressionLevel::Interactive => 3,
+                CompressionLevel::Amortized => 19,
+            };
+            let output = Cursor::new(Vec::with_capacity(input.len() / 2));
+            let mut compressor =
+                zstd::stream::write::Encoder::new(output, level).map_err(|_| CompressionFailed)?;
+            compressor
+                .write_all(&input)
+                .map_err(|_| CompressionFailed)?;
+            compressor
+                .finish()
+                .map(|cursor| cursor.into_inner())
+                .map_err(|_| CompressionFailed)
+        }
+
+        fn algorithm(&self) -> CertificateCompressionAlgorithm {
+            CertificateCompressionAlgorithm::Zstd
+        }
+    }
+}
+
+#[cfg(feature = "zstd")]
+pub use feat_zstd::{ZSTD_COMPRESSOR, ZSTD_DECOMPRESSOR};
+
 /// An LRU cache for compressions.
 ///
 /// The prospect of being able to reuse a given compression for many connections
@@ -410,7 +483,7 @@ impl CompressionCache {
 
 impl Default for CompressionCache {
     fn default() -> Self {
-        // 4 entries allows 2 certificate chains times 2 compression algorithms
+        // 4 entries allows 2 certificate chains times 2 compression algorithms.
         Self::new(4)
     }
 }
@@ -431,7 +504,7 @@ impl CompressionCacheEntry {
     }
 }
 
-#[cfg(all(test, any(feature = "brotli", feature = "zlib")))]
+#[cfg(all(test, any(feature = "brotli", feature = "zlib", feature = "zstd")))]
 mod tests {
     use std::{println, vec};
 
@@ -447,6 +520,12 @@ mod tests {
     #[cfg(feature = "brotli")]
     fn test_brotli() {
         test_compressor(BROTLI_COMPRESSOR, BROTLI_DECOMPRESSOR);
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_zstd() {
+        test_compressor(ZSTD_COMPRESSOR, ZSTD_DECOMPRESSOR);
     }
 
     fn test_compressor(comp: &dyn CertCompressor, decomp: &dyn CertDecompressor) {

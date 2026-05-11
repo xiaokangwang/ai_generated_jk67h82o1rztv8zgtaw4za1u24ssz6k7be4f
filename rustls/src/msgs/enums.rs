@@ -111,6 +111,7 @@ impl ExtensionType {
                 | Self::SignatureAlgorithms
                 | Self::SignatureAlgorithmsCert
                 | Self::ALProtocolNegotiation
+                | Self::CompressCertificate
                 | Self::SupportedVersions
                 | Self::Cookie
                 | Self::KeyShare

@@ -9,6 +9,7 @@ use subtle::ConstantTimeEq;
 use super::config::ClientConfig;
 use super::{Retrieved, Tls13Session, tls13};
 use crate::common_state::Protocol;
+use crate::craft::EchPaddingStyle;
 use crate::crypto::cipher::Payload;
 use crate::crypto::hash::Hash;
 use crate::crypto::hpke::{
@@ -55,6 +56,13 @@ impl EchMode {
             Self::Grease(grease_config) => grease_config.suite.fips(),
         }
     }
+
+    pub(crate) fn tls13_only(&self) -> bool {
+        match self {
+            Self::Enable(ech_config) => ech_config.tls13_only,
+            Self::Grease(grease_config) => grease_config.tls13_only,
+        }
+    }
 }
 
 impl From<EchConfig> for EchMode {
@@ -80,6 +88,9 @@ pub struct EchConfig {
     /// An HPKE instance corresponding to a suite from the `config` we have selected as
     /// a compatible choice.
     pub(crate) suite: &'static dyn Hpke,
+
+    /// Whether offering ECH also disables TLS 1.2 in the outer handshake.
+    pub(crate) tls13_only: bool,
 }
 
 impl EchConfig {
@@ -122,6 +133,16 @@ impl EchConfig {
         };
 
         Self::new_for_configs(configs, hpke_suites)
+    }
+
+    /// Configure whether enabling ECH forces the whole handshake to offer TLS 1.3 only.
+    ///
+    /// The default is `true`, which preserves rustls' historical ECH behavior. Set this to
+    /// `false` to allow a browser-style outer ClientHello that can fall back to TLS 1.2 if
+    /// ECH is not accepted.
+    pub fn with_tls13_only(mut self, tls13_only: bool) -> Self {
+        self.tls13_only = tls13_only;
+        self
     }
 
     pub(super) fn state(
@@ -193,6 +214,7 @@ impl EchConfig {
                     return Ok(Self {
                         config: config.clone(),
                         suite: *hpke,
+                        tls13_only: true,
                     });
                 }
             }
@@ -207,6 +229,7 @@ impl EchConfig {
 pub struct EchGreaseConfig {
     pub(crate) suite: &'static dyn Hpke,
     pub(crate) placeholder_key: HpkePublicKey,
+    pub(crate) tls13_only: bool,
 }
 
 impl EchGreaseConfig {
@@ -223,7 +246,14 @@ impl EchGreaseConfig {
         Self {
             suite,
             placeholder_key,
+            tls13_only: true,
         }
+    }
+
+    /// Configure whether GREASE ECH also forces the whole handshake to offer TLS 1.3 only.
+    pub fn with_tls13_only(mut self, tls13_only: bool) -> Self {
+        self.tls13_only = tls13_only;
+        self
     }
 
     /// Build a GREASE ECH extension based on the placeholder configuration.
@@ -261,6 +291,7 @@ impl EchGreaseConfig {
                     extensions: Vec::default(),
                 }),
                 suite: self.suite,
+                tls13_only: self.tls13_only,
             },
             inner_name,
             protocol,
@@ -271,7 +302,8 @@ impl EchGreaseConfig {
 
         // Construct an inner hello using the outer hello - this allows us to know the size of
         // dummy payload we should use for the GREASE extension.
-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, None);
+        let encoded_inner_hello =
+            grease_state.encode_inner_hello(outer_hello, None, None, EchPaddingStyle::Standard);
 
         // Generate a payload of random data equivalent in length to a real inner hello.
         let payload_len = encoded_inner_hello.len()
@@ -410,6 +442,7 @@ impl EchState {
         mut outer_hello: ClientHelloPayload,
         retry_req: Option<&HelloRetryRequest>,
         resuming: Option<&Retrieved<&Tls13Session>>,
+        padding_style: EchPaddingStyle,
     ) -> Result<ClientHelloPayload, Error> {
         trace!(
             "Preparing ECH offer {}",
@@ -417,7 +450,8 @@ impl EchState {
         );
 
         // Construct the encoded inner hello and update the transcript.
-        let encoded_inner_hello = self.encode_inner_hello(&outer_hello, retry_req, resuming);
+        let encoded_inner_hello =
+            self.encode_inner_hello(&outer_hello, retry_req, resuming, padding_style);
 
         // Complete the ClientHelloOuterAAD with an ech extension, the payload should be a placeholder
         // of size L, all zeroes. L == length of encrypting encoded client hello inner w/ the selected
@@ -446,6 +480,44 @@ impl EchState {
             })
         }
 
+        fn set_outer_hello_ext(outer_hello: &mut ClientHelloPayload, ech: EncryptedClientHello) {
+            let mut payload = Vec::new();
+            ech.encode(&mut payload);
+            outer_hello.encrypted_client_hello = Some(ech);
+
+            let Some(craft_extensions) = outer_hello.craft_extensions.as_mut() else {
+                return;
+            };
+
+            if let Some(existing) = craft_extensions
+                .iter_mut()
+                .find(|ext| ext.extension_type() == ExtensionType::EncryptedClientHello)
+            {
+                *existing = crate::craft::CraftClientExtension::raw(
+                    ExtensionType::EncryptedClientHello,
+                    payload,
+                );
+                return;
+            }
+
+            let insert_at = craft_extensions
+                .iter()
+                .position(|ext| {
+                    matches!(
+                        ext.extension_type(),
+                        ExtensionType::Padding | ExtensionType::PreSharedKey
+                    )
+                })
+                .unwrap_or(craft_extensions.len());
+            craft_extensions.insert(
+                insert_at,
+                crate::craft::CraftClientExtension::raw(
+                    ExtensionType::EncryptedClientHello,
+                    payload,
+                ),
+            );
+        }
+
         // The outer handshake is not permitted to resume a session. If we're resuming in the
         // inner handshake we remove the PSK extension from the outer hello, replacing it
         // with a GREASE PSK to implement the "ClientHello Malleability Mitigation" mentioned
@@ -455,8 +527,10 @@ impl EchState {
         }
 
         // To compute the encoded AAD we add a placeholder extension with an empty payload.
-        outer_hello.encrypted_client_hello =
-            Some(outer_hello_ext(self, enc.clone(), vec![0; payload_len]));
+        set_outer_hello_ext(
+            &mut outer_hello,
+            outer_hello_ext(self, enc.clone(), vec![0; payload_len]),
+        );
 
         // Next we compute the proper extension payload.
         let payload = self
@@ -464,7 +538,7 @@ impl EchState {
             .seal(&outer_hello.get_encoding(), &encoded_inner_hello)?;
 
         // And then we replace the placeholder extension with the real one.
-        outer_hello.encrypted_client_hello = Some(outer_hello_ext(self, enc, payload));
+        set_outer_hello_ext(&mut outer_hello, outer_hello_ext(self, enc, payload));
 
         Ok(outer_hello)
     }
@@ -588,6 +662,7 @@ impl EchState {
         outer_hello: &ClientHelloPayload,
         retryreq: Option<&HelloRetryRequest>,
         resuming: Option<&Retrieved<&Tls13Session>>,
+        padding_style: EchPaddingStyle,
     ) -> Vec<u8> {
         // Start building an inner hello using the outer_hello as a template.
         let mut inner_hello = ClientHelloPayload {
@@ -601,12 +676,13 @@ impl EchState {
             session_id: outer_hello.session_id,
 
             // We remove the empty renegotiation info SCSV from the outer hello's ciphersuite.
-            // Similar to the TLS 1.2 specific extensions we will filter out, this is seen as a
-            // TLS 1.2 only feature by bogo.
+            // ECH ClientHelloInner is TLS 1.3-only, so it carries only TLS 1.3 cipher suites and
+            // GREASE. BoringSSL follows the same split: ClientHelloOuter keeps the TLS 1.2
+            // fallback cipher surface, but ClientHelloInner does not.
             cipher_suites: outer_hello
                 .cipher_suites
                 .iter()
-                .filter(|cs| **cs != CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
+                .filter(|cs| is_tls13_or_grease_cipher_suite(**cs))
                 .copied()
                 .collect(),
             compression_methods: outer_hello.compression_methods.clone(),
@@ -634,7 +710,7 @@ impl EchState {
         // 2. Add the extension to the inner hello as-is.
         // 3. Compress the extension, by collecting it into a list of to-be-compressed
         //    extensions we'll handle separately.
-        let outer_extensions = outer_hello.used_extensions_in_encoding_order();
+        let outer_extensions = client_hello_extension_encoding_order(outer_hello);
         let mut compressed_exts = Vec::with_capacity(outer_extensions.len());
         for ext in outer_extensions {
             // Some outer hello extensions are only useful in the context where a TLS 1.3
@@ -658,13 +734,47 @@ impl EchState {
                 continue;
             }
 
+            if matches!(
+                ext,
+                ExtensionType::EncryptedClientHello
+                    | ExtensionType::EncryptedClientHelloOuterExtensions
+            ) {
+                // ClientHelloInner has its own ECH marker. Never copy the outer real/placeholder
+                // ECH extension into the encrypted inner.
+                continue;
+            }
+
+            let should_compress = ext.ech_compress()
+                && !(ext == ExtensionType::SupportedVersions
+                    && outer_supported_versions_has_tls12(outer_hello));
+
             // Compressed extensions need to be put aside to include in one contiguous block.
-            // Uncompressed extensions get added directly to the inner hello.
-            if ext.ech_compress() {
+            // Uncompressed extensions get added directly to the inner hello. For crafted outer
+            // hellos, first copy the crafted wire value into the typed inner hello model when we
+            // can decode it, so the transcript we compute matches either the encoded inner value
+            // or what the server reconstructs from encrypted_client_hello_outer_extensions.
+            let cloned_crafted = clone_crafted_outer_extension(&mut inner_hello, outer_hello, ext);
+            if cloned_crafted {
+                if should_compress {
+                    compressed_exts.push(ext);
+                }
+                continue;
+            }
+
+            if should_compress && outer_hello.craft_extensions.is_none() {
+                inner_hello.clone_one(outer_hello, ext);
                 compressed_exts.push(ext);
+                continue;
             }
 
             inner_hello.clone_one(outer_hello, ext);
+        }
+
+        // ECH ClientHelloInner is only valid for TLS 1.3 and later. The outer hello may
+        // deliberately retain TLS 1.2 for browser-style fallback, but the protected inner
+        // handshake must not offer it.
+        if let Some(supported_versions) = inner_hello.supported_versions.as_mut() {
+            supported_versions.tls12 = false;
         }
 
         // We've added all the uncompressed extensions. Now we need to add the contiguous
@@ -704,7 +814,6 @@ impl EchState {
         // Calculate padding
         // max_name_len = L
         let max_name_len = usize::from(self.maximum_name_length);
-        let max_name_len = if max_name_len > 0 { max_name_len } else { 255 };
 
         let name_padding_len = match &inner_hello.server_name {
             Some(ServerNamePayload::SingleDnsName(name)) => {
@@ -718,9 +827,12 @@ impl EchState {
         };
         encoded_hello.extend(iter::repeat_n(0, name_padding_len));
 
-        // Let L be the length of the EncodedClientHelloInner with all the padding computed so far
-        // Let N = 31 - ((L - 1) % 32) and add N bytes of padding.
-        let padding_len = 31 - ((encoded_hello.len() - 1) % 32);
+        // Let L be the length of the EncodedClientHelloInner with all the padding computed so far.
+        // The standard path rounds L up to a multiple of 32. NSS/Firefox pads L to 31 mod 32.
+        let padding_len = match padding_style {
+            EchPaddingStyle::Standard => 31 - ((encoded_hello.len() - 1) % 32),
+            EchPaddingStyle::Nss => 31 - (encoded_hello.len() % 32),
+        };
         encoded_hello.extend(iter::repeat_n(0, padding_len));
 
         // Construct the inner hello message that will be used for the transcript.
@@ -828,6 +940,108 @@ impl EchState {
     }
 }
 
+fn clone_crafted_outer_extension(
+    inner_hello: &mut ClientHelloPayload,
+    outer_hello: &ClientHelloPayload,
+    typ: ExtensionType,
+) -> bool {
+    let Some(payload) = outer_hello
+        .craft_extensions
+        .as_ref()
+        .and_then(|extensions| {
+            extensions
+                .iter()
+                .find(|extension| extension.extension_type() == typ)
+                .and_then(|extension| extension.raw_payload())
+        })
+    else {
+        return false;
+    };
+
+    let extension_len = 4usize.saturating_add(payload.len());
+    let Ok(extension_len) = u16::try_from(extension_len) else {
+        return false;
+    };
+    let Ok(payload_len) = u16::try_from(payload.len()) else {
+        return false;
+    };
+
+    let mut encoded = Vec::with_capacity(2 + usize::from(extension_len));
+    encoded.extend_from_slice(&extension_len.to_be_bytes());
+    typ.encode(&mut encoded);
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(payload);
+
+    let Ok(decoded) = ClientExtensions::read_bytes(&encoded).map(ClientExtensions::into_owned)
+    else {
+        return false;
+    };
+    inner_hello.clone_one(&decoded, typ);
+    true
+}
+
+fn client_hello_extension_encoding_order(hello: &ClientHelloPayload) -> Vec<ExtensionType> {
+    if let Some(craft_extensions) = hello.craft_extensions.as_ref() {
+        return craft_extensions
+            .iter()
+            .map(|extension| extension.extension_type())
+            .collect();
+    }
+
+    hello.used_extensions_in_encoding_order()
+}
+
+fn outer_supported_versions_has_tls12(outer_hello: &ClientHelloPayload) -> bool {
+    if let Some(craft_extensions) = outer_hello.craft_extensions.as_ref() {
+        if let Some(payload) = craft_extensions
+            .iter()
+            .find(|ext| ext.extension_type() == ExtensionType::SupportedVersions)
+            .and_then(|ext| ext.raw_payload())
+        {
+            return supported_versions_payload_has_tls12(payload);
+        }
+    }
+
+    outer_hello
+        .supported_versions
+        .map(|versions| versions.tls12)
+        .unwrap_or(false)
+}
+
+fn supported_versions_payload_has_tls12(payload: &[u8]) -> bool {
+    let Some((&len, versions)) = payload.split_first() else {
+        return false;
+    };
+    let len = usize::from(len);
+    if len > versions.len() || len % 2 != 0 {
+        return false;
+    }
+
+    versions[..len]
+        .chunks_exact(2)
+        .any(|version| {
+            u16::from_be_bytes([version[0], version[1]]) == u16::from(ProtocolVersion::TLSv1_2)
+        })
+}
+
+fn is_tls13_or_grease_cipher_suite(cipher_suite: CipherSuite) -> bool {
+    let value = u16::from(cipher_suite);
+    if value & 0x0f0f == 0x0a0a && value >> 8 == value & 0xff {
+        return true;
+    }
+
+    matches!(
+        cipher_suite,
+        CipherSuite::TLS13_AES_128_GCM_SHA256
+            | CipherSuite::TLS13_AES_256_GCM_SHA384
+            | CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            | CipherSuite::TLS13_AES_128_CCM_SHA256
+            | CipherSuite::TLS13_AES_128_CCM_8_SHA256
+            | CipherSuite::TLS13_SM4_GCM_SM3
+            | CipherSuite::TLS13_SM4_CCM_SM3
+    )
+}
+
 /// The last eight bytes of the ServerHello's random, taken from a Handshake message containing it.
 ///
 /// This has:
@@ -854,7 +1068,9 @@ mod tests {
     use super::*;
     use crate::crypto::hpke::{HpkeAead, HpkeKdf};
     use crate::crypto::{CipherSuite, TEST_PROVIDER};
-    use crate::msgs::{Compression, Random, ServerExtensions, SessionId};
+    use crate::msgs::{
+        Compression, Random, ServerExtensions, SessionId, SupportedProtocolVersions,
+    };
 
     #[test]
     fn server_hello_conf_alters_server_hello_random() {
@@ -952,7 +1168,149 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inner_client_hello_zero_max_name_length_uses_no_name_padding() {
+        let name = DnsName::try_from("private.example").unwrap();
+        let zero_max_len = inner_hello_encoding_for_name_with_max_len(name.clone(), true, 0).len();
+        let full_max_len = inner_hello_encoding_for_name_with_max_len(name, true, 255).len();
+
+        assert_eq!(zero_max_len % 32, 0);
+        assert!(
+            zero_max_len < full_max_len,
+            "maximum_name_length=0 must not be treated as 255"
+        );
+    }
+
+    #[test]
+    fn inner_client_hello_nss_padding_matches_firefox_residue() {
+        let name = DnsName::try_from("private.example").unwrap();
+        let standard = inner_hello_encoding_for_name_with_padding_style(
+            name.clone(),
+            true,
+            0,
+            EchPaddingStyle::Standard,
+        );
+        let nss =
+            inner_hello_encoding_for_name_with_padding_style(name, true, 0, EchPaddingStyle::Nss);
+
+        assert_eq!(standard.len() % 32, 0);
+        assert_eq!(nss.len() % 32, 31);
+        assert_eq!((standard.len() + 16) % 32, 16);
+        assert_eq!((nss.len() + 16) % 32, 15);
+    }
+
+    #[test]
+    fn inner_client_hello_omits_tls12_when_outer_allows_tls12() {
+        let encoded = inner_hello_encoding_for_outer_versions(SupportedProtocolVersions {
+            tls13: true,
+            tls12: true,
+        });
+        let versions = supported_versions_from_client_hello_payload(&encoded);
+
+        assert!(versions.tls13);
+        assert!(!versions.tls12);
+    }
+
+    fn supported_versions_from_client_hello_payload(wire: &[u8]) -> SupportedProtocolVersions {
+        let mut offset = 0;
+        take(wire, &mut offset, 2); // legacy_version
+        take(wire, &mut offset, 32); // random
+        let session_id_len = take_u8(wire, &mut offset) as usize;
+        take(wire, &mut offset, session_id_len);
+        let cipher_suites_len = take_u16(wire, &mut offset) as usize;
+        take(wire, &mut offset, cipher_suites_len);
+        let compression_methods_len = take_u8(wire, &mut offset) as usize;
+        take(wire, &mut offset, compression_methods_len);
+
+        let extensions_len = take_u16(wire, &mut offset) as usize;
+        let extensions_end = offset + extensions_len;
+        while offset < extensions_end {
+            let typ = ExtensionType(take_u16(wire, &mut offset));
+            let len = take_u16(wire, &mut offset) as usize;
+            let payload = take(wire, &mut offset, len);
+            if typ == ExtensionType::SupportedVersions {
+                return SupportedProtocolVersions::read(&mut Reader::new(payload)).unwrap();
+            }
+        }
+
+        panic!("missing supported_versions extension");
+    }
+
+    fn take_u8(bytes: &[u8], offset: &mut usize) -> u8 {
+        let value = bytes[*offset];
+        *offset += 1;
+        value
+    }
+
+    fn take_u16(bytes: &[u8], offset: &mut usize) -> u16 {
+        let value = u16::from_be_bytes([bytes[*offset], bytes[*offset + 1]]);
+        *offset += 2;
+        value
+    }
+
+    fn take<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> &'a [u8] {
+        let start = *offset;
+        *offset += len;
+        &bytes[start..*offset]
+    }
+
+    fn inner_hello_encoding_for_outer_versions(versions: SupportedProtocolVersions) -> Vec<u8> {
+        let name = DnsName::try_from("private.example").unwrap();
+        inner_hello_encoding_for_extensions(
+            name.clone(),
+            true,
+            255,
+            ClientExtensions {
+                server_name: Some(ServerNamePayload::from(&name)),
+                supported_versions: Some(versions),
+                ..Default::default()
+            },
+            EchPaddingStyle::Standard,
+        )
+    }
+
     fn inner_hello_encoding_for_name(name: DnsName<'static>, enable_sni: bool) -> Vec<u8> {
+        inner_hello_encoding_for_name_with_max_len(name, enable_sni, 255)
+    }
+
+    fn inner_hello_encoding_for_name_with_max_len(
+        name: DnsName<'static>,
+        enable_sni: bool,
+        maximum_name_length: u8,
+    ) -> Vec<u8> {
+        inner_hello_encoding_for_name_with_padding_style(
+            name,
+            enable_sni,
+            maximum_name_length,
+            EchPaddingStyle::Standard,
+        )
+    }
+
+    fn inner_hello_encoding_for_name_with_padding_style(
+        name: DnsName<'static>,
+        enable_sni: bool,
+        maximum_name_length: u8,
+        padding_style: EchPaddingStyle,
+    ) -> Vec<u8> {
+        inner_hello_encoding_for_extensions(
+            name.clone(),
+            enable_sni,
+            maximum_name_length,
+            ClientExtensions {
+                server_name: Some(ServerNamePayload::from(&name)),
+                ..Default::default()
+            },
+            padding_style,
+        )
+    }
+
+    fn inner_hello_encoding_for_extensions(
+        name: DnsName<'static>,
+        enable_sni: bool,
+        maximum_name_length: u8,
+        extensions: ClientExtensions<'static>,
+        padding_style: EchPaddingStyle,
+    ) -> Vec<u8> {
         let config = EchConfig {
             config: EchConfigPayload::V18(EchConfigContents {
                 key_config: HpkeKeyConfig {
@@ -961,11 +1319,12 @@ mod tests {
                     public_key: vec![0; 32].into(),
                     symmetric_cipher_suites: vec![],
                 },
-                maximum_name_length: 255,
+                maximum_name_length,
                 public_name: DnsName::try_from("public").unwrap(),
                 extensions: vec![],
             }),
             suite: &MockHpke,
+            tls13_only: true,
         };
 
         EchState::new(
@@ -982,16 +1341,14 @@ mod tests {
                 client_version: ProtocolVersion::TLSv1_3,
                 random: Random([0u8; 32]),
                 session_id: SessionId::empty(),
-                cipher_suites: vec![],
+                cipher_suites: vec![CipherSuite::TLS13_AES_128_GCM_SHA256],
                 compression_methods: vec![Compression::Null],
-                extensions: Box::new(ClientExtensions {
-                    server_name: Some(ServerNamePayload::from(&name)),
-                    ..Default::default()
-                }),
+                extensions: Box::new(extensions),
                 craft_extensions: None,
             },
             None,
             None,
+            padding_style,
         )
     }
 

@@ -50,6 +50,13 @@ use crate::tls13::{
 use crate::verify::{self, DigitallySignedStruct, ServerIdentity, SignatureVerificationInput};
 use crate::{ConnectionTrafficSecrets, KeyLog, compress, crypto};
 
+const CHROMIUM_HTTP2_ALPS_SETTINGS: &[u8] = &[
+    0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // SETTINGS_HEADER_TABLE_SIZE = 65536
+    0x00, 0x02, 0x00, 0x00, 0x00, 0x00, // SETTINGS_ENABLE_PUSH = 0
+    0x00, 0x04, 0x00, 0x60, 0x00, 0x00, // SETTINGS_INITIAL_WINDOW_SIZE = 6291456
+    0x00, 0x06, 0x00, 0x04, 0x00, 0x00, // SETTINGS_MAX_HEADER_LIST_SIZE = 262144
+];
+
 #[expect(private_interfaces)]
 pub(crate) enum Tls13State {
     EncryptedExtensions(Box<ExpectEncryptedExtensions>),
@@ -137,7 +144,10 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
         };
 
         // We always send a key share when TLS 1.3 is enabled.
-        let our_key_share = st.offered_key_share.unwrap();
+        let our_key_shares = st.offered_key_share.unwrap();
+        let our_key_share = our_key_shares
+            .into_share_for_group(their_key_share.group, &config)
+            .ok_or(PeerMisbehaved::WrongGroupForKeyShare)?;
         let our_key_share = KeyExchangeChoice::new(&config, output, our_key_share, their_key_share)
             .map_err(|_| PeerMisbehaved::WrongGroupForKeyShare)?;
 
@@ -270,6 +280,8 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
                 randoms,
                 transcript,
                 key_schedule,
+                alps_codepoint: None,
+                alps_settings: Vec::new(),
             },
             resuming_session,
             suite,
@@ -492,6 +504,22 @@ fn validate_encrypted_extensions(
     Ok(())
 }
 
+fn negotiated_alps_codepoint(exts: &ServerExtensions<'_>) -> Result<Option<ExtensionType>, Error> {
+    let has_new = exts
+        .unknown_extensions
+        .contains(&ExtensionType::ApplicationSettings.0);
+    let has_old = exts
+        .unknown_extensions
+        .contains(&ExtensionType::ApplicationSettingsOld.0);
+
+    match (has_new, has_old) {
+        (true, true) => Err(PeerMisbehaved::DuplicateEncryptedExtensions.into()),
+        (true, false) => Ok(Some(ExtensionType::ApplicationSettings)),
+        (false, true) => Ok(Some(ExtensionType::ApplicationSettingsOld)),
+        (false, false) => Ok(None),
+    }
+}
+
 struct ExpectEncryptedExtensions {
     hs: HandshakeState,
     resuming_session: Option<Tls13Session>,
@@ -516,11 +544,19 @@ impl ExpectEncryptedExtensions {
         self.hs.transcript.add_message(&message);
 
         validate_encrypted_extensions(&self.hello, exts)?;
+        let alps_codepoint = negotiated_alps_codepoint(exts)?;
 
         let selected_alpn = exts
             .selected_protocol
             .as_ref()
             .map(|protocol| protocol.as_ref());
+        if let Some(codepoint) = alps_codepoint {
+            output.output(OutputEvent::ApplicationSettingsNegotiated);
+            self.hs.alps_codepoint = Some(codepoint);
+            if selected_alpn.is_some_and(|protocol| protocol.as_ref() == b"h2") {
+                self.hs.alps_settings = CHROMIUM_HTTP2_ALPS_SETTINGS.to_vec();
+            }
+        }
         process_alpn_protocol(
             output,
             &self.hello.alpn_protocols,
@@ -1270,6 +1306,23 @@ fn emit_end_of_early_data_tls13(transcript: &mut HandshakeHash, output: &mut dyn
     output.send_msg(m, true);
 }
 
+fn emit_alps_encrypted_extensions_tls13(
+    flight: &mut HandshakeFlightTls13<'_>,
+    codepoint: ExtensionType,
+    settings: &[u8],
+) {
+    let mut payload = Vec::with_capacity(6 + settings.len());
+    payload.extend_from_slice(&(4u16 + settings.len() as u16).to_be_bytes());
+    payload.extend_from_slice(&codepoint.0.to_be_bytes());
+    payload.extend_from_slice(&(settings.len() as u16).to_be_bytes());
+    payload.extend_from_slice(settings);
+
+    flight.add(HandshakeMessagePayload(HandshakePayload::Unknown((
+        HandshakeType::EncryptedExtensions,
+        Payload::new(payload),
+    ))));
+}
+
 struct ExpectFinished {
     hs: HandshakeState,
     session_input: Tls13ClientSessionInput,
@@ -1326,6 +1379,10 @@ impl ExpectFinished {
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.hs.transcript);
+
+        if let Some(codepoint) = st.hs.alps_codepoint {
+            emit_alps_encrypted_extensions_tls13(&mut flight, codepoint, &st.hs.alps_settings);
+        }
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */
@@ -1444,6 +1501,8 @@ struct HandshakeState {
     randoms: ConnectionRandoms,
     transcript: HandshakeHash,
     key_schedule: KeyScheduleHandshake,
+    alps_codepoint: Option<ExtensionType>,
+    alps_settings: Vec<u8>,
 }
 
 // -- Traffic transit state (TLS1.3) --

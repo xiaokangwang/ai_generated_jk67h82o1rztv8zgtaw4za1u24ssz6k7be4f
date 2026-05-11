@@ -1,0 +1,17 @@
+[package]
+name = "ja4plus"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0 OR ISC OR MIT"
+description = "JA4+ ClientHello fingerprint listener."
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

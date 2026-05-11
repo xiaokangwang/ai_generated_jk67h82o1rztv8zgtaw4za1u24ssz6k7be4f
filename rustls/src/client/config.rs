@@ -667,9 +667,13 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
 
     /// Enable Encrypted Client Hello (ECH) in the given mode.
     ///
-    /// This requires TLS 1.3 as the only supported protocol version to meet the requirement
-    /// to support ECH.  At the end, the config building process will return an error if either
-    /// TLS1.3 _is not_ supported by the provider, or TLS1.2 _is_ supported.
+    /// By default, this requires TLS 1.3 as the only supported protocol version to meet the
+    /// requirement to support ECH. At the end, the config building process will return an error
+    /// if either TLS1.3 _is not_ supported by the provider, or TLS1.2 _is_ supported.
+    ///
+    /// This can be relaxed with [`crate::client::EchConfig::with_tls13_only(false)`] for
+    /// browser-style behavior where ECH itself requires TLS 1.3, but the outer ClientHello can
+    /// still fall back to TLS 1.2 if ECH is not accepted.
     ///
     /// The `ClientConfig` that will be produced by this builder will be specific to the provided
     /// [`crate::client::EchConfig`] and may not be appropriate for all connections made by the program.
@@ -729,7 +733,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
     ) -> Result<ClientConfig, Error> {
         self.provider.consistency_check()?;
 
-        if self.state.client_ech_mode.is_some() {
+        if let Some(ech_mode) = self.state.client_ech_mode.as_ref() {
             match (
                 self.provider
                     .tls12_cipher_suites
@@ -739,8 +743,11 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
                     .is_empty(),
             ) {
                 (_, true) => return Err(ApiMisuse::EchRequiresTls13Support.into()),
-                (false, _) => return Err(ApiMisuse::EchForbidsTls12Support.into()),
+                (false, _) if ech_mode.tls13_only() => {
+                    return Err(ApiMisuse::EchForbidsTls12Support.into());
+                }
                 (true, false) => {}
+                (false, false) => {}
             };
         }
 

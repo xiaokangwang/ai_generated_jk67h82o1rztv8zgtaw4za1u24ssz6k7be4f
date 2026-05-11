@@ -289,6 +289,8 @@
 //!
 //! - `zlib`: uses the `zlib-rs` crate for RFC8879 certificate compression support.
 //!
+//! - `zstd`: uses the `zstd` crate for RFC8879 certificate compression support.
+//!
 //! [x25519mlkem768-manual]: manual::_05_defaults#about-the-post-quantum-secure-key-exchange-x25519mlkem768
 
 // Require docs for public APIs, deny unsafe code, etc.

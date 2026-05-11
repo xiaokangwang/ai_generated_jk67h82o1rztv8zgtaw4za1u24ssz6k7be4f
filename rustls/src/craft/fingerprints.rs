@@ -1,16 +1,61 @@
 #![allow(missing_docs)]
 
 use super::*;
+use crate::crypto::hpke::HpkeAead;
 use std::sync::LazyLock;
 
 macro_rules! define_fingerprint {
+    ($fingerprint_name:ident { $extensions:expr, $cipher:expr, ech_force_tls13: $ech_force_tls13:expr, ech_padding: $ech_padding:expr }) => {
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            false,
+            $cipher,
+            Some($ech_force_tls13),
+            $ech_padding
+        );
+    };
+    ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr, ech_force_tls13: $ech_force_tls13:expr }) => {
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            true,
+            $cipher,
+            Some($ech_force_tls13),
+            EchPaddingStyle::Standard
+        );
+    };
+    ($fingerprint_name:ident { $extensions:expr, $cipher:expr, ech_force_tls13: $ech_force_tls13:expr }) => {
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            false,
+            $cipher,
+            Some($ech_force_tls13),
+            EchPaddingStyle::Standard
+        );
+    };
     ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr }) => {
-        define_fingerprint!($fingerprint_name, $extensions, true, $cipher);
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            true,
+            $cipher,
+            None,
+            EchPaddingStyle::Standard
+        );
     };
     ($fingerprint_name:ident { $extensions:expr, $cipher:expr }) => {
-        define_fingerprint!($fingerprint_name, $extensions, false, $cipher);
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            false,
+            $cipher,
+            None,
+            EchPaddingStyle::Standard
+        );
     };
-    ($fingerprint_name:ident, $extensions:expr, $shuffle_extensions:expr, $cipher:expr) => {
+    ($fingerprint_name:ident, $extensions:expr, $shuffle_extensions:expr, $cipher:expr, $ech_force_tls13:expr, $ech_padding:expr) => {
         /// Represents a set of [`Fingerprint`] configurations, each tailored for different ALPN extensions.
         pub static $fingerprint_name: LazyLock<FingerprintSet> = LazyLock::new(|| {
             use ExtensionSpec::*;
@@ -38,16 +83,22 @@ macro_rules! define_fingerprint {
                     extensions: ($extensions).as_slice(),
                     cipher: ($cipher).as_slice(),
                     shuffle_extensions: $shuffle_extensions,
+                    ech_force_tls13: $ech_force_tls13,
+                    ech_padding_style: $ech_padding,
                 },
                 test_alpn_http1: Fingerprint {
                     extensions: Box::leak(alpn_http1),
                     cipher: ($cipher).as_slice(),
                     shuffle_extensions: $shuffle_extensions,
+                    ech_force_tls13: $ech_force_tls13,
+                    ech_padding_style: $ech_padding,
                 },
                 test_no_alpn: Fingerprint {
                     extensions: Box::leak(no_alpn),
                     cipher: ($cipher).as_slice(),
                     shuffle_extensions: $shuffle_extensions,
+                    ech_force_tls13: $ech_force_tls13,
+                    ech_padding_style: $ech_padding,
                 },
             }
         });
@@ -143,6 +194,139 @@ pub static CHROME_108_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
         }),
         Craft(CraftExtension::Grease2),
         Craft(CraftExtension::Padding),
+        Keep(Optional(ExtensionType::PreSharedKey)),
+    ]
+});
+
+/// The extension list of chromium 144, captured from a no-SNI ECH-capable
+/// ClientHello with h2/http1 ALPN and ALPS-new.
+pub static CHROMIUM_144_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
+    use ExtensionSpec::*;
+    use KeepExtension::*;
+    vec![
+        Craft(CraftExtension::Grease1),
+        Keep(Must(ExtensionType::ServerName)),
+        Craft(CraftExtension::Protocols(&[b"h2", b"http/1.1"])),
+        Craft(CraftExtension::RenegotiationInfo),
+        Rustls(ClientExtension::CertificateStatusRequest(ocsp_req())),
+        Craft(CraftExtension::EchPlaceholder {
+            payload_body_len: 1366,
+            random_config_id: false,
+            aead: EchPlaceholderAead::Fixed(HpkeAead::AES_128_GCM),
+        }),
+        Craft(CraftExtension::SupportedVersions(static_ref!(
+            &[
+                Grease,
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_3),
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_2),
+            ],
+            &[GreaseOrVersion]
+        ))),
+        Keep(OrDefault(
+            ExtensionType::SessionTicket,
+            default_rustls_session_ticket(),
+        )),
+        Rustls(ClientExtension::PresharedKeyModes(vec![
+            PSKKeyExchangeMode::PSK_DHE_KE,
+        ])),
+        Craft(CraftExtension::SignedCertificateTimestamp),
+        Craft(CraftExtension::ApplicationSettings {
+            codepoint: ApplicationSettingsCodepoint::New,
+            protocols: &[b"h2"],
+        }),
+        Rustls(ClientExtension::ExtendedMasterSecretRequest),
+        Rustls(ClientExtension::SignatureAlgorithms(
+            CHROME_108_SIGNATURE_ALGO.to_vec(),
+        )),
+        Craft(CraftExtension::KeyShare(static_ref!(
+            &[Grease, GreaseOrCurve::T(NamedGroup::X25519),],
+            &[GreaseOrCurve]
+        ))),
+        Rustls(ClientExtension::EcPointFormats(vec![
+            ECPointFormat::Uncompressed,
+        ])),
+        Craft(CraftExtension::CompressCert(static_ref!(
+            &[CertificateCompressionAlgorithm::Brotli],
+            &[CertificateCompressionAlgorithm]
+        ))),
+        Craft(CraftExtension::SupportedCurves(static_ref!(
+            &[
+                Grease,
+                GreaseOrCurve::T(NamedGroup::X25519),
+                GreaseOrCurve::T(NamedGroup::secp256r1),
+                GreaseOrCurve::T(NamedGroup::secp384r1),
+            ],
+            &[GreaseOrCurve]
+        ))),
+        Craft(CraftExtension::Grease2),
+        Keep(Optional(ExtensionType::PreSharedKey)),
+    ]
+});
+
+/// The extension list of Chrome 148, captured from no-SNI ECH-capable
+/// ClientHellos with h2/http1 ALPN, ALPS-new, and BoringSSL GREASE ECH.
+pub static CHROME_148_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
+    use ExtensionSpec::*;
+    use KeepExtension::*;
+    vec![
+        Craft(CraftExtension::Grease1),
+        Keep(Must(ExtensionType::ServerName)),
+        Craft(CraftExtension::Protocols(&[b"h2", b"http/1.1"])),
+        Craft(CraftExtension::RenegotiationInfo),
+        Craft(CraftExtension::KeyShare(static_ref!(
+            &[
+                Grease,
+                GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
+                GreaseOrCurve::T(NamedGroup::X25519),
+            ],
+            &[GreaseOrCurve]
+        ))),
+        Craft(CraftExtension::ApplicationSettings {
+            codepoint: ApplicationSettingsCodepoint::New,
+            protocols: &[b"h2"],
+        }),
+        Rustls(ClientExtension::CertificateStatusRequest(ocsp_req())),
+        Rustls(ClientExtension::SignatureAlgorithms(
+            CHROME_108_SIGNATURE_ALGO.to_vec(),
+        )),
+        Rustls(ClientExtension::EcPointFormats(vec![
+            ECPointFormat::Uncompressed,
+        ])),
+        Craft(CraftExtension::SupportedVersions(static_ref!(
+            &[
+                Grease,
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_3),
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_2),
+            ],
+            &[GreaseOrVersion]
+        ))),
+        Craft(CraftExtension::CompressCert(static_ref!(
+            &[CertificateCompressionAlgorithm::Brotli],
+            &[CertificateCompressionAlgorithm]
+        ))),
+        Rustls(ClientExtension::ExtendedMasterSecretRequest),
+        Keep(OrDefault(
+            ExtensionType::SessionTicket,
+            default_rustls_session_ticket(),
+        )),
+        Rustls(ClientExtension::PresharedKeyModes(vec![
+            PSKKeyExchangeMode::PSK_DHE_KE,
+        ])),
+        Craft(CraftExtension::SupportedCurves(static_ref!(
+            &[
+                Grease,
+                GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
+                GreaseOrCurve::T(NamedGroup::X25519),
+                GreaseOrCurve::T(NamedGroup::secp256r1),
+                GreaseOrCurve::T(NamedGroup::secp384r1),
+            ],
+            &[GreaseOrCurve]
+        ))),
+        Craft(CraftExtension::SignedCertificateTimestamp),
+        Craft(CraftExtension::BoringSslEchGrease {
+            aead: HpkeAead::AES_128_GCM,
+        }),
+        Craft(CraftExtension::Grease2),
         Keep(Optional(ExtensionType::PreSharedKey)),
     ]
 });
@@ -243,6 +427,8 @@ pub static CHROME_CIPHER: LazyLock<Vec<GreaseOrCipher>> = LazyLock::new(|| {
 
 define_fingerprint!(CHROME_108 { &CHROME_108_EXT, &CHROME_CIPHER });
 define_fingerprint!(CHROME_112 { shuffle(&CHROME_108_EXT), &CHROME_CIPHER });
+define_fingerprint!(CHROMIUM_144 { shuffle(&CHROMIUM_144_EXT), &CHROME_CIPHER });
+define_fingerprint!(CHROME_148 { shuffle(&CHROME_148_EXT), &CHROME_CIPHER });
 define_fingerprint!(RUSTLS_TEST { &EXT_TEST, &CHROME_CIPHER });
 
 /// The cipher list of Safari 17.1
@@ -395,6 +581,7 @@ pub static FIREFOX_105_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
         Craft(CraftExtension::RenegotiationInfo),
         Craft(CraftExtension::SupportedCurves(static_ref!(
             &[
+                GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
                 GreaseOrCurve::T(NamedGroup::X25519),
                 GreaseOrCurve::T(NamedGroup::secp256r1),
                 GreaseOrCurve::T(NamedGroup::secp384r1),
@@ -420,6 +607,7 @@ pub static FIREFOX_105_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
         ))),
         Craft(CraftExtension::KeyShare(static_ref!(
             &[
+                GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
                 GreaseOrCurve::T(NamedGroup::X25519),
                 GreaseOrCurve::T(NamedGroup::secp256r1),
             ],
@@ -445,3 +633,88 @@ pub static FIREFOX_105_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
 });
 
 define_fingerprint!(FIREFOX_105 { &FIREFOX_105_EXT, &FIREFOX_105_CIPHERS });
+
+/// The extension list of firefox 140, captured from a no-SNI ECH-capable
+/// ClientHello with h2/http1 ALPN.
+pub static FIREFOX_140_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
+    use ExtensionSpec::*;
+    use KeepExtension::*;
+    vec![
+        Keep(Must(ExtensionType::ServerName)),
+        Rustls(ClientExtension::ExtendedMasterSecretRequest),
+        Craft(CraftExtension::RenegotiationInfo),
+        Craft(CraftExtension::SupportedCurves(static_ref!(
+            &[
+                GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
+                GreaseOrCurve::T(NamedGroup::X25519),
+                GreaseOrCurve::T(NamedGroup::secp256r1),
+                GreaseOrCurve::T(NamedGroup::secp384r1),
+                GreaseOrCurve::T(NamedGroup::secp521r1),
+                GreaseOrCurve::T(NamedGroup::FFDHE2048),
+                GreaseOrCurve::T(NamedGroup::FFDHE3072),
+            ],
+            &[GreaseOrCurve]
+        ))),
+        Rustls(ClientExtension::EcPointFormats(vec![
+            ECPointFormat::Uncompressed,
+        ])),
+        Keep(OrDefault(
+            ExtensionType::SessionTicket,
+            default_rustls_session_ticket(),
+        )),
+        Craft(CraftExtension::Protocols(&[b"h2", b"http/1.1"])),
+        Rustls(ClientExtension::CertificateStatusRequest(ocsp_req())),
+        Craft(CraftExtension::DelegatedCredentials(static_ref!(
+            &[
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_NISTP256_SHA256),
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_NISTP384_SHA384),
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_NISTP521_SHA512),
+                GreaseOrSignatureScheme::T(SignatureScheme::ECDSA_SHA1_Legacy),
+            ],
+            &[GreaseOrSignatureScheme]
+        ))),
+        Craft(CraftExtension::SignedCertificateTimestamp),
+        Craft(CraftExtension::KeyShare(static_ref!(
+            &[
+                GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
+                GreaseOrCurve::T(NamedGroup::X25519),
+                GreaseOrCurve::T(NamedGroup::secp256r1),
+            ],
+            &[GreaseOrCurve]
+        ))),
+        Craft(CraftExtension::SupportedVersions(static_ref!(
+            &[
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_3),
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_2),
+            ],
+            &[GreaseOrVersion]
+        ))),
+        Rustls(ClientExtension::SignatureAlgorithms(
+            FIREFOX_105_SIGNATURE_ALGO.to_vec(),
+        )),
+        Rustls(ClientExtension::PresharedKeyModes(vec![
+            PSKKeyExchangeMode::PSK_DHE_KE,
+        ])),
+        Craft(CraftExtension::RecordSizeLimit(0x4001)),
+        Craft(CraftExtension::CompressCert(&[
+            CertificateCompressionAlgorithm::Zlib,
+            CertificateCompressionAlgorithm::Brotli,
+            CertificateCompressionAlgorithm::Zstd,
+        ])),
+        // Sized with the larger hybrid key share to match the captured
+        // no-SNI ClientHello length of 1871 bytes.
+        Craft(CraftExtension::EchPlaceholder {
+            payload_body_len: 239,
+            random_config_id: true,
+            aead: EchPlaceholderAead::NssGrease,
+        }),
+        Keep(Optional(ExtensionType::PreSharedKey)),
+    ]
+});
+
+define_fingerprint!(FIREFOX_140 {
+    &FIREFOX_140_EXT,
+    &FIREFOX_105_CIPHERS,
+    ech_force_tls13: false,
+    ech_padding: EchPaddingStyle::Nss
+});

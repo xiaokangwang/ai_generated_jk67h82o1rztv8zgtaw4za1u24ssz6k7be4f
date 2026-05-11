@@ -1,0 +1,25 @@
+[package]
+name = "craftget"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0 OR ISC OR MIT"
+description = "uget-like HTTPS fetcher using craftls ClientHello fingerprints."
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+hyper = { path = "../reference/hyper", features = ["client", "http2"] }
+rustls = { path = "../rustls", package = "craftls", features = ["log"] }
+rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
+rustls-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+url = { workspace = true }
+webpki-roots = { workspace = true }
+
+[lints]
+workspace = true

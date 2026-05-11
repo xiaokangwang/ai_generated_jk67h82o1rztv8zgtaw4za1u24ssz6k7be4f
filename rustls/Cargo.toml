@@ -17,17 +17,19 @@ exclude = ["src/testdata", "tests/**"]
 name = "rustls"
 
 [features]
-default = ["brotli", "log", "webpki", "zlib"]
+default = ["brotli", "log", "webpki", "zlib", "zstd"]
 brotli = ["dep:brotli", "dep:brotli-decompressor"]
 log = ["dep:log"]
 webpki = ["dep:webpki"]
 zlib = ["dep:zlib-rs"]
+zstd = ["dep:zstd"]
 
 [dependencies]
 brotli = { workspace = true, optional = true }
 brotli-decompressor = { workspace = true, optional = true }
 hashbrown = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
+num-bigint = { workspace = true }
 # only required for no-std
 once_cell = { workspace = true, features = ["std"] }
 subtle = { workspace = true }
@@ -35,6 +37,7 @@ webpki = { workspace = true, optional = true }
 pki-types = { workspace = true, features = ["std"] }
 zeroize = { workspace = true }
 zlib-rs = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 bencher = { workspace = true }
@@ -54,7 +57,7 @@ path = "examples/internal/test_ca.rs"
 
 [package.metadata.docs.rs]
 # all non-default features except fips (cannot build on docs.rs environment)
-features = ["brotli", "hashbrown", "log", "std", "zlib"]
+features = ["brotli", "hashbrown", "log", "std", "zlib", "zstd"]
 rustdoc-args = ["--cfg", "rustls_docsrs"]
 
 [package.metadata.cargo_check_external_types]

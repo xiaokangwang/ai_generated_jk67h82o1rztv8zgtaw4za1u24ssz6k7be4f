@@ -16,7 +16,7 @@ use crate::check::inappropriate_handshake_message;
 use crate::common_state::{EarlyDataEvent, Event, Output, OutputEvent, Protocol};
 use crate::conn::{Input, StateMachine};
 use crate::crypto::cipher::Payload;
-use crate::crypto::kx::{KeyExchangeAlgorithm, StartedKeyExchange, SupportedKxGroup};
+use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, StartedKeyExchange, SupportedKxGroup};
 use crate::crypto::{CipherSuite, CryptoProvider, rand};
 use crate::enums::{
     ApplicationProtocol, CertificateType, ContentType, HandshakeType, ProtocolVersion,
@@ -92,7 +92,7 @@ pub(crate) struct ExpectServerHello {
     //
     // If this is `None` then we do not support early data.
     pub(super) early_data_key_schedule: Option<(KeyScheduleEarlyClient, bool)>,
-    pub(super) offered_key_share: Option<GroupAndKeyShare>,
+    pub(super) offered_key_share: Option<OfferedKeyShares>,
     pub(super) suite: Option<SupportedCipherSuite>,
     pub(super) ech_state: Option<EchState>,
     pub(super) ech_status: EchStatus,
@@ -112,6 +112,17 @@ impl ExpectServerHello {
     {
         if server_hello.compression_method != Compression::Null {
             return Err(PeerMisbehaved::SelectedUnofferedCompression.into());
+        }
+
+        if T::VERSION == ProtocolVersion::TLSv1_2 {
+            if let Some(ech_state) = self.ech_state.as_ref() {
+                // ECH cannot be accepted by a TLS 1.2 server. Treat this as secure
+                // disablement and authenticate the public name from ClientHelloOuter.
+                self.ech_status = EchStatus::Rejected;
+                output.emit(Event::EchStatus(EchStatus::Rejected));
+                self.input.session_key.server_name =
+                    ServerName::DnsName(ech_state.outer_name.clone());
+            }
         }
 
         let allowed_unsolicited = [ExtensionType::RenegotiationInfo];
@@ -256,12 +267,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
         let config = &self.next.input.config;
 
         if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
-            let offered_hybrid = offered_key_share
-                .share
-                .as_hybrid_checked(&config.provider().kx_groups, ProtocolVersion::TLSv1_3)
-                .map(|(hybrid, _)| hybrid.component().0);
-
-            if req_group == offered_key_share.share.group() || Some(req_group) == offered_hybrid {
+            if offered_key_share.contains_group_or_hybrid_component(req_group, config) {
                 return Err(PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup.into());
             }
         }
@@ -350,7 +356,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
         }
 
         let key_share = match hrr.key_share {
-            Some(group) if group != offered_key_share.share.group() => {
+            Some(group) if offered_key_share.primary_group() != Some(group) => {
                 let Some(skxg) = config
                     .provider()
                     .find_kx_group(group, ProtocolVersion::TLSv1_3)
@@ -360,7 +366,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
                     );
                 };
 
-                GroupAndKeyShare::new(skxg)?
+                OfferedKeyShares::single(GroupAndKeyShare::new(skxg)?)
             }
             _ => offered_key_share,
         };
@@ -506,7 +512,10 @@ impl ClientHelloInput {
             .config
             .supports_version(ProtocolVersion::TLSv1_3)
         {
-            Some(tls13::initial_key_share(&self.config, &self.session_key)?)
+            Some(OfferedKeyShares::single(tls13::initial_key_share(
+                &self.config,
+                &self.session_key,
+            )?))
         } else {
             None
         };
@@ -542,7 +551,7 @@ impl ClientHelloInput {
 fn emit_client_hello_for_retry(
     mut transcript_buffer: HandshakeHashBuffer,
     retryreq: Option<&HelloRetryRequest>,
-    mut key_share: Option<GroupAndKeyShare>,
+    mut key_share: Option<OfferedKeyShares>,
     extra_exts: ClientExtensionsInput,
     suite: Option<SupportedCipherSuite>,
     mut input: ClientHelloInput,
@@ -551,9 +560,11 @@ fn emit_client_hello_for_retry(
     mut ech_status: EchStatus,
 ) -> Result<ClientState, Error> {
     let config = &input.config;
-    // Defense in depth: the ECH state should be None if ECH is disabled based on config
-    // builder semantics.
-    let forbids_tls12 = input.protocol.is_quic() || ech_state.is_some();
+    let ech_forbids_tls12 = config
+        .ech_mode
+        .as_ref()
+        .is_some_and(EchMode::tls13_only);
+    let forbids_tls12 = input.protocol.is_quic() || ech_forbids_tls12;
 
     let supported_versions = SupportedProtocolVersions {
         tls13: config.supports_version(ProtocolVersion::TLSv1_3),
@@ -634,24 +645,15 @@ fn emit_client_hello_for_retry(
         (None, false) => None,
     };
 
-    if let Some(GroupAndKeyShare { share, .. }) = &key_share {
+    if let Some(key_share) = &key_share {
         debug_assert!(supported_versions.tls13);
-        let mut shares = vec![KeyShareEntry::new(share.group(), share.pub_key())];
+        let mut shares = key_share.to_key_share_entries(config);
 
         if !retryreq
             .map(|rr| rr.key_share.is_some())
             .unwrap_or_default()
         {
-            // Only for the initial client hello, or a HRR that does not specify a kx group,
-            // see if we can send a second KeyShare for "free".  We only do this if the same
-            // algorithm is also supported separately by our provider for this version
-            // (via `component_separately_supported`).
-            if let Some((hybrid, _)) =
-                share.as_hybrid_checked(&config.provider().kx_groups, ProtocolVersion::TLSv1_3)
-            {
-                let (component_group, component_share) = hybrid.component();
-                shares.push(KeyShareEntry::new(component_group, component_share));
-            }
+            key_share.push_hybrid_component_key_share(config, &mut shares);
         }
 
         exts.key_shares = Some(shares);
@@ -749,6 +751,26 @@ fn emit_client_hello_for_retry(
         craft_extensions: None,
     };
 
+    let craft_patched_before_ech = config.craft.is_enabled() && ech_state.is_some();
+    if craft_patched_before_ech {
+        let patch = config.craft.patch_client_hello(
+            &mut input.craft_connection_data,
+            config,
+            retryreq,
+            &mut chp_payload,
+        );
+        if let Some(error) = patch.error {
+            return Err(error);
+        }
+        // With real ECH, this pre-ECH craft pass shapes ClientHelloOuter.  The negotiated
+        // key exchange for an accepted ECH connection comes from ClientHelloInner, which is
+        // reconstructed from compressed outer extensions, so track the same crafted key_share
+        // that was copied into the ECH inner transcript.
+        if !patch.key_shares.is_empty() {
+            key_share = Some(OfferedKeyShares::new(patch.key_shares));
+        }
+    }
+
     let ech_grease_ext = config
         .ech_mode
         .as_ref()
@@ -767,7 +789,12 @@ fn emit_client_hello_for_retry(
         // we need to replace the client hello payload with an ECH client hello payload.
         (EchStatus::NotOffered | EchStatus::Offered, Some(ech_state)) => {
             // Replace the client hello payload with an ECH client hello payload.
-            chp_payload = ech_state.ech_hello(chp_payload, retryreq, tls13_session.as_ref())?;
+            chp_payload = ech_state.ech_hello(
+                chp_payload,
+                retryreq,
+                tls13_session.as_ref(),
+                config.craft.ech_padding_style(),
+            )?;
             ech_status = EchStatus::Offered;
             output.emit(Event::EchStatus(ech_status));
             // Store the ECH extension in case we need to carry it forward in a subsequent hello.
@@ -792,16 +819,29 @@ fn emit_client_hello_for_retry(
         _ => {}
     }
 
-    if config.craft.is_enabled() {
+    if config.craft.is_enabled() && !craft_patched_before_ech {
         let patch = config.craft.patch_client_hello(
             &mut input.craft_connection_data,
             config,
             retryreq,
             &mut chp_payload,
         );
-        if let Some((group, share)) = patch.key_share {
-            key_share = Some(GroupAndKeyShare { group, share });
+        if let Some(error) = patch.error {
+            return Err(error);
         }
+        if !patch.key_shares.is_empty() {
+            key_share = Some(OfferedKeyShares::new(patch.key_shares));
+        }
+    }
+
+    if ech_status == EchStatus::NotOffered
+        && ech_state.is_none()
+        && chp_payload
+            .collect_used()
+            .contains(&ExtensionType::EncryptedClientHello)
+    {
+        ech_status = EchStatus::Grease;
+        output.emit(Event::EchStatus(ech_status));
     }
 
     // Note what extensions we sent.
@@ -924,6 +964,105 @@ impl GroupAndKeyShare {
             group,
             share: group.start()?,
         })
+    }
+}
+
+pub(super) struct OfferedKeyShares {
+    shares: Vec<GroupAndKeyShare>,
+}
+
+impl OfferedKeyShares {
+    pub(super) fn single(share: GroupAndKeyShare) -> Self {
+        Self {
+            shares: vec![share],
+        }
+    }
+
+    pub(super) fn new(shares: Vec<(&'static dyn SupportedKxGroup, StartedKeyExchange)>) -> Self {
+        Self {
+            shares: shares
+                .into_iter()
+                .map(|(group, share)| GroupAndKeyShare { group, share })
+                .collect(),
+        }
+    }
+
+    fn primary_group(&self) -> Option<NamedGroup> {
+        self.shares
+            .first()
+            .map(|share| share.share.group())
+    }
+
+    fn contains_group_or_hybrid_component(&self, group: NamedGroup, config: &ClientConfig) -> bool {
+        self.shares.iter().any(|share| {
+            share.share.group() == group
+                || share
+                    .share
+                    .as_hybrid_checked(&config.provider().kx_groups, ProtocolVersion::TLSv1_3)
+                    .map(|(hybrid, _)| hybrid.component().0 == group)
+                    .unwrap_or(false)
+        })
+    }
+
+    pub(super) fn into_share_for_group(
+        mut self,
+        group: NamedGroup,
+        config: &ClientConfig,
+    ) -> Option<GroupAndKeyShare> {
+        if let Some(index) = self
+            .shares
+            .iter()
+            .position(|share| share.share.group() == group)
+        {
+            return Some(self.shares.swap_remove(index));
+        }
+
+        self.shares.into_iter().find(|share| {
+            share
+                .share
+                .as_hybrid_checked(&config.provider().kx_groups, ProtocolVersion::TLSv1_3)
+                .map(|(hybrid, _)| hybrid.component().0 == group)
+                .unwrap_or(false)
+        })
+    }
+
+    fn to_key_share_entries(&self, config: &ClientConfig) -> Vec<KeyShareEntry> {
+        let mut shares = self
+            .shares
+            .iter()
+            .map(|share| KeyShareEntry::new(share.share.group(), share.share.pub_key()))
+            .collect::<Vec<_>>();
+
+        if self.shares.len() == 1 {
+            self.push_hybrid_component_key_share(config, &mut shares);
+        }
+
+        shares
+    }
+
+    fn push_hybrid_component_key_share(
+        &self,
+        config: &ClientConfig,
+        shares: &mut Vec<KeyShareEntry>,
+    ) {
+        let Some(share) = self.shares.first() else {
+            return;
+        };
+        let Some((hybrid, _)) = share
+            .share
+            .as_hybrid_checked(&config.provider().kx_groups, ProtocolVersion::TLSv1_3)
+        else {
+            return;
+        };
+
+        let (component_group, component_share) = hybrid.component();
+        if shares
+            .iter()
+            .any(|share| share.group == component_group)
+        {
+            return;
+        }
+        shares.push(KeyShareEntry::new(component_group, component_share));
     }
 }
 

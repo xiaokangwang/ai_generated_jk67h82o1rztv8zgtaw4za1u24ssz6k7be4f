@@ -94,6 +94,7 @@ pub struct ConnectionOutputs {
     suite: Option<SupportedCipherSuite>,
     negotiated_kx_group: Option<&'static dyn SupportedKxGroup>,
     alpn_protocol: Option<ApplicationProtocol<'static>>,
+    application_settings_negotiated: bool,
     peer_identity: Option<Identity<'static>>,
     pub(crate) exporter: Option<Box<dyn Exporter>>,
     pub(crate) early_exporter: Option<Box<dyn Exporter>>,
@@ -119,6 +120,11 @@ impl ConnectionOutputs {
     /// were offered or accepted by the peer).
     pub fn alpn_protocol(&self) -> Option<&ApplicationProtocol<'static>> {
         self.alpn_protocol.as_ref()
+    }
+
+    /// Returns whether application settings were negotiated using ALPS.
+    pub fn application_settings_negotiated(&self) -> bool {
+        self.application_settings_negotiated
     }
 
     /// Retrieves the cipher suite agreed with the peer.
@@ -177,6 +183,9 @@ impl ConnectionOutput for ConnectionOutputs {
         match ev {
             OutputEvent::ApplicationProtocol(protocol) => {
                 self.alpn_protocol = Some(ApplicationProtocol::from(protocol.as_ref()).to_owned())
+            }
+            OutputEvent::ApplicationSettingsNegotiated => {
+                self.application_settings_negotiated = true;
             }
             OutputEvent::CipherSuite(suite) => self.suite = Some(suite),
             OutputEvent::EarlyExporter(exporter) => self.early_exporter = Some(exporter),
@@ -273,6 +282,7 @@ pub(crate) enum Event<'a> {
 
 pub(crate) enum OutputEvent<'a> {
     ApplicationProtocol(ApplicationProtocol<'a>),
+    ApplicationSettingsNegotiated,
     CipherSuite(SupportedCipherSuite),
     EarlyExporter(Box<dyn Exporter>),
     Exporter(Box<dyn Exporter>),

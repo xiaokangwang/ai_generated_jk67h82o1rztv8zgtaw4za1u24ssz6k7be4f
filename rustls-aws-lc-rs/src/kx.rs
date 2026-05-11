@@ -247,6 +247,14 @@ pub static SECP384R1: &dyn SupportedKxGroup = &KxGroup {
     pub_key_validator: uncompressed_point,
 };
 
+/// Ephemeral ECDH on secp521r1 (aka NIST-P521)
+pub static SECP521R1: &dyn SupportedKxGroup = &KxGroup {
+    name: NamedGroup::secp521r1,
+    agreement_algorithm: &agreement::ECDH_P521,
+    fips_allowed: true,
+    pub_key_validator: uncompressed_point,
+};
+
 fn uncompressed_point(point: &[u8]) -> bool {
     // See `UncompressedPointRepresentation`, which is a retelling of
     // SEC1 section 2.3.3 "Elliptic-Curve-Point-to-Octet-String Conversion"

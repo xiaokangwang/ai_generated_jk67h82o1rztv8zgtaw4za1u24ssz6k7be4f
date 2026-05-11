@@ -5,21 +5,29 @@ pub use fingerprints::*;
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug};
 use std::collections::HashMap;
 
+use num_bigint::BigUint;
+
 use crate::ClientConfig;
 use crate::compress;
 use crate::crypto::cipher::Payload;
-use crate::crypto::kx::{NamedGroup, StartedKeyExchange, SupportedKxGroup};
-use crate::crypto::{CipherSuite, SecureRandom, SignatureScheme};
+use crate::crypto::hpke::HpkeAead;
+use crate::crypto::kx::ffdhe::{self, FfdheGroup};
+use crate::crypto::kx::{
+    ActiveKeyExchange, NamedGroup, SharedSecret, StartedKeyExchange, SupportedKxGroup,
+};
+use crate::crypto::tls13::OkmBlock;
+use crate::crypto::{CipherSuite, HashAlgorithm, SecureRandom, SignatureScheme};
 use crate::enums::{
     ApplicationProtocol, CertificateCompressionAlgorithm, CertificateType, ProtocolVersion,
 };
-use crate::error::Error;
+use crate::error::{Error, PeerMisbehaved};
 use crate::msgs::{
     ClientExtensions, ClientHelloPayload, ExtensionType, HandshakeMessagePayload, HandshakePayload,
     HelloRetryRequest, KeyShareEntry, PskKeyExchangeModes,
@@ -49,10 +57,16 @@ impl CraftOptions {
         let Some(builder) = self.get() else {
             return CraftPatchResult::default();
         };
+        if let Some(error) = &builder.validation_error {
+            return CraftPatchResult::fatal(Error::General(error.clone()));
+        }
 
         let result = builder
             .fingerprint
             .patch_client_hello(data, config, hrr, hello);
+        if result.error.is_some() {
+            return result;
+        }
 
         if builder.override_suite {
             builder
@@ -66,7 +80,28 @@ impl CraftOptions {
 
 #[derive(Default)]
 pub(crate) struct CraftPatchResult {
-    pub(crate) key_share: Option<(&'static dyn SupportedKxGroup, StartedKeyExchange)>,
+    pub(crate) key_shares: Vec<(&'static dyn SupportedKxGroup, StartedKeyExchange)>,
+    pub(crate) error: Option<Error>,
+}
+
+impl CraftPatchResult {
+    fn fatal(error: Error) -> Self {
+        Self {
+            key_shares: Vec::new(),
+            error: Some(error),
+        }
+    }
+}
+
+enum CraftExtensionError {
+    Skip,
+    Fatal(Error),
+}
+
+impl From<()> for CraftExtensionError {
+    fn from((): ()) -> Self {
+        Self::Skip
+    }
 }
 
 pub(crate) fn refresh_psk_binder(hmp: &mut HandshakeMessagePayload<'_>) {
@@ -287,15 +322,36 @@ impl ApplicationSettingsCodepoint {
 }
 
 #[derive(Debug)]
-struct CraftFakeKxGroup {
+struct CraftFfdheKxGroup {
     name: NamedGroup,
+    group: FfdheGroup<'static>,
+    secure_random: &'static dyn SecureRandom,
 }
 
-impl SupportedKxGroup for CraftFakeKxGroup {
+impl SupportedKxGroup for CraftFfdheKxGroup {
     fn start(&self) -> Result<StartedKeyExchange, Error> {
-        Err(Error::General(String::from(
-            "craftls fake key exchange group cannot start key exchange",
-        )))
+        let mut exponent = vec![0; ffdhe_exponent_len(self.group)];
+        self.secure_random.fill(&mut exponent)?;
+        if exponent.iter().all(|byte| *byte == 0) {
+            exponent[0] = 1;
+        }
+
+        let x = BigUint::from_bytes_be(&exponent);
+        let p = BigUint::from_bytes_be(self.group.p);
+        let g = BigUint::from_bytes_be(self.group.g);
+        let x_pub = to_bytes_be_with_len(g.modpow(&x, &p), self.group.p.len());
+
+        Ok(StartedKeyExchange::Single(Box::new(ActiveCraftFfdheKx {
+            x_pub,
+            x,
+            p,
+            group: self.group,
+            named_group: self.name,
+        })))
+    }
+
+    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
+        Some(self.group)
     }
 
     fn name(&self) -> NamedGroup {
@@ -303,31 +359,90 @@ impl SupportedKxGroup for CraftFakeKxGroup {
     }
 }
 
-pub(crate) static FAKE_SECP256R1: &dyn SupportedKxGroup = &CraftFakeKxGroup {
-    name: NamedGroup::secp256r1,
-};
-pub(crate) static FAKE_SECP384R1: &dyn SupportedKxGroup = &CraftFakeKxGroup {
-    name: NamedGroup::secp384r1,
-};
-pub(crate) static FAKE_SECP521R1: &dyn SupportedKxGroup = &CraftFakeKxGroup {
-    name: NamedGroup::secp521r1,
-};
-pub(crate) static FAKE_FFDHE2048: &dyn SupportedKxGroup = &CraftFakeKxGroup {
-    name: NamedGroup::FFDHE2048,
-};
-pub(crate) static FAKE_FFDHE3072: &dyn SupportedKxGroup = &CraftFakeKxGroup {
-    name: NamedGroup::FFDHE3072,
-};
+struct ActiveCraftFfdheKx {
+    x_pub: Vec<u8>,
+    x: BigUint,
+    p: BigUint,
+    group: FfdheGroup<'static>,
+    named_group: NamedGroup,
+}
 
-fn to_fake_curves(group: &NamedGroup) -> &'static dyn SupportedKxGroup {
-    match *group {
-        NamedGroup::secp256r1 => FAKE_SECP256R1,
-        NamedGroup::secp384r1 => FAKE_SECP384R1,
-        NamedGroup::secp521r1 => FAKE_SECP521R1,
-        NamedGroup::FFDHE2048 => FAKE_FFDHE2048,
-        NamedGroup::FFDHE3072 => FAKE_FFDHE3072,
-        _ => panic!("unsupported fake key exchange group {group:?}"),
+impl ActiveKeyExchange for ActiveCraftFfdheKx {
+    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+        let peer_pub = BigUint::from_bytes_be(peer_pub_key);
+        let min_peer_pub = BigUint::from(2u8);
+        let max_peer_pub = &self.p - BigUint::from(2u8);
+        if peer_pub < min_peer_pub || peer_pub > max_peer_pub {
+            return Err(PeerMisbehaved::InvalidKeyShare.into());
+        }
+
+        let secret = peer_pub.modpow(&self.x, &self.p);
+        let secret = to_bytes_be_with_len(secret, self.group.p.len());
+
+        Ok(SharedSecret::from(&secret[..]))
     }
+
+    fn pub_key(&self) -> &[u8] {
+        &self.x_pub
+    }
+
+    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
+        Some(self.group)
+    }
+
+    fn group(&self) -> NamedGroup {
+        self.named_group
+    }
+}
+
+fn ffdhe_exponent_len(group: FfdheGroup<'static>) -> usize {
+    match group.p.len() {
+        0..=256 => 32,
+        257..=384 => 40,
+        385..=512 => 48,
+        513..=768 => 56,
+        _ => 64,
+    }
+}
+
+fn to_bytes_be_with_len(n: BigUint, len_bytes: usize) -> Vec<u8> {
+    let mut bytes = n.to_bytes_le();
+    bytes.resize(len_bytes, 0);
+    bytes.reverse();
+    bytes
+}
+
+fn craft_ffdhe_group(
+    name: NamedGroup,
+    group: FfdheGroup<'static>,
+    secure_random: &'static dyn SecureRandom,
+) -> &'static dyn SupportedKxGroup {
+    Box::leak(Box::new(CraftFfdheKxGroup {
+        name,
+        group,
+        secure_random,
+    }))
+}
+
+pub(crate) fn to_missing_kx_group(
+    group: &NamedGroup,
+    secure_random: &'static dyn SecureRandom,
+) -> Option<&'static dyn SupportedKxGroup> {
+    match *group {
+        NamedGroup::FFDHE2048 => Some(craft_ffdhe_group(*group, ffdhe::FFDHE2048, secure_random)),
+        NamedGroup::FFDHE3072 => Some(craft_ffdhe_group(*group, ffdhe::FFDHE3072, secure_random)),
+        NamedGroup::FFDHE4096 => Some(craft_ffdhe_group(*group, ffdhe::FFDHE4096, secure_random)),
+        NamedGroup::FFDHE6144 => Some(craft_ffdhe_group(*group, ffdhe::FFDHE6144, secure_random)),
+        NamedGroup::FFDHE8192 => Some(craft_ffdhe_group(*group, ffdhe::FFDHE8192, secure_random)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum EchPlaceholderAead {
+    Fixed(HpkeAead),
+    NssGrease,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +451,14 @@ pub enum CraftExtension {
     Grease2,
     RenegotiationInfo,
     Raw(ExtensionType, &'static [u8]),
+    EchPlaceholder {
+        payload_body_len: usize,
+        random_config_id: bool,
+        aead: EchPlaceholderAead,
+    },
+    BoringSslEchGrease {
+        aead: HpkeAead,
+    },
     SupportedCurves(&'static [GreaseOrCurve]),
     SupportedVersions(&'static [GreaseOrVersion]),
     SignatureAlgorithms(&'static [GreaseOrSignatureScheme]),
@@ -406,6 +529,132 @@ fn encode_protocol_list_with_grease(
 
 fn encode_application_settings(protocols: &[&[u8]]) -> Vec<u8> {
     encode_protocol_list(protocols)
+}
+
+fn encode_certificate_compression_algorithms(
+    algorithms: &[CertificateCompressionAlgorithm],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    let byte_len = algorithms
+        .len()
+        .checked_mul(2)
+        .and_then(|len| u8::try_from(len).ok())
+        .expect("certificate compression algorithm list too long");
+    byte_len.encode(&mut payload);
+    for algorithm in algorithms {
+        algorithm.encode(&mut payload);
+    }
+    payload
+}
+
+fn encode_ech_placeholder(
+    config: &ClientConfig,
+    payload_body_len: usize,
+    random_config_id: bool,
+    aead: EchPlaceholderAead,
+) -> Result<Vec<u8>, Error> {
+    let payload_body_len = u16::try_from(payload_body_len)
+        .map_err(|_| Error::General("ECH placeholder payload body is too large".into()))?;
+
+    let mut payload = Vec::with_capacity(42 + usize::from(payload_body_len));
+    payload.push(0x00); // ECHClientHelloOuter
+    payload.extend_from_slice(&0x0001u16.to_be_bytes()); // HKDF-SHA256
+    let aead_pos = payload.len();
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    let config_id_pos = payload.len();
+    payload.push(0);
+    payload.extend_from_slice(&0x0020u16.to_be_bytes()); // enc length
+
+    let enc_start = payload.len();
+    payload.resize(enc_start + 32, 0);
+    payload.extend_from_slice(&payload_body_len.to_be_bytes());
+    let body_start = payload.len();
+    payload.resize(body_start + usize::from(payload_body_len), 0);
+
+    match aead {
+        EchPlaceholderAead::Fixed(aead) => {
+            payload[aead_pos..aead_pos + 2].copy_from_slice(&aead.0.to_be_bytes());
+            if random_config_id {
+                config
+                    .provider()
+                    .secure_random
+                    .fill(&mut payload[config_id_pos..config_id_pos + 1])?;
+            }
+            config
+                .provider()
+                .secure_random
+                .fill(&mut payload[enc_start..enc_start + 32])?;
+            config
+                .provider()
+                .secure_random
+                .fill(&mut payload[body_start..])?;
+        }
+        EchPlaceholderAead::NssGrease => {
+            let raw_data = nss_grease_ech_raw_data(config, 34 + usize::from(payload_body_len))?;
+            let aead = if raw_data[0] & 1 == 1 {
+                HpkeAead::AES_128_GCM
+            } else {
+                HpkeAead::CHACHA20_POLY_1305
+            };
+            payload[aead_pos..aead_pos + 2].copy_from_slice(&aead.0.to_be_bytes());
+            if random_config_id {
+                payload[config_id_pos] = raw_data[1];
+            }
+            payload[enc_start..enc_start + 32].copy_from_slice(&raw_data[2..34]);
+            payload[body_start..].copy_from_slice(&raw_data[34..]);
+        }
+    }
+
+    Ok(payload)
+}
+
+fn random_size(config: &ClientConfig, min: usize, max: usize) -> Result<usize, Error> {
+    debug_assert!(min < max);
+    let mut random = [0; 8];
+    config
+        .provider()
+        .secure_random
+        .fill(&mut random)?;
+    let value = u64::from_ne_bytes(random) as usize;
+    Ok(value % (max - min + 1) + min)
+}
+
+fn boring_ssl_ech_grease_payload_body_len(
+    config: &ClientConfig,
+    aead: HpkeAead,
+) -> Result<usize, Error> {
+    let tag_len = aead
+        .tag_len()
+        .ok_or_else(|| Error::General(format!("unsupported ECH GREASE AEAD {aead:?}")))?;
+    Ok(32 * random_size(config, 128 / 32, 224 / 32)? + tag_len)
+}
+
+fn nss_grease_ech_raw_data(config: &ClientConfig, len: usize) -> Result<Vec<u8>, Error> {
+    let mut prk = [0; 32];
+    config
+        .provider()
+        .secure_random
+        .fill(&mut prk)?;
+
+    let Some(suite) = config
+        .provider()
+        .tls13_cipher_suites
+        .iter()
+        .find(|suite| suite.common.hash_provider.algorithm() == HashAlgorithm::SHA256)
+    else {
+        return Err(Error::General(
+            "craft fingerprint requires HKDF-SHA256 support for NSS GREASE ECH".into(),
+        ));
+    };
+
+    let expander = suite
+        .hkdf_provider
+        .expander_for_okm(&OkmBlock::new(&prk));
+    let mut raw_data = vec![0; len];
+    expander
+        .expand_slice(&[], &mut raw_data)
+        .map_err(|_| Error::General("NSS GREASE ECH placeholder is too large".into()))?;
+    Ok(raw_data)
 }
 
 fn encode_signature_scheme_list(schemes: &[GreaseOrSignatureScheme], grease: u16) -> Vec<u8> {
@@ -505,7 +754,7 @@ impl CraftExtension {
         store: &mut HashMap<ExtensionType, CraftClientExtension>,
         hello: &ClientHelloPayload,
         hrr: Option<&HelloRetryRequest>,
-    ) -> Result<(CraftClientExtension, CraftPatchResult), ()> {
+    ) -> Result<(CraftClientExtension, CraftPatchResult), CraftExtensionError> {
         let craft_config = config.craft.get().ok_or(())?;
         let mut result = CraftPatchResult::default();
 
@@ -528,6 +777,29 @@ impl CraftExtension {
                 CraftClientExtension::raw(ExtensionType::RenegotiationInfo, vec![0])
             }
             Self::Raw(typ, payload) => CraftClientExtension::raw(*typ, payload.to_vec()),
+            Self::EchPlaceholder {
+                payload_body_len,
+                random_config_id,
+                aead,
+            } => CraftClientExtension::raw(
+                ExtensionType::EncryptedClientHello,
+                encode_ech_placeholder(config, *payload_body_len, *random_config_id, *aead)
+                    .map_err(CraftExtensionError::Fatal)?,
+            ),
+            Self::BoringSslEchGrease { aead } => {
+                let payload_body_len = boring_ssl_ech_grease_payload_body_len(config, *aead)
+                    .map_err(CraftExtensionError::Fatal)?;
+                CraftClientExtension::raw(
+                    ExtensionType::EncryptedClientHello,
+                    encode_ech_placeholder(
+                        config,
+                        payload_body_len,
+                        true,
+                        EchPlaceholderAead::Fixed(*aead),
+                    )
+                    .map_err(CraftExtensionError::Fatal)?,
+                )
+            }
             Self::SupportedCurves(curves) => {
                 if !craft_config.override_supported_curves {
                     store
@@ -603,12 +875,9 @@ impl CraftExtension {
                         .remove(&ExtensionType::KeyShare)
                         .ok_or(())?
                 } else {
-                    let mut origin = hello
-                        .key_shares
-                        .as_ref()
-                        .and_then(|shares| shares.first().cloned());
-                    let origin_group = origin.as_ref().map(|share| share.group);
                     let mut shares = Vec::new();
+                    let mut tracked_shares = Vec::new();
+                    let mut component_shares: Vec<(NamedGroup, Vec<u8>)> = Vec::new();
 
                     for group_spec in *key_share_spec {
                         match group_spec {
@@ -620,17 +889,18 @@ impl CraftExtension {
                                 vec![0],
                             )),
                             GreaseOr::T(group) => {
-                                if origin_group == Some(*group) {
-                                    if let Some(origin) = origin.take() {
-                                        shares.push(origin);
-                                    }
-                                    continue;
-                                }
-
                                 if shares
                                     .iter()
                                     .any(|share| share.group == *group)
                                 {
+                                    continue;
+                                }
+                                if let Some((_, component_share)) = component_shares
+                                    .iter()
+                                    .find(|(component_group, _)| component_group == group)
+                                {
+                                    shares
+                                        .push(KeyShareEntry::new(*group, component_share.clone()));
                                     continue;
                                 }
 
@@ -638,31 +908,44 @@ impl CraftExtension {
                                     .provider()
                                     .find_kx_group(*group, ProtocolVersion::TLSv1_3)
                                 else {
-                                    assert!(
-                                        !craft_config.strict_mode,
-                                        "unsupported key share group {group:?}"
-                                    );
+                                    if craft_config.strict_mode {
+                                        return Err(CraftExtensionError::Fatal(Error::General(
+                                            format!(
+                                                "craft fingerprint requires unsupported key share group {group:?}"
+                                            ),
+                                        )));
+                                    }
                                     continue;
                                 };
 
                                 let Ok(started) = group_impl.start() else {
-                                    assert!(
-                                        !craft_config.strict_mode,
-                                        "failed to start key exchange for group {group:?}"
-                                    );
+                                    if craft_config.strict_mode {
+                                        return Err(CraftExtensionError::Fatal(Error::General(
+                                            format!(
+                                                "craft fingerprint failed to start key exchange for group {group:?}"
+                                            ),
+                                        )));
+                                    }
                                     continue;
                                 };
-                                shares.push(KeyShareEntry::new(*group, started.pub_key()));
-                                if result.key_share.is_none() {
-                                    result.key_share = Some((group_impl, started));
+                                if let Some((hybrid, _)) = started.as_hybrid_checked(
+                                    &config.provider().kx_groups,
+                                    ProtocolVersion::TLSv1_3,
+                                ) {
+                                    let (component_group, component_share) = hybrid.component();
+                                    component_shares
+                                        .push((component_group, component_share.to_vec()));
                                 }
+                                shares.push(KeyShareEntry::new(*group, started.pub_key()));
+                                tracked_shares.push((group_impl, started));
                             }
                         }
                     }
 
                     if shares.is_empty() {
-                        return Err(());
+                        return Err(CraftExtensionError::Skip);
                     }
+                    result.key_shares = tracked_shares;
                     CraftClientExtension::encoded(ExtensionType::KeyShare, &shares)
                 }
             }
@@ -693,16 +976,26 @@ impl CraftExtension {
                         .remove(&ExtensionType::CompressCertificate)
                         .ok_or(())?
                 } else {
-                    if craft_config.strict_mode {
-                        let offered = hello
-                            .certificate_compression_algorithms
-                            .as_deref()
-                            .unwrap_or_default();
-                        assert_eq!(offered, *algorithms);
+                    let missing_algorithms = algorithms
+                        .iter()
+                        .copied()
+                        .filter(|algorithm| {
+                            !config
+                                .cert_decompressors
+                                .iter()
+                                .any(|decompressor| decompressor.algorithm() == *algorithm)
+                        })
+                        .collect::<Vec<_>>();
+                    if !missing_algorithms.is_empty() {
+                        return Err(CraftExtensionError::Fatal(Error::General(format!(
+                            "craft fingerprint requires unsupported certificate compression algorithm(s): {missing_algorithms:?}"
+                        ))));
                     }
-                    store
-                        .remove(&ExtensionType::CompressCertificate)
-                        .ok_or(())?
+
+                    CraftClientExtension::raw(
+                        ExtensionType::CompressCertificate,
+                        encode_certificate_compression_algorithms(algorithms),
+                    )
                 }
             }
             Self::Padding => {
@@ -1076,6 +1369,15 @@ pub struct Fingerprint {
     pub extensions: &'static [ExtensionSpec],
     pub shuffle_extensions: bool,
     pub cipher: &'static [GreaseOrCipher],
+    pub ech_force_tls13: Option<bool>,
+    pub ech_padding_style: EchPaddingStyle,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum EchPaddingStyle {
+    #[default]
+    Standard,
+    Nss,
 }
 
 impl Fingerprint {
@@ -1089,6 +1391,9 @@ impl Fingerprint {
             override_keyshare: true,
             override_cert_compress: true,
             override_suite: true,
+            ech_force_tls13: self.ech_force_tls13,
+            ech_padding_style: self.ech_padding_style,
+            validation_error: None,
         }
     }
 
@@ -1124,13 +1429,21 @@ impl Fingerprint {
 
             let extension = match spec {
                 ExtensionSpec::Craft(ext) => {
-                    let Ok((ext, patch_result)) =
-                        ext.to_wire_extension(data, config, &mut store, hello, hrr)
-                    else {
-                        continue;
+                    let (ext, patch_result) =
+                        match ext.to_wire_extension(data, config, &mut store, hello, hrr) {
+                            Ok(result) => result,
+                            Err(CraftExtensionError::Skip) => continue,
+                            Err(CraftExtensionError::Fatal(error)) => {
+                                result.error = Some(error);
+                                break;
+                            }
+                        };
+                    if patch_result.error.is_some() {
+                        result.error = patch_result.error;
+                        break;
                     };
-                    if result.key_share.is_none() {
-                        result.key_share = patch_result.key_share;
+                    if result.key_shares.is_empty() {
+                        result.key_shares = patch_result.key_shares;
                     }
                     ext
                 }
@@ -1196,6 +1509,9 @@ pub struct FingerprintBuilder {
     override_keyshare: bool,
     override_cert_compress: bool,
     override_suite: bool,
+    ech_force_tls13: Option<bool>,
+    ech_padding_style: EchPaddingStyle,
+    validation_error: Option<String>,
 }
 
 impl FingerprintBuilder {
@@ -1229,6 +1545,20 @@ impl FingerprintBuilder {
         self
     }
 
+    pub fn ech_force_tls13(&self) -> Option<bool> {
+        self.ech_force_tls13
+    }
+
+    pub fn with_ech_force_tls13(mut self, ech_force_tls13: bool) -> Self {
+        self.ech_force_tls13 = Some(ech_force_tls13);
+        self
+    }
+
+    pub fn with_ech_padding_style(mut self, ech_padding_style: EchPaddingStyle) -> Self {
+        self.ech_padding_style = ech_padding_style;
+        self
+    }
+
     pub fn dangerous_craft_test_mode(mut self) -> Self {
         self.strict_mode = false;
         self.override_alpn = false;
@@ -1241,7 +1571,7 @@ impl FingerprintBuilder {
         CraftOptions(Some(self))
     }
 
-    pub(crate) fn patch_config(self, mut config: ClientConfig) -> ClientConfig {
+    pub(crate) fn patch_config(mut self, mut config: ClientConfig) -> ClientConfig {
         for ext in self.fingerprint.extensions.iter() {
             match ext {
                 ExtensionSpec::Craft(CraftExtension::SupportedCurves(curves)) => {
@@ -1252,21 +1582,32 @@ impl FingerprintBuilder {
                     let mut provider = config.provider().as_ref().clone();
                     let mut kx_groups = provider.kx_groups.to_vec();
                     let mut grease_offset = 0;
+                    let mut missing_offset = 0;
                     for (idx, curve) in curves.iter().enumerate() {
                         match curve {
                             Grease => {
                                 grease_offset += 1;
                             }
                             GreaseOr::T(curve) => {
+                                let desired_idx = idx - grease_offset - missing_offset;
                                 if let Some(old_idx) = kx_groups
                                     .iter()
                                     .position(|v| v.name() == *curve)
                                 {
-                                    if idx - grease_offset != old_idx {
-                                        kx_groups.swap(idx - grease_offset, old_idx);
+                                    if desired_idx != old_idx {
+                                        kx_groups.swap(desired_idx, old_idx);
                                     }
                                 } else {
-                                    kx_groups.insert(idx - grease_offset, to_fake_curves(curve));
+                                    missing_offset += 1;
+                                    if let Some(group) =
+                                        to_missing_kx_group(curve, provider.secure_random)
+                                    {
+                                        kx_groups.push(group);
+                                    } else if self.strict_mode {
+                                        self.validation_error = Some(format!(
+                                            "craft fingerprint requires unsupported named group {curve:?}"
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -1312,6 +1653,14 @@ impl FingerprintBuilder {
     }
 }
 
+impl CraftOptions {
+    pub(crate) fn ech_padding_style(&self) -> EchPaddingStyle {
+        self.get()
+            .map(|builder| builder.ech_padding_style)
+            .unwrap_or_default()
+    }
+}
+
 pub struct FingerprintSet {
     pub main: Fingerprint,
     pub test_alpn_http1: Fingerprint,
@@ -1348,7 +1697,7 @@ enum CraftClientExtensionPayload {
 }
 
 impl CraftClientExtension {
-    fn raw(typ: ExtensionType, payload: Vec<u8>) -> Self {
+    pub(crate) fn raw(typ: ExtensionType, payload: Vec<u8>) -> Self {
         Self {
             typ,
             payload: CraftClientExtensionPayload::Raw(payload),
@@ -1373,6 +1722,13 @@ impl CraftClientExtension {
 
     pub(crate) fn extension_type(&self) -> ExtensionType {
         self.typ
+    }
+
+    pub(crate) fn raw_payload(&self) -> Option<&[u8]> {
+        match &self.payload {
+            CraftClientExtensionPayload::Raw(payload) => Some(payload),
+            CraftClientExtensionPayload::Padding(_) => None,
+        }
     }
 
     fn payload_len(&self) -> usize {
