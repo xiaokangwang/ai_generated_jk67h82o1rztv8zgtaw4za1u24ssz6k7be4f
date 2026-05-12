@@ -1087,6 +1087,140 @@ fn craft_chrome_148_real_ech_inner_matches_boringssl_shape() {
     );
 }
 
+#[cfg(all(feature = "brotli", feature = "zlib", feature = "zstd"))]
+#[test]
+fn craftlsmaxxing_emits_https_safe_maximal_shuffled_surface() {
+    let config = ClientConfig::builder(Arc::new(CRAFTLSMAXXING_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap()
+        .with_fingerprint(crate::craft::CRAFTLSMAXXING.builder());
+    let (_, wire) = client_hello_sent_for_config_with_wire(config).unwrap();
+    let raw = RawClientHello::parse(&wire);
+
+    assert!(crate::craft::CRAFTLSMAXXING.shuffle_extensions);
+    assert_eq!(raw.cipher_suites.len(), 10);
+    assert!(is_grease_u16(u16::from(raw.cipher_suites[0])));
+    assert!(
+        raw.cipher_suites
+            .contains(&CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
+    );
+
+    let extension_types = raw.extension_types();
+    assert!(is_grease_u16(u16::from(extension_types[0])));
+    assert_eq!(*extension_types.last().unwrap(), ExtensionType::Padding);
+    for (idx, ext) in extension_types.iter().enumerate() {
+        assert!(
+            !extension_types[..idx].contains(ext),
+            "duplicate extension {ext:?}"
+        );
+    }
+
+    for ext in [
+        ExtensionType::ServerName,
+        ExtensionType::ExtendedMasterSecret,
+        ExtensionType::RenegotiationInfo,
+        ExtensionType::EllipticCurves,
+        ExtensionType::ECPointFormats,
+        ExtensionType::SessionTicket,
+        ExtensionType::StatusRequest,
+        ExtensionType::SignatureAlgorithms,
+        ExtensionType::SignatureAlgorithmsCert,
+        ExtensionType::ALProtocolNegotiation,
+        ExtensionType::SCT,
+        ExtensionType::DelegatedCredential,
+        ExtensionType::KeyShare,
+        ExtensionType::PSKKeyExchangeModes,
+        ExtensionType::SupportedVersions,
+        ExtensionType::CompressCertificate,
+        ExtensionType::EncryptedClientHello,
+        ExtensionType::RecordSizeLimit,
+        ExtensionType::PostHandshakeAuth,
+        ExtensionType::CertificateAuthorities,
+        ExtensionType::ApplicationSettingsOld,
+        ExtensionType::ApplicationSettings,
+        ExtensionType::Padding,
+    ] {
+        assert!(extension_types.contains(&ext), "missing extension {ext:?}");
+    }
+    for ext in [
+        ExtensionType::ClientCertificateType,
+        ExtensionType::ServerCertificateType,
+        ExtensionType::UseSRTP,
+        ExtensionType::NextProtocolNegotiation,
+        ExtensionType::ChannelId,
+        ExtensionType::TransportParameters,
+        ExtensionType::QuicTransportParametersLegacy,
+        ExtensionType::TrustAnchors,
+        ExtensionType::Pake,
+    ] {
+        assert!(
+            !extension_types.contains(&ext),
+            "HTTPS-safe maxxing fingerprint should not emit {ext:?}"
+        );
+    }
+
+    let protocols = decode_alpn_protocols(raw.extension(ExtensionType::ALProtocolNegotiation));
+    assert_eq!(protocols.len(), 3);
+    assert_eq!(protocols[0].len(), 2);
+    assert!(is_grease_u16(u16::from_be_bytes([
+        protocols[0][0],
+        protocols[0][1]
+    ])));
+    assert_eq!(protocols[1], b"h2");
+    assert_eq!(protocols[2], b"http/1.1");
+
+    let groups = decode_u16_list(raw.extension(ExtensionType::EllipticCurves))
+        .into_iter()
+        .map(NamedGroup)
+        .collect::<Vec<_>>();
+    assert!(is_grease_u16(u16::from(groups[0])));
+    for group in [
+        NamedGroup::X25519MLKEM768,
+        NamedGroup::X25519,
+        NamedGroup::secp256r1,
+        NamedGroup::secp384r1,
+        NamedGroup::secp521r1,
+        NamedGroup::FFDHE2048,
+        NamedGroup::FFDHE8192,
+    ] {
+        assert!(groups.contains(&group), "missing group {group:?}");
+    }
+
+    let key_shares = decode_key_shares(raw.extension(ExtensionType::KeyShare));
+    assert!(is_grease_u16(u16::from(key_shares[0].0)));
+    assert!(
+        key_shares
+            .iter()
+            .any(|(group, _)| *group == NamedGroup::X25519MLKEM768)
+    );
+    assert!(
+        key_shares
+            .iter()
+            .any(|(group, _)| *group == NamedGroup::FFDHE8192)
+    );
+
+    let sigalgs = decode_u16_list(raw.extension(ExtensionType::SignatureAlgorithms));
+    assert!(is_grease_u16(sigalgs[0]));
+    assert!(sigalgs.contains(&u16::from(SignatureScheme::ML_DSA_87)));
+
+    let authorities =
+        decode_certificate_authorities(raw.extension(ExtensionType::CertificateAuthorities));
+    assert_eq!(authorities.len(), 16);
+    for authority in authorities {
+        assert_eq!(authority.len(), 32);
+        assert!(
+            authority.iter().all(|byte| byte.is_ascii_alphanumeric()
+                || matches!(*byte, b'\\' | b'.' | b'-')),
+            "certificate authority name contains bytes outside the craftlsmaxxing alphabet"
+        );
+    }
+
+    let (_, _, _, _, ech_payload) =
+        decode_ech_outer_payload(raw.extension(ExtensionType::EncryptedClientHello));
+    assert!((144..=240).contains(&ech_payload.len()));
+}
+
 #[test]
 fn craft_can_emit_boringssl_and_nss_extension_surface() {
     let extensions = Box::leak(
@@ -2570,6 +2704,21 @@ fn decode_alpn_protocols(payload: &[u8]) -> Vec<Vec<u8>> {
     protocols
 }
 
+fn decode_certificate_authorities(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut offset = 0;
+    let len = take_u16(payload, &mut offset) as usize;
+    assert_eq!(payload.len(), offset + len);
+    let end = offset + len;
+
+    let mut authorities = Vec::new();
+    while offset < end {
+        let authority_len = take_u16(payload, &mut offset) as usize;
+        authorities.push(take(payload, &mut offset, authority_len).to_vec());
+    }
+
+    authorities
+}
+
 fn decode_u8_prefixed_u16_list(payload: &[u8]) -> Vec<u16> {
     let mut offset = 0;
     let len = take_u8(payload, &mut offset) as usize;
@@ -2652,6 +2801,17 @@ const CRAFT_CHROME_148_PROVIDER: CryptoProvider = CryptoProvider {
     ..TEST_PROVIDER
 };
 
+const CRAFTLSMAXXING_PROVIDER: CryptoProvider = CryptoProvider {
+    kx_groups: Cow::Borrowed(&[
+        FAKE_X25519_MLKEM768_KX_GROUP,
+        FAKE_X25519_KX_GROUP,
+        FAKE_SECP256R1_KX_GROUP,
+        FAKE_SECP384R1_KX_GROUP,
+        FAKE_SECP521R1_KX_GROUP,
+    ]),
+    ..TEST_PROVIDER
+};
+
 #[derive(Debug)]
 struct IncrementingRandom;
 
@@ -2696,6 +2856,7 @@ const FAKE_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup(0x
 const FAKE_X25519_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::X25519);
 const FAKE_SECP256R1_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::secp256r1);
 const FAKE_SECP384R1_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::secp384r1);
+const FAKE_SECP521R1_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::secp521r1);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FakeHybrid {

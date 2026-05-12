@@ -14,7 +14,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{ArgAction, Parser};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
-use hyper::header::{ACCEPT_ENCODING, USER_AGENT};
+use hyper::header::{ACCEPT_ENCODING, CONTENT_LENGTH, USER_AGENT};
 use hyper::{Method, Request, Uri};
 use rustls::client::{EchConfig, EchMode};
 use rustls::pki_types::{EchConfigListBytes, ServerName};
@@ -32,6 +32,7 @@ const FINGERPRINTS: &[&str] = &[
     "chrome_112",
     "chromium_144",
     "chrome_148",
+    "craftlsmaxxing",
     "firefox_105",
     "firefox_140",
     "safari_17_1",
@@ -77,6 +78,10 @@ struct Args {
     #[arg(long = "list-fps")]
     list_fps: bool,
 
+    /// Read the full HTTP response body instead of only the first 2048 bytes.
+    #[arg(long = "full-body")]
+    full_body: bool,
+
     /// URL to fetch.
     url: Option<String>,
 }
@@ -103,6 +108,7 @@ struct Input {
     send_sni: bool,
     ech_enabled: bool,
     ech_force_tls13: bool,
+    full_body: bool,
 }
 
 #[derive(Serialize)]
@@ -161,6 +167,7 @@ fn main() -> Result<()> {
         send_sni,
         ech_enabled,
         ech_force_tls13,
+        full_body: args.full_body,
     };
 
     let summary = match http_get(
@@ -171,6 +178,7 @@ fn main() -> Result<()> {
         input.send_sni,
         ech_config_list,
         ech_force_tls13,
+        body_read_mode(input.full_body),
     ) {
         Ok(output) => Summary {
             input,
@@ -199,6 +207,7 @@ fn http_get(
     send_sni: bool,
     ech_config_list: Option<EchConfigListBytes<'static>>,
     ech_force_tls13: bool,
+    body_read_mode: BodyReadMode,
 ) -> Result<Output> {
     let mut config = build_client_config(fingerprint, send_sni, ech_config_list, ech_force_tls13)?;
     config.enable_sni = send_sni;
@@ -220,14 +229,14 @@ fn http_get(
         .alpn_protocol()
         .map(|protocol| String::from_utf8_lossy(protocol.as_ref()).into_owned())
         .unwrap_or_default();
-    let application_settings_negotiated = conn.application_settings_negotiated();
     let (status_code, body) = match alpn.as_str() {
-        "h2" => read_http2_response(conn, sock, uri, application_settings_negotiated)
-            .context("HTTP/2 request failed")?,
+        "h2" => {
+            read_http2_response(conn, sock, uri, body_read_mode).context("HTTP/2 request failed")?
+        }
         "" | "http/1.1" => {
             let mut tls = Stream::new(&mut conn, &mut sock);
             write_http1_request(&mut tls, uri)?;
-            read_http1_response(&mut tls)?
+            read_http1_response(&mut tls, body_read_mode)?
         }
         _ => bail!("unsupported ALPN {alpn:?}"),
     };
@@ -329,7 +338,7 @@ fn read_http2_response(
     conn: rustls::ClientConnection,
     sock: StdTcpStream,
     uri: &Url,
-    application_settings_negotiated: bool,
+    body_read_mode: BodyReadMode,
 ) -> Result<(u16, Vec<u8>)> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -339,7 +348,7 @@ fn read_http2_response(
         conn,
         sock,
         uri.clone(),
-        application_settings_negotiated,
+        body_read_mode,
     ))
 }
 
@@ -347,7 +356,7 @@ async fn read_http2_response_async(
     conn: rustls::ClientConnection,
     sock: StdTcpStream,
     uri: Url,
-    application_settings_negotiated: bool,
+    body_read_mode: BodyReadMode,
 ) -> Result<(u16, Vec<u8>)> {
     sock.set_nonblocking(true)?;
     let sock = tokio::net::TcpStream::from_std(sock)?;
@@ -355,9 +364,17 @@ async fn read_http2_response_async(
         conn,
         sock,
         pending_plaintext: Vec::new(),
-        h2_alps_filter: H2AlpsWriteFilter::new(application_settings_negotiated),
+        // Hyper's h2 state machine is not ALPS-aware, so keep the normal client
+        // preface and SETTINGS even when TLS negotiated application settings.
+        h2_alps_filter: H2AlpsWriteFilter::new(false),
     };
-    let (mut sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor, io).await?;
+    let mut h2_builder = hyper::client::conn::http2::Builder::new(TokioExecutor);
+    // Hyper's larger default flow-control windows make some fingerprinting endpoints close
+    // after response headers. The RFC default window is more broadly tolerated.
+    h2_builder
+        .initial_stream_window_size(65_535)
+        .initial_connection_window_size(65_535);
+    let (mut sender, connection) = h2_builder.handshake(io).await?;
     let connection_task = tokio::task::spawn(async move { connection.await });
 
     let request = Request::builder()
@@ -368,16 +385,32 @@ async fn read_http2_response_async(
         .body(EmptyBody)?;
     let response = sender.send_request(request).await?;
     let status = response.status().as_u16();
-    let body = read_http2_body(response.into_body()).await?;
+    let body_len = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .or_else(|| {
+            response
+                .body()
+                .size_hint()
+                .exact()
+                .and_then(|len| usize::try_from(len).ok())
+        });
+    let body = read_http2_body(response.into_body(), body_read_mode, body_len).await?;
     connection_task.abort();
 
     Ok((status, body))
 }
 
-async fn read_http2_body(body: Incoming) -> Result<Vec<u8>> {
+async fn read_http2_body(
+    body: Incoming,
+    body_read_mode: BodyReadMode,
+    body_len: Option<usize>,
+) -> Result<Vec<u8>> {
     let mut body = Box::pin(body);
     let mut output = Vec::new();
-    while output.len() < MAX_BODY_BYTES {
+    while should_continue_http2_body_read(body_read_mode, body_len, output.len()) {
         let Some(frame) = poll_fn(|cx| body.as_mut().poll_frame(cx)).await else {
             break;
         };
@@ -385,10 +418,53 @@ async fn read_http2_body(body: Incoming) -> Result<Vec<u8>> {
         let Some(data) = frame.data_ref() else {
             continue;
         };
-        let remaining = MAX_BODY_BYTES - output.len();
+        let mode_remaining = body_read_mode
+            .remaining(output.len())
+            .unwrap_or(0);
+        let remaining = body_len
+            .and_then(|len| len.checked_sub(output.len()))
+            .map(|len| len.min(mode_remaining))
+            .unwrap_or(mode_remaining);
         output.extend_from_slice(&data[..data.len().min(remaining)]);
     }
     Ok(output)
+}
+
+fn should_continue_http2_body_read(
+    body_read_mode: BodyReadMode,
+    body_len: Option<usize>,
+    current_len: usize,
+) -> bool {
+    body_read_mode.should_continue(current_len) && body_len.is_none_or(|len| current_len < len)
+}
+
+#[derive(Clone, Copy)]
+enum BodyReadMode {
+    Head { max_bytes: usize },
+    Full,
+}
+
+fn body_read_mode(full_body: bool) -> BodyReadMode {
+    match full_body {
+        true => BodyReadMode::Full,
+        false => BodyReadMode::Head {
+            max_bytes: MAX_BODY_BYTES,
+        },
+    }
+}
+
+impl BodyReadMode {
+    fn remaining(self, current_len: usize) -> Option<usize> {
+        match self {
+            Self::Full => Some(usize::MAX),
+            Self::Head { max_bytes } => max_bytes.checked_sub(current_len),
+        }
+    }
+
+    fn should_continue(self, current_len: usize) -> bool {
+        self.remaining(current_len)
+            .is_some_and(|remaining| remaining > 0)
+    }
 }
 
 fn hyper_uri(uri: &Url) -> Result<Uri> {
@@ -397,7 +473,10 @@ fn hyper_uri(uri: &Url) -> Result<Uri> {
         .with_context(|| format!("failed to convert URL to hyper URI: {uri}"))
 }
 
-fn read_http1_response(reader: &mut impl BufRead) -> Result<(u16, Vec<u8>)> {
+fn read_http1_response(
+    reader: &mut impl BufRead,
+    body_read_mode: BodyReadMode,
+) -> Result<(u16, Vec<u8>)> {
     let mut status_line = String::new();
     if reader.read_line(&mut status_line)? == 0 {
         bail!("server closed before sending an HTTP response");
@@ -432,21 +511,22 @@ fn read_http1_response(reader: &mut impl BufRead) -> Result<(u16, Vec<u8>)> {
                 .split(',')
                 .any(|part| part.trim() == "chunked")
     }) {
-        read_chunked_body(reader).map(|body| (status_code, body))
+        read_chunked_body(reader, body_read_mode).map(|body| (status_code, body))
     } else if let Some(content_length) = headers
         .iter()
         .find(|(name, _)| name == "content-length")
         .and_then(|(_, value)| value.parse::<usize>().ok())
     {
-        read_known_length_body(reader, content_length).map(|body| (status_code, body))
+        read_known_length_body(reader, content_length, body_read_mode)
+            .map(|body| (status_code, body))
     } else {
-        read_until_eof_body(reader).map(|body| (status_code, body))
+        read_until_eof_body(reader, body_read_mode).map(|body| (status_code, body))
     }
 }
 
-fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+fn read_chunked_body(reader: &mut impl BufRead, body_read_mode: BodyReadMode) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-    while body.len() < MAX_BODY_BYTES {
+    while body_read_mode.should_continue(body.len()) {
         let mut size_line = String::new();
         if reader.read_line(&mut size_line)? == 0 {
             bail!("server closed while sending a chunked body");
@@ -461,7 +541,9 @@ fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>> {
             break;
         }
 
-        let remaining = MAX_BODY_BYTES - body.len();
+        let remaining = body_read_mode
+            .remaining(body.len())
+            .unwrap_or(0);
         let take = size.min(remaining);
         let mut chunk = vec![0u8; take];
         reader.read_exact(&mut chunk)?;
@@ -476,17 +558,32 @@ fn read_chunked_body(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn read_known_length_body(reader: &mut impl Read, content_length: usize) -> Result<Vec<u8>> {
-    let mut body = vec![0u8; content_length.min(MAX_BODY_BYTES)];
+fn read_known_length_body(
+    reader: &mut impl Read,
+    content_length: usize,
+    body_read_mode: BodyReadMode,
+) -> Result<Vec<u8>> {
+    let read_len = match body_read_mode {
+        BodyReadMode::Full => content_length,
+        BodyReadMode::Head { max_bytes } => content_length.min(max_bytes),
+    };
+    let mut body = vec![0u8; read_len];
     reader.read_exact(&mut body)?;
     Ok(body)
 }
 
-fn read_until_eof_body(reader: &mut impl Read) -> Result<Vec<u8>> {
+fn read_until_eof_body(reader: &mut impl Read, body_read_mode: BodyReadMode) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-    reader
-        .take(MAX_BODY_BYTES as u64)
-        .read_to_end(&mut body)?;
+    match body_read_mode {
+        BodyReadMode::Full => {
+            reader.read_to_end(&mut body)?;
+        }
+        BodyReadMode::Head { max_bytes } => {
+            reader
+                .take(max_bytes as u64)
+                .read_to_end(&mut body)?;
+        }
+    }
     Ok(body)
 }
 
@@ -597,11 +694,20 @@ impl TokioTlsIo {
             };
 
             let mut record = &tls_record[..read];
-            let consumed = self.conn.read_tls(&mut record)?;
-            self.conn
-                .process_new_packets()
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            return Poll::Ready(Ok(consumed));
+            let mut consumed_total = 0;
+            // rustls may intentionally consume only part of this slice per read_tls call.
+            // Feed the whole TCP read into the deframer before returning to hyper.
+            while !record.is_empty() {
+                let consumed = self.conn.read_tls(&mut record)?;
+                if consumed == 0 {
+                    break;
+                }
+                consumed_total += consumed;
+                self.conn
+                    .process_new_packets()
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            }
+            return Poll::Ready(Ok(consumed_total));
         }
     }
 }
@@ -808,6 +914,9 @@ fn fingerprint_builder(name: &str) -> Option<craft::FingerprintBuilder> {
         "chrome_148" | "chromium_148" | "hellochrome_148" | "hellochromium_148" => {
             Some(craft::CHROME_148.builder())
         }
+        "craftlsmaxxing" | "craftmaxxing" | "hellocraftlsmaxxing" => {
+            Some(craft::CRAFTLSMAXXING.builder())
+        }
         "firefox" | "hellofirefox_auto" | "firefox_105" | "hellofirefox_105" => Some(
             craft::FIREFOX_105
                 .test_alpn_http1
@@ -911,6 +1020,8 @@ mod tests {
         assert!(fingerprint_builder("chromium_144").is_some());
         assert!(fingerprint_builder("chrome_148").is_some());
         assert!(fingerprint_builder("chromium_148").is_some());
+        assert!(fingerprint_builder("craftlsmaxxing").is_some());
+        assert!(fingerprint_builder("craftmaxxing").is_some());
         assert!(fingerprint_builder("hellofirefox_105").is_some());
         assert!(fingerprint_builder("firefox_140").is_some());
         assert!(fingerprint_builder("hellosafari_17_1").is_some());
@@ -970,6 +1081,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_full_body_flag() {
+        let args = Args::try_parse_from(["craftget", "https://example.com/"]).unwrap();
+        assert!(!args.full_body);
+
+        let args =
+            Args::try_parse_from(["craftget", "--full-body", "https://example.com/"]).unwrap();
+        assert!(args.full_body);
+    }
+
+    #[test]
+    fn http2_body_read_respects_content_length() {
+        assert!(should_continue_http2_body_read(
+            BodyReadMode::Full,
+            Some(11),
+            10
+        ));
+        assert!(!should_continue_http2_body_read(
+            BodyReadMode::Full,
+            Some(11),
+            11
+        ));
+        assert!(!should_continue_http2_body_read(
+            BodyReadMode::Head { max_bytes: 5 },
+            Some(11),
+            5
+        ));
+    }
+
+    #[test]
     fn decodes_ech_key_text() {
         let raw = include_bytes!("../../rustls/tests/data/localhost-echconfigs.bin");
         let encoded = BASE64.encode(raw);
@@ -1007,10 +1147,29 @@ mod tests {
     #[test]
     fn reads_content_length_response() {
         let mut response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nhello".as_slice();
-        let (status, body) = read_http1_response(&mut response).unwrap();
+        let (status, body) = read_http1_response(&mut response, body_read_mode(false)).unwrap();
 
         assert_eq!(status, 404);
         assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn reads_only_body_head_by_default() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world".as_slice();
+        let (status, body) =
+            read_http1_response(&mut response, BodyReadMode::Head { max_bytes: 5 }).unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn reads_full_content_length_response_when_requested() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world".as_slice();
+        let (status, body) = read_http1_response(&mut response, BodyReadMode::Full).unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello world");
     }
 
     #[test]
@@ -1018,10 +1177,21 @@ mod tests {
         let mut response =
             b"HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
                 .as_slice();
-        let (status, body) = read_http1_response(&mut response).unwrap();
+        let (status, body) = read_http1_response(&mut response, body_read_mode(false)).unwrap();
 
         assert_eq!(status, 206);
         assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn reads_full_chunked_response_when_requested() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+                .as_slice();
+        let (status, body) = read_http1_response(&mut response, BodyReadMode::Full).unwrap();
+
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello world");
     }
 
     #[test]

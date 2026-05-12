@@ -331,6 +331,157 @@ pub static CHROME_148_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
     ]
 });
 
+/// A maximal craftls fingerprint that advertises the broadest extension surface
+/// that remains appropriate for ordinary HTTPS-over-TLS handshakes.
+///
+/// This is useful for stress-testing server tolerance without sending extensions
+/// which are QUIC-only, DTLS-only, PAKE-specific, or likely to require follow-up
+/// handshake messages that craftls does not currently synthesize.
+pub static CRAFTLSMAXXING_SIGNATURE_ALGO: LazyLock<Vec<GreaseOrSignatureScheme>> =
+    LazyLock::new(|| {
+        vec![
+            Grease,
+            SignatureScheme::ECDSA_NISTP256_SHA256.into(),
+            SignatureScheme::ECDSA_NISTP384_SHA384.into(),
+            SignatureScheme::ECDSA_NISTP521_SHA512.into(),
+            SignatureScheme::RSA_PSS_SHA256.into(),
+            SignatureScheme::RSA_PSS_SHA384.into(),
+            SignatureScheme::RSA_PSS_SHA512.into(),
+            SignatureScheme::RSA_PKCS1_SHA256.into(),
+            SignatureScheme::RSA_PKCS1_SHA384.into(),
+            SignatureScheme::RSA_PKCS1_SHA512.into(),
+            SignatureScheme::ED25519.into(),
+            SignatureScheme::ED448.into(),
+            SignatureScheme::SM2_SM3.into(),
+            SignatureScheme::ML_DSA_44.into(),
+            SignatureScheme::ML_DSA_65.into(),
+            SignatureScheme::ML_DSA_87.into(),
+            SignatureScheme::ECDSA_SHA1_Legacy.into(),
+            SignatureScheme::RSA_PKCS1_SHA1.into(),
+        ]
+    });
+
+/// The broadest key exchange group list craftls can currently advertise using
+/// the default aws-lc provider plus craftls' built-in FFDHE support.
+pub static CRAFTLSMAXXING_GROUPS: LazyLock<Vec<GreaseOrCurve>> = LazyLock::new(|| {
+    vec![
+        Grease,
+        NamedGroup::X25519MLKEM768.into(),
+        NamedGroup::X25519.into(),
+        NamedGroup::secp256r1.into(),
+        NamedGroup::secp384r1.into(),
+        NamedGroup::secp521r1.into(),
+        NamedGroup::FFDHE2048.into(),
+        NamedGroup::FFDHE3072.into(),
+        NamedGroup::FFDHE4096.into(),
+        NamedGroup::FFDHE6144.into(),
+        NamedGroup::FFDHE8192.into(),
+    ]
+});
+
+/// All cipher suites with implementations in the rustls ring/aws-lc providers,
+/// plus a GREASE value.
+pub static CRAFTLSMAXXING_CIPHER: LazyLock<Vec<GreaseOrCipher>> = LazyLock::new(|| {
+    vec![
+        GreaseOrCipher::Grease,
+        CipherSuite::TLS13_AES_128_GCM_SHA256.into(),
+        CipherSuite::TLS13_AES_256_GCM_SHA384.into(),
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256.into(),
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.into(),
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.into(),
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256.into(),
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.into(),
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384.into(),
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.into(),
+    ]
+});
+
+pub static CRAFTLSMAXXING_EXT: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
+    use ExtensionSpec::*;
+    use KeepExtension::*;
+    vec![
+        Craft(CraftExtension::Grease1),
+        Keep(Must(ExtensionType::ServerName)),
+        Rustls(ClientExtension::ExtendedMasterSecretRequest),
+        Craft(CraftExtension::RenegotiationInfo),
+        Craft(CraftExtension::SupportedCurves(&CRAFTLSMAXXING_GROUPS)),
+        Rustls(ClientExtension::EcPointFormats(vec![
+            ECPointFormat::Uncompressed,
+        ])),
+        Keep(OrDefault(
+            ExtensionType::SessionTicket,
+            default_rustls_session_ticket(),
+        )),
+        Rustls(ClientExtension::CertificateStatusRequest(ocsp_req())),
+        Craft(CraftExtension::SignatureAlgorithms(
+            &CRAFTLSMAXXING_SIGNATURE_ALGO,
+        )),
+        Craft(CraftExtension::SignatureAlgorithmsCert(
+            &CRAFTLSMAXXING_SIGNATURE_ALGO,
+        )),
+        Craft(CraftExtension::ProtocolsWithGrease(static_ref!(
+            &[
+                GreaseOrProtocol::Grease,
+                GreaseOrProtocol::Protocol(b"h2"),
+                GreaseOrProtocol::Protocol(b"http/1.1"),
+            ],
+            &[GreaseOrProtocol]
+        ))),
+        Craft(CraftExtension::SignedCertificateTimestamp),
+        Craft(CraftExtension::DelegatedCredentials(
+            &CRAFTLSMAXXING_SIGNATURE_ALGO,
+        )),
+        Craft(CraftExtension::KeyShare(&CRAFTLSMAXXING_GROUPS)),
+        Craft(CraftExtension::PresharedKeyModes(static_ref!(
+            &[
+                GreaseOrPskKeyExchangeMode::Grease,
+                GreaseOrPskKeyExchangeMode::T(PSKKeyExchangeMode::PSK_DHE_KE),
+            ],
+            &[GreaseOrPskKeyExchangeMode]
+        ))),
+        Craft(CraftExtension::SupportedVersions(static_ref!(
+            &[
+                Grease,
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_3),
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_2),
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_1),
+                GreaseOrVersion::T(ProtocolVersion::TLSv1_0),
+            ],
+            &[GreaseOrVersion]
+        ))),
+        Craft(CraftExtension::CompressCert(static_ref!(
+            &[
+                CertificateCompressionAlgorithm::Zlib,
+                CertificateCompressionAlgorithm::Brotli,
+                CertificateCompressionAlgorithm::Zstd,
+            ],
+            &[CertificateCompressionAlgorithm]
+        ))),
+        Craft(CraftExtension::BoringSslEchGrease {
+            aead: HpkeAead::AES_128_GCM,
+        }),
+        Craft(CraftExtension::RecordSizeLimit(0x4001)),
+        Craft(CraftExtension::PostHandshakeAuth),
+        Craft(CraftExtension::RandomPrintableCertificateAuthorities {
+            count: 16,
+            name_len: 32,
+        }),
+        Craft(CraftExtension::ApplicationSettings {
+            codepoint: ApplicationSettingsCodepoint::Old,
+            protocols: &[b"h2"],
+        }),
+        Craft(CraftExtension::ApplicationSettings {
+            codepoint: ApplicationSettingsCodepoint::New,
+            protocols: &[b"h2"],
+        }),
+        Keep(Optional(ExtensionType::EarlyData)),
+        Keep(Optional(ExtensionType::Cookie)),
+        Craft(CraftExtension::Grease2),
+        Craft(CraftExtension::Raw(ExtensionType::Padding, &[])),
+        Keep(Optional(ExtensionType::PreSharedKey)),
+    ]
+});
+
 /// The extension list of chrome 108
 pub(crate) static EXT_TEST: LazyLock<Vec<ExtensionSpec>> = LazyLock::new(|| {
     use ExtensionSpec::*;
@@ -429,6 +580,11 @@ define_fingerprint!(CHROME_108 { &CHROME_108_EXT, &CHROME_CIPHER });
 define_fingerprint!(CHROME_112 { shuffle(&CHROME_108_EXT), &CHROME_CIPHER });
 define_fingerprint!(CHROMIUM_144 { shuffle(&CHROMIUM_144_EXT), &CHROME_CIPHER });
 define_fingerprint!(CHROME_148 { shuffle(&CHROME_148_EXT), &CHROME_CIPHER });
+define_fingerprint!(CRAFTLSMAXXING {
+    shuffle(&CRAFTLSMAXXING_EXT),
+    &CRAFTLSMAXXING_CIPHER,
+    ech_force_tls13: false
+});
 define_fingerprint!(RUSTLS_TEST { &EXT_TEST, &CHROME_CIPHER });
 
 /// The cipher list of Safari 17.1

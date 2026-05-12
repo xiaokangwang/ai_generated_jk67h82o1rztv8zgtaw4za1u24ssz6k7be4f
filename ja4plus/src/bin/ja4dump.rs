@@ -363,15 +363,23 @@ fn decode_extension(extension_type: u16, payload: &[u8]) -> Result<Vec<String>> 
         0x000a => decode_supported_groups(payload),
         0x000b => decode_ec_point_formats(payload),
         0x000d => decode_signature_algorithms(payload),
+        0x000e => decode_use_srtp(payload),
         0x0010 => decode_alpn(payload),
-        0x0012 | 0x0017 | 0x0023 => Ok(empty_or_len(payload)),
+        0x0012 | 0x0017 | 0x0023 | 0x0031 | 0x3374 | 0x754f => Ok(empty_or_len(payload)),
+        0x0013 | 0x0014 => decode_certificate_types(payload),
+        0x0015 => Ok(decode_padding(payload)),
         0x001b => decode_compress_certificate(payload),
         0x001c => decode_record_size_limit(payload),
         0x0022 => decode_delegated_credentials(payload),
+        0x002f => decode_certificate_authorities(payload),
         0x002b => decode_supported_versions(payload),
         0x002d => decode_psk_key_exchange_modes(payload),
+        0x0032 => decode_signature_algorithms_cert(payload),
         0x0033 => decode_key_share(payload),
+        0x0039 | 0xffa5 => decode_quic_transport_parameters(payload),
         0x4469 | 0x44cd => decode_application_settings(payload),
+        0x8a3b => Ok(decode_opaque_payload(payload)),
+        0xca34 => decode_trust_anchors(payload),
         0xfe0d => decode_ech(payload),
         0xff01 => decode_renegotiation_info(payload),
         _ => Ok(vec![format!("payload: {} bytes", payload.len())]),
@@ -447,6 +455,37 @@ fn decode_signature_algorithms(payload: &[u8]) -> Result<Vec<String>> {
         .collect()
 }
 
+fn decode_signature_algorithms_cert(payload: &[u8]) -> Result<Vec<String>> {
+    decode_u16_vector(payload, 2, "signature_algorithms_cert")?
+        .into_iter()
+        .map(|scheme| Ok(format!("0x{scheme:04x} {}", signature_scheme_name(scheme))))
+        .collect()
+}
+
+fn decode_use_srtp(payload: &[u8]) -> Result<Vec<String>> {
+    let mut cursor = Cursor::new(payload);
+    let profiles = cursor.take_u16_len_prefixed("srtp_protection_profiles")?;
+    if profiles.len() % 2 != 0 {
+        bail!("srtp_protection_profiles has an odd byte length");
+    }
+
+    let mut lines = profiles
+        .chunks_exact(2)
+        .map(|chunk| {
+            let profile = u16::from_be_bytes([chunk[0], chunk[1]]);
+            format!("profile: 0x{profile:04x} {}", srtp_profile_name(profile))
+        })
+        .collect::<Vec<_>>();
+    let mki = cursor.take_u8_len_prefixed("mki")?;
+    if mki.is_empty() {
+        lines.push("mki: empty".to_owned());
+    } else {
+        lines.push(format!("mki: {}", hex_bytes(mki)));
+    }
+    cursor.finish()?;
+    Ok(lines)
+}
+
 fn decode_alpn(payload: &[u8]) -> Result<Vec<String>> {
     let mut cursor = Cursor::new(payload);
     let protocol_list = cursor.take_u16_len_prefixed("alpn_protocol_list")?;
@@ -479,6 +518,17 @@ fn decode_record_size_limit(payload: &[u8]) -> Result<Vec<String>> {
     Ok(vec![format!("{limit} bytes")])
 }
 
+fn decode_certificate_types(payload: &[u8]) -> Result<Vec<String>> {
+    let mut cursor = Cursor::new(payload);
+    let types = cursor.take_u8_len_prefixed("certificate_types")?;
+    let lines = types
+        .iter()
+        .map(|typ| format!("0x{typ:02x} {}", certificate_type_name(*typ)))
+        .collect();
+    cursor.finish()?;
+    Ok(lines)
+}
+
 fn decode_delegated_credentials(payload: &[u8]) -> Result<Vec<String>> {
     decode_u16_vector(payload, 2, "delegated_credentials algorithms")?
         .into_iter()
@@ -504,6 +554,23 @@ fn decode_psk_key_exchange_modes(payload: &[u8]) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+fn decode_certificate_authorities(payload: &[u8]) -> Result<Vec<String>> {
+    let mut cursor = Cursor::new(payload);
+    let authorities = cursor.take_u16_len_prefixed("certificate_authorities")?;
+    let mut authority_cursor = Cursor::new(authorities);
+    let mut lines = Vec::new();
+    while !authority_cursor.is_empty() {
+        let authority = authority_cursor.take_u16_len_prefixed("distinguished_name")?;
+        lines.push(format!(
+            "authority: {} bytes ({})",
+            authority.len(),
+            printable_bytes(authority)
+        ));
+    }
+    cursor.finish()?;
+    Ok(lines)
+}
+
 fn decode_key_share(payload: &[u8]) -> Result<Vec<String>> {
     let mut cursor = Cursor::new(payload);
     let shares = cursor.take_u16_len_prefixed("client_shares")?;
@@ -524,6 +591,54 @@ fn decode_key_share(payload: &[u8]) -> Result<Vec<String>> {
 
 fn decode_application_settings(payload: &[u8]) -> Result<Vec<String>> {
     decode_alpn(payload)
+}
+
+fn decode_quic_transport_parameters(payload: &[u8]) -> Result<Vec<String>> {
+    let mut cursor = Cursor::new(payload);
+    let mut lines = Vec::new();
+    while !cursor.is_empty() {
+        let id = cursor.take_quic_varint("transport_parameter_id")?;
+        let value_len = cursor.take_quic_varint("transport_parameter_value_len")?;
+        let value_len = usize::try_from(value_len).context("transport parameter too large")?;
+        let value = cursor.take(value_len, "transport_parameter_value")?;
+        lines.push(format!(
+            "0x{id:x} {}: {}",
+            quic_transport_parameter_name(id),
+            describe_quic_transport_parameter_value(value)
+        ));
+    }
+    Ok(lines)
+}
+
+fn decode_trust_anchors(payload: &[u8]) -> Result<Vec<String>> {
+    let mut cursor = Cursor::new(payload);
+    let anchors = cursor.take_u16_len_prefixed("trust_anchors")?;
+    let mut anchor_cursor = Cursor::new(anchors);
+    let mut lines = Vec::new();
+    while !anchor_cursor.is_empty() {
+        let anchor = anchor_cursor.take_u8_len_prefixed("trust_anchor")?;
+        lines.push(format!(
+            "anchor: {} bytes ({})",
+            anchor.len(),
+            printable_bytes(anchor)
+        ));
+    }
+    cursor.finish()?;
+    Ok(lines)
+}
+
+fn decode_opaque_payload(payload: &[u8]) -> Vec<String> {
+    if payload.is_empty() {
+        Vec::new()
+    } else if payload.len() <= 32 {
+        vec![format!(
+            "payload: {} bytes ({})",
+            payload.len(),
+            hex_bytes(payload)
+        )]
+    } else {
+        vec![format!("payload: {} bytes", payload.len())]
+    }
 }
 
 fn decode_ech(payload: &[u8]) -> Result<Vec<String>> {
@@ -562,6 +677,16 @@ fn decode_renegotiation_info(payload: &[u8]) -> Result<Vec<String>> {
             "renegotiated_connection: {}",
             hex_bytes(renegotiated_connection)
         )])
+    }
+}
+
+fn decode_padding(payload: &[u8]) -> Vec<String> {
+    if payload.is_empty() {
+        Vec::new()
+    } else if payload.iter().all(|byte| *byte == 0) {
+        vec![format!("{} zero bytes", payload.len())]
+    } else {
+        decode_opaque_payload(payload)
     }
 }
 
@@ -644,6 +769,16 @@ impl<'a> Cursor<'a> {
         self.take(len, name)
     }
 
+    fn take_quic_varint(&mut self, name: &str) -> Result<u64> {
+        let first = self.take_u8(name)?;
+        let len = 1usize << (first >> 6);
+        let mut value = u64::from(first & 0x3f);
+        for _ in 1..len {
+            value = (value << 8) | u64::from(self.take_u8(name)?);
+        }
+        Ok(value)
+    }
+
     fn finish(&self) -> Result<()> {
         if !self.is_empty() {
             bail!("{} trailing bytes", self.remaining());
@@ -716,6 +851,28 @@ fn printable_bytes(bytes: &[u8]) -> String {
 
 fn is_grease(value: u16) -> bool {
     value & 0x000f == 0x000a && value >> 8 == value & 0x00ff
+}
+
+fn is_grease_psk_key_exchange_mode(value: u8) -> bool {
+    value >= 0x0b && (value - 0x0b) % 0x1f == 0
+}
+
+fn is_quic_grease_transport_parameter(value: u64) -> bool {
+    value >= 0x1b && (value - 0x1b) % 0x1f == 0
+}
+
+fn describe_quic_transport_parameter_value(value: &[u8]) -> String {
+    if value.is_empty() {
+        "empty".to_owned()
+    } else if value.len() <= 8 {
+        let mut cursor = Cursor::new(value);
+        match cursor.take_quic_varint("transport_parameter_value") {
+            Ok(varint) if cursor.is_empty() => format!("varint {varint}"),
+            _ => format!("{} bytes ({})", value.len(), hex_bytes(value)),
+        }
+    } else {
+        format!("{} bytes ({})", value.len(), hex_bytes(value))
+    }
 }
 
 fn handshake_type_name(value: u8) -> &'static str {
@@ -792,8 +949,12 @@ fn extension_name(value: u16) -> &'static str {
         0x000a => "supported_groups",
         0x000b => "ec_point_formats",
         0x000d => "signature_algorithms",
+        0x000e => "use_srtp",
         0x0010 => "application_layer_protocol_negotiation",
         0x0012 => "signed_certificate_timestamp",
+        0x0013 => "client_certificate_type",
+        0x0014 => "server_certificate_type",
+        0x0015 => "padding",
         0x0017 => "extended_master_secret",
         0x001b => "compress_certificate",
         0x001c => "record_size_limit",
@@ -801,10 +962,19 @@ fn extension_name(value: u16) -> &'static str {
         0x0023 => "session_ticket",
         0x002b => "supported_versions",
         0x002d => "psk_key_exchange_modes",
+        0x002f => "certificate_authorities",
+        0x0031 => "post_handshake_auth",
+        0x0032 => "signature_algorithms_cert",
         0x0033 => "key_share",
+        0x0039 => "quic_transport_parameters",
+        0x3374 => "next_protocol_negotiation",
         0x4469 => "application_settings_old",
         0x44cd => "application_settings",
+        0x754f => "channel_id",
+        0x8a3b => "pake",
+        0xca34 => "trust_anchors",
         0xfe0d => "encrypted_client_hello",
+        0xffa5 => "quic_transport_parameters_legacy",
         0xff01 => "renegotiation_info",
         value if is_grease(value) => "GREASE",
         _ => "unknown",
@@ -860,9 +1030,18 @@ fn signature_scheme_name(value: u16) -> &'static str {
         0x0503 => "ecdsa_secp384r1_sha384",
         0x0601 => "rsa_pkcs1_sha512",
         0x0603 => "ecdsa_secp521r1_sha512",
+        0x0708 => "sm2sig_sm3",
         0x0804 => "rsa_pss_rsae_sha256",
         0x0805 => "rsa_pss_rsae_sha384",
         0x0806 => "rsa_pss_rsae_sha512",
+        0x0807 => "ed25519",
+        0x0808 => "ed448",
+        0x0809 => "rsa_pss_pss_sha256",
+        0x080a => "rsa_pss_pss_sha384",
+        0x080b => "rsa_pss_pss_sha512",
+        0x0904 => "mldsa44",
+        0x0905 => "mldsa65",
+        0x0906 => "mldsa87",
         value if is_grease(value) => "GREASE",
         _ => "unknown",
     }
@@ -888,6 +1067,50 @@ fn psk_key_exchange_mode_name(value: u8) -> &'static str {
     match value {
         0 => "psk_ke",
         1 => "psk_dhe_ke",
+        value if is_grease_psk_key_exchange_mode(value) => "GREASE",
+        _ => "unknown",
+    }
+}
+
+fn certificate_type_name(value: u8) -> &'static str {
+    match value {
+        0 => "x509",
+        2 => "raw_public_key",
+        _ => "unknown",
+    }
+}
+
+fn srtp_profile_name(value: u16) -> &'static str {
+    match value {
+        0x0001 => "SRTP_AES128_CM_HMAC_SHA1_80",
+        0x0002 => "SRTP_AES128_CM_HMAC_SHA1_32",
+        0x0005 => "SRTP_AEAD_AES_128_GCM",
+        0x0006 => "SRTP_AEAD_AES_256_GCM",
+        _ => "unknown",
+    }
+}
+
+fn quic_transport_parameter_name(value: u64) -> &'static str {
+    match value {
+        0x00 => "original_destination_connection_id",
+        0x01 => "max_idle_timeout",
+        0x02 => "stateless_reset_token",
+        0x03 => "max_udp_payload_size",
+        0x04 => "initial_max_data",
+        0x05 => "initial_max_stream_data_bidi_local",
+        0x06 => "initial_max_stream_data_bidi_remote",
+        0x07 => "initial_max_stream_data_uni",
+        0x08 => "initial_max_streams_bidi",
+        0x09 => "initial_max_streams_uni",
+        0x0a => "ack_delay_exponent",
+        0x0b => "max_ack_delay",
+        0x0c => "disable_active_migration",
+        0x0d => "preferred_address",
+        0x0e => "active_connection_id_limit",
+        0x0f => "initial_source_connection_id",
+        0x10 => "retry_source_connection_id",
+        0x11 => "version_information",
+        value if is_quic_grease_transport_parameter(value) => "GREASE",
         _ => "unknown",
     }
 }
@@ -929,6 +1152,40 @@ mod tests {
         assert!(text.contains("0x001d x25519, 32-byte key share"));
         assert!(text.contains("AEAD: 0x0001 AES-128-GCM"));
         assert!(text.contains("encrypted payload: 2 bytes"));
+    }
+
+    #[test]
+    fn decodes_craftlsmaxxing_extension_surface() {
+        let input = r#"{"client_hello_structured":{"handshake_type":"0x01","legacy_version":"0x0303","random_hex":"0000000000000000000000000000000000000000000000000000000000000000","session_id_hex":"","cipher_suites":[],"compression_methods":["0x00"],"extensions_present":true,"extensions":[{"type":"0x002d","payload_hex":"020b01"},{"type":"0x0032","payload_hex":"00061a1a08070906"},{"type":"0x0014","payload_hex":"020002"},{"type":"0x0013","payload_hex":"020002"},{"type":"0xca34","payload_hex":"000b05616c7068610462657461"},{"type":"0x002f","payload_hex":"0009000263610003616c74"},{"type":"0x000e","payload_hex":"00060001000200050100"},{"type":"0x0039","payload_hex":"010101"},{"type":"0xffa5","payload_hex":""},{"type":"0x3374","payload_hex":""},{"type":"0x754f","payload_hex":""},{"type":"0x8a3b","payload_hex":"00"},{"type":"0x0031","payload_hex":""},{"type":"0x0015","payload_hex":"0000"}],"handshake_bytes":43}}"#;
+
+        let dumps = parse_inputs(input).unwrap();
+        let text = render_dump(&dumps[0], false).unwrap();
+
+        assert!(text.contains("0x002d psk_key_exchange_modes:"));
+        assert!(text.contains("0x0b GREASE"));
+        assert!(text.contains("0x0032 signature_algorithms_cert:"));
+        assert!(text.contains("0x0807 ed25519"));
+        assert!(text.contains("0x0906 mldsa87"));
+        assert!(text.contains("0x0014 server_certificate_type:"));
+        assert!(text.contains("0x00 x509"));
+        assert!(text.contains("0x02 raw_public_key"));
+        assert!(text.contains("0xca34 trust_anchors:"));
+        assert!(text.contains("anchor: 5 bytes (alpha)"));
+        assert!(text.contains("0x002f certificate_authorities:"));
+        assert!(text.contains("authority: 2 bytes (ca)"));
+        assert!(text.contains("0x000e use_srtp:"));
+        assert!(text.contains("profile: 0x0005 SRTP_AEAD_AES_128_GCM"));
+        assert!(text.contains("mki: 00"));
+        assert!(text.contains("0x0039 quic_transport_parameters:"));
+        assert!(text.contains("0x1 max_idle_timeout: varint 1"));
+        assert!(text.contains("0xffa5 quic_transport_parameters_legacy:"));
+        assert!(text.contains("0x3374 next_protocol_negotiation:"));
+        assert!(text.contains("0x754f channel_id:"));
+        assert!(text.contains("0x8a3b pake:"));
+        assert!(text.contains("payload: 1 bytes (00)"));
+        assert!(text.contains("0x0031 post_handshake_auth:"));
+        assert!(text.contains("0x0015 padding:"));
+        assert!(text.contains("2 zero bytes"));
     }
 
     #[test]

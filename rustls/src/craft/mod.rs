@@ -490,6 +490,10 @@ pub enum CraftExtension {
     ClientCertificateTypes(&'static [CertificateType]),
     ServerCertificateTypes(&'static [CertificateType]),
     CertificateAuthorities(&'static [&'static [u8]]),
+    RandomPrintableCertificateAuthorities {
+        count: usize,
+        name_len: usize,
+    },
     QuicTransportParameters(&'static [u8]),
     QuicTransportParametersLegacy(&'static [u8]),
     TrustAnchors(&'static [&'static [u8]]),
@@ -721,6 +725,30 @@ fn encode_certificate_authorities(authorities: &[&[u8]]) -> Vec<u8> {
         }
     }
     payload
+}
+
+fn encode_random_printable_certificate_authorities(
+    secure_random: &dyn SecureRandom,
+    count: usize,
+    name_len: usize,
+) -> Result<Vec<u8>, Error> {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\\.-";
+
+    let mut payload = Vec::new();
+    {
+        let list = LengthPrefixedBuffer::new(ListLength::U16, &mut payload);
+        let mut authority = vec![0; name_len];
+        for _ in 0..count {
+            secure_random
+                .fill(&mut authority)
+                .map_err(Error::from)?;
+            for byte in &mut authority {
+                *byte = ALPHABET[usize::from(*byte) % ALPHABET.len()];
+            }
+            append_opaque_u16(list.buf, &authority);
+        }
+    }
+    Ok(payload)
 }
 
 fn encode_trust_anchors(anchors: &[&[u8]]) -> Vec<u8> {
@@ -1095,6 +1123,17 @@ impl CraftExtension {
                 ExtensionType::CertificateAuthorities,
                 encode_certificate_authorities(authorities),
             ),
+            Self::RandomPrintableCertificateAuthorities { count, name_len } => {
+                CraftClientExtension::raw(
+                    ExtensionType::CertificateAuthorities,
+                    encode_random_printable_certificate_authorities(
+                        config.provider().secure_random,
+                        *count,
+                        *name_len,
+                    )
+                    .map_err(CraftExtensionError::Fatal)?,
+                )
+            }
             Self::QuicTransportParameters(params) => {
                 CraftClientExtension::raw(ExtensionType::TransportParameters, params.to_vec())
             }
@@ -1342,6 +1381,7 @@ fn shuffle_extensions(extensions: &[ExtensionSpec], config: &ClientConfig) -> Ve
         match ext {
             Craft(CraftExtension::Grease1 | CraftExtension::Grease2)
             | Craft(CraftExtension::Padding)
+            | Craft(CraftExtension::Raw(ExtensionType::Padding, _))
             | Keep(KeepExtension::Optional(ExtensionType::PreSharedKey)) => {
                 do_not_shuffle.push(i);
             }
