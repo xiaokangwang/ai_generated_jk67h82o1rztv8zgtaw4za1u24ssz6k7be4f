@@ -190,7 +190,12 @@ mod server_hello {
                         secrets.master_secret(),
                     );
 
-                    let (dec, enc) = secrets.make_cipher_pair(Side::Client);
+                    let (dec, enc) = secrets.make_cipher_pair(
+                        Side::Client,
+                        config
+                            .craft
+                            .tls12_aead_zero_explicit_nonce(),
+                    );
                     output.output(OutputEvent::HandshakeKind(HandshakeKind::Resumed));
                     let cert_verified = verify::PeerVerified::assertion();
                     let sig_verified = verify::HandshakeSignatureValid::assertion();
@@ -865,7 +870,13 @@ impl ExpectServerDone {
             secrets.master_secret(),
         );
 
-        let (dec, encrypter) = secrets.make_cipher_pair(Side::Client);
+        let (dec, encrypter) = secrets.make_cipher_pair(
+            Side::Client,
+            self.hs
+                .config
+                .craft
+                .tls12_aead_zero_explicit_nonce(),
+        );
         output.send().set_encrypter(
             encrypter,
             secrets

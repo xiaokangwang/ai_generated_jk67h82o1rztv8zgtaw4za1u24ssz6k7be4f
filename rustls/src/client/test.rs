@@ -972,6 +972,25 @@ fn craft_chrome_148_matches_captured_client_hello_shape() {
     assert!([144, 176, 208, 240].contains(&encrypted_payload.len()));
 }
 
+#[test]
+fn craft_browser_fingerprints_use_zero_tls12_aead_explicit_nonce() {
+    assert!(
+        crate::craft::CHROME_148
+            .builder()
+            .tls12_aead_zero_explicit_nonce()
+    );
+    assert!(
+        crate::craft::FIREFOX_140
+            .builder()
+            .tls12_aead_zero_explicit_nonce()
+    );
+    assert!(
+        !crate::craft::CHROMIUM_144
+            .builder()
+            .tls12_aead_zero_explicit_nonce()
+    );
+}
+
 #[cfg(feature = "brotli")]
 #[test]
 fn craft_chrome_148_boringssl_ech_grease_varies_payload_size() {
@@ -1210,8 +1229,9 @@ fn craftlsmaxxing_emits_https_safe_maximal_shuffled_surface() {
     for authority in authorities {
         assert_eq!(authority.len(), 32);
         assert!(
-            authority.iter().all(|byte| byte.is_ascii_alphanumeric()
-                || matches!(*byte, b'\\' | b'.' | b'-')),
+            authority
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'\\' | b'.' | b'-')),
             "certificate authority name contains bytes outside the craftlsmaxxing alphabet"
         );
     }
@@ -1327,6 +1347,7 @@ fn craft_can_emit_boringssl_and_nss_extension_surface() {
         cipher: ciphers,
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
+        tls12_aead_zero_explicit_nonce: false,
     };
     let config = ClientConfig::builder(Arc::new(CRAFT_CHROME_PROVIDER.clone()))
         .with_root_certificates(roots())
@@ -1531,6 +1552,7 @@ fn craft_real_ech_replaces_placeholder_before_encrypting_outer() {
         cipher: ciphers,
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
+        tls12_aead_zero_explicit_nonce: false,
     };
     let ech_config = EchConfig {
         config: EchConfigPayload::V18(EchConfigContents {
@@ -1630,6 +1652,7 @@ fn craft_real_ech_compresses_crafted_outer_extensions() {
         cipher: ciphers,
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Nss,
+        tls12_aead_zero_explicit_nonce: false,
     };
     let config = ClientConfig::builder(Arc::new(tls13_only(CRAFT_CHROME_PROVIDER.clone())))
         .with_ech(EchMode::Enable(plaintext_echo_ech_config(true)))
@@ -1784,6 +1807,7 @@ fn craft_fingerprint_errors_instead_of_faking_unsupported_curve() {
         cipher: ciphers,
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
+        tls12_aead_zero_explicit_nonce: false,
     };
     let config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
         .with_root_certificates(roots())
@@ -2111,6 +2135,7 @@ fn craft_boringssl_nss_interop_fingerprint() -> crate::craft::Fingerprint {
         shuffle_extensions: false,
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
+        tls12_aead_zero_explicit_nonce: false,
     }
 }
 
@@ -2151,6 +2176,7 @@ fn craft_incompatible_override_fingerprint() -> crate::craft::Fingerprint {
         shuffle_extensions: false,
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
+        tls12_aead_zero_explicit_nonce: false,
     }
 }
 
@@ -2190,6 +2216,7 @@ fn craft_ffdhe_hrr_fingerprint() -> crate::craft::Fingerprint {
         shuffle_extensions: false,
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
+        tls12_aead_zero_explicit_nonce: false,
     }
 }
 

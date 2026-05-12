@@ -1411,6 +1411,7 @@ pub struct Fingerprint {
     pub cipher: &'static [GreaseOrCipher],
     pub ech_force_tls13: Option<bool>,
     pub ech_padding_style: EchPaddingStyle,
+    pub tls12_aead_zero_explicit_nonce: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1433,6 +1434,7 @@ impl Fingerprint {
             override_suite: true,
             ech_force_tls13: self.ech_force_tls13,
             ech_padding_style: self.ech_padding_style,
+            tls12_aead_zero_explicit_nonce: self.tls12_aead_zero_explicit_nonce,
             validation_error: None,
         }
     }
@@ -1551,6 +1553,7 @@ pub struct FingerprintBuilder {
     override_suite: bool,
     ech_force_tls13: Option<bool>,
     ech_padding_style: EchPaddingStyle,
+    tls12_aead_zero_explicit_nonce: bool,
     validation_error: Option<String>,
 }
 
@@ -1596,6 +1599,18 @@ impl FingerprintBuilder {
 
     pub fn with_ech_padding_style(mut self, ech_padding_style: EchPaddingStyle) -> Self {
         self.ech_padding_style = ech_padding_style;
+        self
+    }
+
+    pub fn tls12_aead_zero_explicit_nonce(&self) -> bool {
+        self.tls12_aead_zero_explicit_nonce
+    }
+
+    pub fn with_tls12_aead_zero_explicit_nonce(
+        mut self,
+        tls12_aead_zero_explicit_nonce: bool,
+    ) -> Self {
+        self.tls12_aead_zero_explicit_nonce = tls12_aead_zero_explicit_nonce;
         self
     }
 
@@ -1697,6 +1712,12 @@ impl CraftOptions {
     pub(crate) fn ech_padding_style(&self) -> EchPaddingStyle {
         self.get()
             .map(|builder| builder.ech_padding_style)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn tls12_aead_zero_explicit_nonce(&self) -> bool {
+        self.get()
+            .map(|builder| builder.tls12_aead_zero_explicit_nonce)
             .unwrap_or_default()
     }
 }

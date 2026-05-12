@@ -382,7 +382,7 @@ mod client_hello {
         }
         emit_ccs(output);
 
-        let (dec, encrypter) = secrets.make_cipher_pair(Side::Server);
+        let (dec, encrypter) = secrets.make_cipher_pair(Side::Server, false);
         output.send().set_encrypter(
             encrypter,
             secrets
@@ -749,7 +749,7 @@ impl ExpectCcs {
             None => {
                 let (dec, enc) = self
                     .secrets
-                    .make_cipher_pair(Side::Server);
+                    .make_cipher_pair(Side::Server, false);
                 (dec, Some(enc))
             }
         };

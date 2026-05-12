@@ -214,7 +214,11 @@ impl ConnectionSecrets {
 
     /// Make a `MessageCipherPair` based on the given supported ciphersuite `self.suite`,
     /// and the session's `secrets`.
-    pub(crate) fn make_cipher_pair(&self, side: Side) -> MessageCipherPair {
+    pub(crate) fn make_cipher_pair(
+        &self,
+        side: Side,
+        zero_explicit_nonce_start: bool,
+    ) -> MessageCipherPair {
         // Make a key block, and chop it up.
         // Note: we don't implement any ciphersuites with nonzero mac_key_len.
         let key_block = self.make_key_block();
@@ -240,13 +244,21 @@ impl ConnectionSecrets {
             ),
         };
 
+        let zero_explicit;
+        let write_explicit = if zero_explicit_nonce_start && shape.explicit_nonce_len > 0 {
+            zero_explicit = vec![0; shape.explicit_nonce_len];
+            zero_explicit.as_slice()
+        } else {
+            extra
+        };
+
         (
             self.suite
                 .aead_alg
                 .decrypter(AeadKey::new(read_key), read_iv),
             self.suite
                 .aead_alg
-                .encrypter(AeadKey::new(write_key), write_iv, extra),
+                .encrypter(AeadKey::new(write_key), write_iv, write_explicit),
         )
     }
 
@@ -417,9 +429,141 @@ pub(crate) const DOWNGRADE_SENTINEL: [u8; 8] = [0x44, 0x4f, 0x57, 0x4e, 0x47, 0x
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
     use crate::crypto::TEST_PROVIDER;
+    use crate::crypto::cipher::{
+        EncodedMessage, InboundOpaque, KeyBlockShape, OutboundOpaque, OutboundPlain,
+        UnsupportedOperationError,
+    };
     use crate::crypto::kx::NamedGroup;
+    use crate::crypto::test_provider::{FAKE_HASH, FAKE_HMAC};
     use crate::msgs::{ServerEcdhParams, ServerKeyExchangeParams};
+
+    static LAST_EXPLICIT_NONCE: LazyLock<Mutex<Vec<u8>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+    static RECORDING_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    static RECORDING_PRF: crypto::tls12::PrfUsingHmac<'static> =
+        crypto::tls12::PrfUsingHmac(FAKE_HMAC);
+
+    static RECORDING_AEAD: RecordingAead = RecordingAead;
+
+    static RECORDING_SUITE: Tls12CipherSuite = Tls12CipherSuite {
+        common: CipherSuiteCommon {
+            suite: crypto::CipherSuite(0xff12),
+            hash_provider: FAKE_HASH,
+            confidentiality_limit: u64::MAX,
+        },
+        protocol_version: crate::version::TLS12_VERSION,
+        prf_provider: &RECORDING_PRF,
+        kx: KeyExchangeAlgorithm::ECDHE,
+        sign: &[SignatureScheme::ECDSA_NISTP256_SHA256],
+        aead_alg: &RECORDING_AEAD,
+    };
+
+    struct RecordingAead;
+
+    impl Tls12AeadAlgorithm for RecordingAead {
+        fn encrypter(
+            &self,
+            _key: AeadKey,
+            _iv: &[u8],
+            explicit: &[u8],
+        ) -> Box<dyn MessageEncrypter> {
+            *LAST_EXPLICIT_NONCE.lock().unwrap() = explicit.to_vec();
+            Box::new(RecordingCipher)
+        }
+
+        fn decrypter(&self, _key: AeadKey, _iv: &[u8]) -> Box<dyn MessageDecrypter> {
+            Box::new(RecordingCipher)
+        }
+
+        fn key_block_shape(&self) -> KeyBlockShape {
+            KeyBlockShape {
+                enc_key_len: 16,
+                fixed_iv_len: 4,
+                explicit_nonce_len: 8,
+            }
+        }
+
+        fn extract_keys(
+            &self,
+            _key: AeadKey,
+            _iv: &[u8],
+            _explicit: &[u8],
+        ) -> Result<crate::ConnectionTrafficSecrets, UnsupportedOperationError> {
+            Err(UnsupportedOperationError)
+        }
+    }
+
+    struct RecordingCipher;
+
+    impl MessageEncrypter for RecordingCipher {
+        fn encrypt(
+            &mut self,
+            _msg: EncodedMessage<OutboundPlain<'_>>,
+            _seq: u64,
+        ) -> Result<EncodedMessage<OutboundOpaque>, Error> {
+            Err(Error::EncryptError)
+        }
+
+        fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+            payload_len
+        }
+    }
+
+    impl MessageDecrypter for RecordingCipher {
+        fn decrypt<'a>(
+            &mut self,
+            _msg: EncodedMessage<InboundOpaque<'a>>,
+            _seq: u64,
+        ) -> Result<EncodedMessage<&'a [u8]>, Error> {
+            Err(Error::DecryptError)
+        }
+    }
+
+    fn recording_secrets() -> ConnectionSecrets {
+        ConnectionSecrets::new_resume(
+            ConnectionRandoms {
+                client: [1; 32],
+                server: [2; 32],
+            },
+            &RECORDING_SUITE,
+            &[3; 48],
+        )
+    }
+
+    #[test]
+    fn tls12_aead_explicit_nonce_uses_key_block_by_default() {
+        let _guard = RECORDING_TEST_LOCK.lock().unwrap();
+        let secrets = recording_secrets();
+        let key_block = secrets.make_key_block();
+        let shape = RECORDING_AEAD.key_block_shape();
+        let extra_offset = (shape.enc_key_len + shape.fixed_iv_len) * 2;
+        let expected = key_block[extra_offset..].to_vec();
+
+        let _ = secrets.make_cipher_pair(Side::Client, false);
+
+        assert_eq!(*LAST_EXPLICIT_NONCE.lock().unwrap(), expected);
+        assert_ne!(
+            *LAST_EXPLICIT_NONCE.lock().unwrap(),
+            vec![0; shape.explicit_nonce_len]
+        );
+    }
+
+    #[test]
+    fn tls12_aead_explicit_nonce_can_start_from_zero() {
+        let _guard = RECORDING_TEST_LOCK.lock().unwrap();
+        let secrets = recording_secrets();
+        let shape = RECORDING_AEAD.key_block_shape();
+
+        let _ = secrets.make_cipher_pair(Side::Client, true);
+
+        assert_eq!(
+            *LAST_EXPLICIT_NONCE.lock().unwrap(),
+            vec![0; shape.explicit_nonce_len]
+        );
+    }
 
     #[test]
     fn server_ecdhe_remaining_bytes() {

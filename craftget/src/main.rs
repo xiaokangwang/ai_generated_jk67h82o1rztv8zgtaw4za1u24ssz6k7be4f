@@ -74,6 +74,10 @@ struct Args {
     #[arg(long = "ech-force-tls13", action = ArgAction::Set)]
     ech_force_tls13: Option<bool>,
 
+    /// Whether TLS 1.2 AEAD explicit nonces should start from zero.
+    #[arg(long = "tls12-aead-zero-explicit-nonce", action = ArgAction::Set)]
+    tls12_aead_zero_explicit_nonce: Option<bool>,
+
     /// Print available fingerprint names and exit.
     #[arg(long = "list-fps")]
     list_fps: bool,
@@ -108,6 +112,7 @@ struct Input {
     send_sni: bool,
     ech_enabled: bool,
     ech_force_tls13: bool,
+    tls12_aead_zero_explicit_nonce: bool,
     full_body: bool,
 }
 
@@ -158,6 +163,11 @@ fn main() -> Result<()> {
         .ech_force_tls13
         .or_else(|| fingerprint.ech_force_tls13())
         .unwrap_or(true);
+    let tls12_aead_zero_explicit_nonce = args
+        .tls12_aead_zero_explicit_nonce
+        .unwrap_or_else(|| fingerprint.tls12_aead_zero_explicit_nonce());
+    let fingerprint =
+        fingerprint.with_tls12_aead_zero_explicit_nonce(tls12_aead_zero_explicit_nonce);
 
     let input = Input {
         url,
@@ -167,6 +177,7 @@ fn main() -> Result<()> {
         send_sni,
         ech_enabled,
         ech_force_tls13,
+        tls12_aead_zero_explicit_nonce,
         full_body: args.full_body,
     };
 
@@ -1031,6 +1042,16 @@ mod tests {
                 .ech_force_tls13(),
             Some(false)
         );
+        assert!(
+            fingerprint_builder("chrome_148")
+                .unwrap()
+                .tls12_aead_zero_explicit_nonce()
+        );
+        assert!(
+            fingerprint_builder("firefox_140")
+                .unwrap()
+                .tls12_aead_zero_explicit_nonce()
+        );
     }
 
     #[test]
@@ -1088,6 +1109,21 @@ mod tests {
         let args =
             Args::try_parse_from(["craftget", "--full-body", "https://example.com/"]).unwrap();
         assert!(args.full_body);
+    }
+
+    #[test]
+    fn parses_tls12_aead_zero_explicit_nonce_flag() {
+        let args = Args::try_parse_from(["craftget", "https://example.com/"]).unwrap();
+        assert_eq!(args.tls12_aead_zero_explicit_nonce, None);
+
+        let args = Args::try_parse_from([
+            "craftget",
+            "--tls12-aead-zero-explicit-nonce",
+            "false",
+            "https://example.com/",
+        ])
+        .unwrap();
+        assert_eq!(args.tls12_aead_zero_explicit_nonce, Some(false));
     }
 
     #[test]

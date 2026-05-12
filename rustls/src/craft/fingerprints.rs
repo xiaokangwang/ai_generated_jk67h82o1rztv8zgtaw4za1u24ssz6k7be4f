@@ -5,6 +5,17 @@ use crate::crypto::hpke::HpkeAead;
 use std::sync::LazyLock;
 
 macro_rules! define_fingerprint {
+    ($fingerprint_name:ident { $extensions:expr, $cipher:expr, ech_force_tls13: $ech_force_tls13:expr, ech_padding: $ech_padding:expr, tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce:expr }) => {
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            false,
+            $cipher,
+            Some($ech_force_tls13),
+            $ech_padding,
+            $tls12_aead_zero_explicit_nonce
+        );
+    };
     ($fingerprint_name:ident { $extensions:expr, $cipher:expr, ech_force_tls13: $ech_force_tls13:expr, ech_padding: $ech_padding:expr }) => {
         define_fingerprint!(
             $fingerprint_name,
@@ -12,7 +23,19 @@ macro_rules! define_fingerprint {
             false,
             $cipher,
             Some($ech_force_tls13),
-            $ech_padding
+            $ech_padding,
+            false
+        );
+    };
+    ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr, tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce:expr }) => {
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            true,
+            $cipher,
+            None,
+            EchPaddingStyle::Standard,
+            $tls12_aead_zero_explicit_nonce
         );
     };
     ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr, ech_force_tls13: $ech_force_tls13:expr }) => {
@@ -22,7 +45,8 @@ macro_rules! define_fingerprint {
             true,
             $cipher,
             Some($ech_force_tls13),
-            EchPaddingStyle::Standard
+            EchPaddingStyle::Standard,
+            false
         );
     };
     ($fingerprint_name:ident { $extensions:expr, $cipher:expr, ech_force_tls13: $ech_force_tls13:expr }) => {
@@ -32,7 +56,8 @@ macro_rules! define_fingerprint {
             false,
             $cipher,
             Some($ech_force_tls13),
-            EchPaddingStyle::Standard
+            EchPaddingStyle::Standard,
+            false
         );
     };
     ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr }) => {
@@ -42,7 +67,8 @@ macro_rules! define_fingerprint {
             true,
             $cipher,
             None,
-            EchPaddingStyle::Standard
+            EchPaddingStyle::Standard,
+            false
         );
     };
     ($fingerprint_name:ident { $extensions:expr, $cipher:expr }) => {
@@ -52,10 +78,11 @@ macro_rules! define_fingerprint {
             false,
             $cipher,
             None,
-            EchPaddingStyle::Standard
+            EchPaddingStyle::Standard,
+            false
         );
     };
-    ($fingerprint_name:ident, $extensions:expr, $shuffle_extensions:expr, $cipher:expr, $ech_force_tls13:expr, $ech_padding:expr) => {
+    ($fingerprint_name:ident, $extensions:expr, $shuffle_extensions:expr, $cipher:expr, $ech_force_tls13:expr, $ech_padding:expr, $tls12_aead_zero_explicit_nonce:expr) => {
         /// Represents a set of [`Fingerprint`] configurations, each tailored for different ALPN extensions.
         pub static $fingerprint_name: LazyLock<FingerprintSet> = LazyLock::new(|| {
             use ExtensionSpec::*;
@@ -85,6 +112,7 @@ macro_rules! define_fingerprint {
                     shuffle_extensions: $shuffle_extensions,
                     ech_force_tls13: $ech_force_tls13,
                     ech_padding_style: $ech_padding,
+                    tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce,
                 },
                 test_alpn_http1: Fingerprint {
                     extensions: Box::leak(alpn_http1),
@@ -92,6 +120,7 @@ macro_rules! define_fingerprint {
                     shuffle_extensions: $shuffle_extensions,
                     ech_force_tls13: $ech_force_tls13,
                     ech_padding_style: $ech_padding,
+                    tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce,
                 },
                 test_no_alpn: Fingerprint {
                     extensions: Box::leak(no_alpn),
@@ -99,6 +128,7 @@ macro_rules! define_fingerprint {
                     shuffle_extensions: $shuffle_extensions,
                     ech_force_tls13: $ech_force_tls13,
                     ech_padding_style: $ech_padding,
+                    tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce,
                 },
             }
         });
@@ -579,7 +609,11 @@ pub static CHROME_CIPHER: LazyLock<Vec<GreaseOrCipher>> = LazyLock::new(|| {
 define_fingerprint!(CHROME_108 { &CHROME_108_EXT, &CHROME_CIPHER });
 define_fingerprint!(CHROME_112 { shuffle(&CHROME_108_EXT), &CHROME_CIPHER });
 define_fingerprint!(CHROMIUM_144 { shuffle(&CHROMIUM_144_EXT), &CHROME_CIPHER });
-define_fingerprint!(CHROME_148 { shuffle(&CHROME_148_EXT), &CHROME_CIPHER });
+define_fingerprint!(CHROME_148 {
+    shuffle(&CHROME_148_EXT),
+    &CHROME_CIPHER,
+    tls12_aead_zero_explicit_nonce: true
+});
 define_fingerprint!(CRAFTLSMAXXING {
     shuffle(&CRAFTLSMAXXING_EXT),
     &CRAFTLSMAXXING_CIPHER,
@@ -872,5 +906,6 @@ define_fingerprint!(FIREFOX_140 {
     &FIREFOX_140_EXT,
     &FIREFOX_105_CIPHERS,
     ech_force_tls13: false,
-    ech_padding: EchPaddingStyle::Nss
+    ech_padding: EchPaddingStyle::Nss,
+    tls12_aead_zero_explicit_nonce: true
 });
