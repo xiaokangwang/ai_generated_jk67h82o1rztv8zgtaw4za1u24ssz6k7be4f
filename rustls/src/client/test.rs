@@ -944,7 +944,10 @@ fn craft_chrome_148_matches_captured_client_hello_shape() {
     assert!(is_grease_u16(u16::from(key_shares[0].0)));
     assert_eq!(key_shares[0].1, [0]);
     assert_eq!(key_shares[1].0, NamedGroup::X25519MLKEM768);
+    assert_eq!(key_shares[1].1, KX_PEER_SHARE);
     assert_eq!(key_shares[2].0, NamedGroup::X25519);
+    assert_eq!(key_shares[2].1, FAKE_X25519_ECH_PUBLIC_KEY);
+    assert_ne!(key_shares[1].1, key_shares[2].1);
 
     let sigalgs = decode_u16_list(raw.extension(ExtensionType::SignatureAlgorithms));
     assert_eq!(
@@ -971,6 +974,29 @@ fn craft_chrome_148_matches_captured_client_hello_shape() {
     assert_eq!(enc.len(), 32);
     assert_eq!(enc.as_slice(), FAKE_X25519_ECH_PUBLIC_KEY);
     assert!([144, 176, 208, 240].contains(&encrypted_payload.len()));
+}
+
+#[cfg(feature = "brotli")]
+#[test]
+fn craft_firefox_140_reuses_hybrid_x25519_component_key_share() {
+    let mut config = ClientConfig::builder(Arc::new(CRAFTLSMAXXING_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap()
+        .with_fingerprint(crate::craft::FIREFOX_140.builder());
+    config.enable_sni = false;
+
+    let (_, wire) = client_hello_sent_for_config_with_wire(config).unwrap();
+    let raw = RawClientHello::parse(&wire);
+    let key_shares = decode_key_shares(raw.extension(ExtensionType::KeyShare));
+
+    assert_eq!(key_shares.len(), 3);
+    assert_eq!(key_shares[0].0, NamedGroup::X25519MLKEM768);
+    assert_eq!(key_shares[0].1, KX_PEER_SHARE);
+    assert_eq!(key_shares[1].0, NamedGroup::X25519);
+    assert_eq!(key_shares[1].1, KX_PEER_SHARE);
+    assert_eq!(key_shares[2].0, NamedGroup::secp256r1);
+    assert_eq!(key_shares[2].1, KX_PEER_SHARE);
 }
 
 #[test]
@@ -1351,6 +1377,7 @@ fn craft_can_emit_boringssl_and_nss_extension_surface() {
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
         tls12_aead_zero_explicit_nonce: false,
+        key_share_component_reuse: crate::craft::KeyShareComponentReuse::Reuse,
     };
     let config = ClientConfig::builder(Arc::new(CRAFT_CHROME_PROVIDER.clone()))
         .with_root_certificates(roots())
@@ -1556,6 +1583,7 @@ fn craft_real_ech_replaces_placeholder_before_encrypting_outer() {
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
         tls12_aead_zero_explicit_nonce: false,
+        key_share_component_reuse: crate::craft::KeyShareComponentReuse::Reuse,
     };
     let ech_config = EchConfig {
         config: EchConfigPayload::V18(EchConfigContents {
@@ -1656,6 +1684,7 @@ fn craft_real_ech_compresses_crafted_outer_extensions() {
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Nss,
         tls12_aead_zero_explicit_nonce: false,
+        key_share_component_reuse: crate::craft::KeyShareComponentReuse::Reuse,
     };
     let config = ClientConfig::builder(Arc::new(tls13_only(CRAFT_CHROME_PROVIDER.clone())))
         .with_ech(EchMode::Enable(plaintext_echo_ech_config(true)))
@@ -1811,6 +1840,7 @@ fn craft_fingerprint_errors_instead_of_faking_unsupported_curve() {
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
         tls12_aead_zero_explicit_nonce: false,
+        key_share_component_reuse: crate::craft::KeyShareComponentReuse::Reuse,
     };
     let config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
         .with_root_certificates(roots())
@@ -2139,6 +2169,7 @@ fn craft_boringssl_nss_interop_fingerprint() -> crate::craft::Fingerprint {
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
         tls12_aead_zero_explicit_nonce: false,
+        key_share_component_reuse: crate::craft::KeyShareComponentReuse::Reuse,
     }
 }
 
@@ -2180,6 +2211,7 @@ fn craft_incompatible_override_fingerprint() -> crate::craft::Fingerprint {
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
         tls12_aead_zero_explicit_nonce: false,
+        key_share_component_reuse: crate::craft::KeyShareComponentReuse::Reuse,
     }
 }
 
@@ -2220,6 +2252,7 @@ fn craft_ffdhe_hrr_fingerprint() -> crate::craft::Fingerprint {
         ech_force_tls13: None,
         ech_padding_style: crate::craft::EchPaddingStyle::Standard,
         tls12_aead_zero_explicit_nonce: false,
+        key_share_component_reuse: crate::craft::KeyShareComponentReuse::Reuse,
     }
 }
 

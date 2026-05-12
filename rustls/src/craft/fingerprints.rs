@@ -38,6 +38,18 @@ macro_rules! define_fingerprint {
             $tls12_aead_zero_explicit_nonce
         );
     };
+    ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr, key_share_component_reuse: $key_share_component_reuse:expr, tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce:expr }) => {
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            true,
+            $cipher,
+            None,
+            EchPaddingStyle::Standard,
+            $tls12_aead_zero_explicit_nonce,
+            $key_share_component_reuse
+        );
+    };
     ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr, ech_force_tls13: $ech_force_tls13:expr }) => {
         define_fingerprint!(
             $fingerprint_name,
@@ -83,6 +95,18 @@ macro_rules! define_fingerprint {
         );
     };
     ($fingerprint_name:ident, $extensions:expr, $shuffle_extensions:expr, $cipher:expr, $ech_force_tls13:expr, $ech_padding:expr, $tls12_aead_zero_explicit_nonce:expr) => {
+        define_fingerprint!(
+            $fingerprint_name,
+            $extensions,
+            $shuffle_extensions,
+            $cipher,
+            $ech_force_tls13,
+            $ech_padding,
+            $tls12_aead_zero_explicit_nonce,
+            KeyShareComponentReuse::Reuse
+        );
+    };
+    ($fingerprint_name:ident, $extensions:expr, $shuffle_extensions:expr, $cipher:expr, $ech_force_tls13:expr, $ech_padding:expr, $tls12_aead_zero_explicit_nonce:expr, $key_share_component_reuse:expr) => {
         /// Represents a set of [`Fingerprint`] configurations, each tailored for different ALPN extensions.
         pub static $fingerprint_name: LazyLock<FingerprintSet> = LazyLock::new(|| {
             use ExtensionSpec::*;
@@ -113,6 +137,7 @@ macro_rules! define_fingerprint {
                     ech_force_tls13: $ech_force_tls13,
                     ech_padding_style: $ech_padding,
                     tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce,
+                    key_share_component_reuse: $key_share_component_reuse,
                 },
                 test_alpn_http1: Fingerprint {
                     extensions: Box::leak(alpn_http1),
@@ -121,6 +146,7 @@ macro_rules! define_fingerprint {
                     ech_force_tls13: $ech_force_tls13,
                     ech_padding_style: $ech_padding,
                     tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce,
+                    key_share_component_reuse: $key_share_component_reuse,
                 },
                 test_no_alpn: Fingerprint {
                     extensions: Box::leak(no_alpn),
@@ -129,6 +155,7 @@ macro_rules! define_fingerprint {
                     ech_force_tls13: $ech_force_tls13,
                     ech_padding_style: $ech_padding,
                     tls12_aead_zero_explicit_nonce: $tls12_aead_zero_explicit_nonce,
+                    key_share_component_reuse: $key_share_component_reuse,
                 },
             }
         });
@@ -612,6 +639,7 @@ define_fingerprint!(CHROMIUM_144 { shuffle(&CHROMIUM_144_EXT), &CHROME_CIPHER })
 define_fingerprint!(CHROME_148 {
     shuffle(&CHROME_148_EXT),
     &CHROME_CIPHER,
+    key_share_component_reuse: KeyShareComponentReuse::Independent,
     tls12_aead_zero_explicit_nonce: true
 });
 define_fingerprint!(CRAFTLSMAXXING {

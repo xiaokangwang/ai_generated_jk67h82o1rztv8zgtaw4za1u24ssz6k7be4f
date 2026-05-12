@@ -954,6 +954,8 @@ impl CraftExtension {
                     let mut shares = Vec::new();
                     let mut tracked_shares = Vec::new();
                     let mut component_shares: Vec<(NamedGroup, Vec<u8>)> = Vec::new();
+                    let reuse_component_shares =
+                        craft_config.key_share_component_reuse == KeyShareComponentReuse::Reuse;
 
                     for group_spec in *key_share_spec {
                         match group_spec {
@@ -971,13 +973,17 @@ impl CraftExtension {
                                 {
                                     continue;
                                 }
-                                if let Some((_, component_share)) = component_shares
-                                    .iter()
-                                    .find(|(component_group, _)| component_group == group)
-                                {
-                                    shares
-                                        .push(KeyShareEntry::new(*group, component_share.clone()));
-                                    continue;
+                                if reuse_component_shares {
+                                    if let Some((_, component_share)) = component_shares
+                                        .iter()
+                                        .find(|(component_group, _)| component_group == group)
+                                    {
+                                        shares.push(KeyShareEntry::new(
+                                            *group,
+                                            component_share.clone(),
+                                        ));
+                                        continue;
+                                    }
                                 }
 
                                 let Some(group_impl) = config
@@ -1009,8 +1015,10 @@ impl CraftExtension {
                                     ProtocolVersion::TLSv1_3,
                                 ) {
                                     let (component_group, component_share) = hybrid.component();
-                                    component_shares
-                                        .push((component_group, component_share.to_vec()));
+                                    if reuse_component_shares {
+                                        component_shares
+                                            .push((component_group, component_share.to_vec()));
+                                    }
                                 }
                                 shares.push(KeyShareEntry::new(*group, started.pub_key()));
                                 tracked_shares.push((group_impl, started));
@@ -1460,6 +1468,7 @@ pub struct Fingerprint {
     pub ech_force_tls13: Option<bool>,
     pub ech_padding_style: EchPaddingStyle,
     pub tls12_aead_zero_explicit_nonce: bool,
+    pub key_share_component_reuse: KeyShareComponentReuse,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1467,6 +1476,13 @@ pub enum EchPaddingStyle {
     #[default]
     Standard,
     Nss,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum KeyShareComponentReuse {
+    #[default]
+    Reuse,
+    Independent,
 }
 
 impl Fingerprint {
@@ -1483,6 +1499,7 @@ impl Fingerprint {
             ech_force_tls13: self.ech_force_tls13,
             ech_padding_style: self.ech_padding_style,
             tls12_aead_zero_explicit_nonce: self.tls12_aead_zero_explicit_nonce,
+            key_share_component_reuse: self.key_share_component_reuse,
             validation_error: None,
         }
     }
@@ -1602,6 +1619,7 @@ pub struct FingerprintBuilder {
     ech_force_tls13: Option<bool>,
     ech_padding_style: EchPaddingStyle,
     tls12_aead_zero_explicit_nonce: bool,
+    key_share_component_reuse: KeyShareComponentReuse,
     validation_error: Option<String>,
 }
 
@@ -1659,6 +1677,18 @@ impl FingerprintBuilder {
         tls12_aead_zero_explicit_nonce: bool,
     ) -> Self {
         self.tls12_aead_zero_explicit_nonce = tls12_aead_zero_explicit_nonce;
+        self
+    }
+
+    pub fn key_share_component_reuse(&self) -> KeyShareComponentReuse {
+        self.key_share_component_reuse
+    }
+
+    pub fn with_key_share_component_reuse(
+        mut self,
+        key_share_component_reuse: KeyShareComponentReuse,
+    ) -> Self {
+        self.key_share_component_reuse = key_share_component_reuse;
         self
     }
 
