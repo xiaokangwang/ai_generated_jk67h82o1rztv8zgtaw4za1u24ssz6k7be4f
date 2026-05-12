@@ -969,6 +969,7 @@ fn craft_chrome_148_matches_captured_client_hello_shape() {
     assert_eq!(kdf, 1);
     assert_eq!(aead, HpkeAead::AES_128_GCM.0);
     assert_eq!(enc.len(), 32);
+    assert_eq!(enc.as_slice(), FAKE_X25519_ECH_PUBLIC_KEY);
     assert!([144, 176, 208, 240].contains(&encrypted_payload.len()));
 }
 
@@ -1014,6 +1015,7 @@ fn craft_chrome_148_boringssl_ech_grease_varies_payload_size() {
 
         assert_eq!(aead, HpkeAead::AES_128_GCM.0);
         assert_eq!(enc.len(), 32);
+        assert_eq!(enc.as_slice(), FAKE_X25519_ECH_PUBLIC_KEY);
         assert!([144, 176, 208, 240].contains(&encrypted_payload.len()));
         if !seen_lengths.contains(&encrypted_payload.len()) {
             seen_lengths.push(encrypted_payload.len());
@@ -1236,8 +1238,9 @@ fn craftlsmaxxing_emits_https_safe_maximal_shuffled_surface() {
         );
     }
 
-    let (_, _, _, _, ech_payload) =
+    let (_, _, _, enc, ech_payload) =
         decode_ech_outer_payload(raw.extension(ExtensionType::EncryptedClientHello));
+    assert_eq!(enc.as_slice(), FAKE_X25519_ECH_PUBLIC_KEY);
     assert!((144..=240).contains(&ech_payload.len()));
 }
 
@@ -2821,7 +2824,7 @@ const CRAFT_CHROME_PROVIDER: CryptoProvider = CryptoProvider {
 const CRAFT_CHROME_148_PROVIDER: CryptoProvider = CryptoProvider {
     kx_groups: Cow::Borrowed(&[
         FAKE_X25519_MLKEM768_KX_GROUP,
-        FAKE_X25519_KX_GROUP,
+        FAKE_X25519_ECH_KX_GROUP,
         FAKE_SECP256R1_KX_GROUP,
         FAKE_SECP384R1_KX_GROUP,
     ]),
@@ -2831,7 +2834,7 @@ const CRAFT_CHROME_148_PROVIDER: CryptoProvider = CryptoProvider {
 const CRAFTLSMAXXING_PROVIDER: CryptoProvider = CryptoProvider {
     kx_groups: Cow::Borrowed(&[
         FAKE_X25519_MLKEM768_KX_GROUP,
-        FAKE_X25519_KX_GROUP,
+        FAKE_X25519_ECH_KX_GROUP,
         FAKE_SECP256R1_KX_GROUP,
         FAKE_SECP384R1_KX_GROUP,
         FAKE_SECP521R1_KX_GROUP,
@@ -2881,9 +2884,11 @@ const FAKE_X25519_MLKEM768_KX_GROUP: &FakeHybrid = &FakeHybrid {
 };
 const FAKE_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup(0xfe01));
 const FAKE_X25519_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::X25519);
+const FAKE_X25519_ECH_KX_GROUP: &dyn SupportedKxGroup = &FakeX25519EchKeyExchangeGroup;
 const FAKE_SECP256R1_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::secp256r1);
 const FAKE_SECP384R1_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::secp384r1);
 const FAKE_SECP521R1_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup::secp521r1);
+const FAKE_X25519_ECH_PUBLIC_KEY: &[u8] = b"FakeX25519PublicKeyForEchGrease!";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FakeHybrid {
@@ -2936,6 +2941,41 @@ impl kx::ActiveKeyExchange for FakeHybrid {
 
     fn group(&self) -> NamedGroup {
         self.name
+    }
+}
+
+#[derive(Debug)]
+struct FakeX25519EchKeyExchangeGroup;
+
+impl SupportedKxGroup for FakeX25519EchKeyExchangeGroup {
+    fn start(&self) -> Result<StartedKeyExchange, Error> {
+        Ok(StartedKeyExchange::Single(Box::new(
+            FakeX25519EchKeyExchange,
+        )))
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::X25519
+    }
+}
+
+#[derive(Debug)]
+struct FakeX25519EchKeyExchange;
+
+impl kx::ActiveKeyExchange for FakeX25519EchKeyExchange {
+    fn complete(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, Error> {
+        match peer {
+            KX_PEER_SHARE => Ok(SharedSecret::from(KX_SHARED_SECRET)),
+            _ => Err(Error::from(PeerMisbehaved::InvalidKeyShare)),
+        }
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        FAKE_X25519_ECH_PUBLIC_KEY
+    }
+
+    fn group(&self) -> NamedGroup {
+        NamedGroup::X25519
     }
 }
 

@@ -612,6 +612,59 @@ fn encode_ech_placeholder(
     Ok(payload)
 }
 
+fn x25519_ech_grease_public_key(config: &ClientConfig) -> Result<Vec<u8>, Error> {
+    let group = config
+        .provider()
+        .find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
+        .ok_or_else(|| {
+            Error::General(
+                "craft fingerprint requires X25519 support for BoringSSL ECH GREASE".into(),
+            )
+        })?;
+    let exchange = group.start()?;
+    let public_key = exchange.pub_key();
+    if public_key.len() != 32 {
+        return Err(Error::General(format!(
+            "craft fingerprint requires a 32-byte X25519 public key for BoringSSL ECH GREASE, got {} bytes",
+            public_key.len()
+        )));
+    }
+    Ok(public_key.to_vec())
+}
+
+fn encode_boring_ssl_ech_grease(
+    config: &ClientConfig,
+    payload_body_len: usize,
+    aead: HpkeAead,
+) -> Result<Vec<u8>, Error> {
+    let payload_body_len = u16::try_from(payload_body_len)
+        .map_err(|_| Error::General("ECH placeholder payload body is too large".into()))?;
+    let enc = x25519_ech_grease_public_key(config)?;
+
+    let mut payload = Vec::with_capacity(42 + usize::from(payload_body_len));
+    payload.push(0x00); // ECHClientHelloOuter
+    payload.extend_from_slice(&0x0001u16.to_be_bytes()); // HKDF-SHA256
+    payload.extend_from_slice(&aead.0.to_be_bytes());
+    payload.push(0);
+    let config_id_pos = payload.len() - 1;
+    payload.extend_from_slice(&0x0020u16.to_be_bytes()); // enc length
+    payload.extend_from_slice(&enc);
+    payload.extend_from_slice(&payload_body_len.to_be_bytes());
+    let body_start = payload.len();
+    payload.resize(body_start + usize::from(payload_body_len), 0);
+
+    config
+        .provider()
+        .secure_random
+        .fill(&mut payload[config_id_pos..config_id_pos + 1])?;
+    config
+        .provider()
+        .secure_random
+        .fill(&mut payload[body_start..])?;
+
+    Ok(payload)
+}
+
 fn random_size(config: &ClientConfig, min: usize, max: usize) -> Result<usize, Error> {
     debug_assert!(min < max);
     let mut random = [0; 8];
@@ -819,13 +872,8 @@ impl CraftExtension {
                     .map_err(CraftExtensionError::Fatal)?;
                 CraftClientExtension::raw(
                     ExtensionType::EncryptedClientHello,
-                    encode_ech_placeholder(
-                        config,
-                        payload_body_len,
-                        true,
-                        EchPlaceholderAead::Fixed(*aead),
-                    )
-                    .map_err(CraftExtensionError::Fatal)?,
+                    encode_boring_ssl_ech_grease(config, payload_body_len, *aead)
+                        .map_err(CraftExtensionError::Fatal)?,
                 )
             }
             Self::SupportedCurves(curves) => {
