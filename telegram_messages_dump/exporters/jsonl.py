@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=missing-docstring
 
+import base64
 import json
 from datetime import date, datetime
+from telethon.tl.tlobject import TLObject
 from .common import common
 
 class jsonl(object):
@@ -33,7 +35,7 @@ class jsonl(object):
 
         msgDictionary = {
             'message_id': msg.id,
-            'from_id': msg.from_id,
+            'from_id': self._get_from_id(msg),
             'reply_id': re_id,
             'author': name,
             'sent_by_bot': is_sent_by_bot,
@@ -45,6 +47,13 @@ class jsonl(object):
         msg_dump_str = json.dumps(
             msgDictionary, default=self._json_serial, ensure_ascii=False)
         return msg_dump_str
+
+    def _get_from_id(self, msg):
+        """Return a JSON-friendly sender id across Telethon versions."""
+        from_id = getattr(msg, 'sender_id', None)
+        if from_id is None:
+            from_id = getattr(msg, 'from_id', None)
+        return from_id
 
     def begin_final_file(self, resulting_file, exporter_context):
         """ Hook executes at the beginning of writing a resulting file.
@@ -58,4 +67,8 @@ class jsonl(object):
         """
         if isinstance(obj, (datetime, date)):
             return obj.isoformat()
+        if isinstance(obj, bytes):
+            return base64.b64encode(obj).decode('ascii')
+        if isinstance(obj, TLObject):
+            return obj.to_dict()
         raise TypeError("Type %s not serializable" % type(obj))
