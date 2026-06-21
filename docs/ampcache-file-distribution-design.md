@@ -57,10 +57,14 @@ These defaults define the current interoperable profile:
 | Manifest chunks per page | 1024 |
 | Publish workers | 4 |
 | Download/verify symbol workers | 32 |
+| Failed-symbol retry rounds | 6 |
 | AMP Cache domain | `cdn.ampproject.org` |
+| AMP Cache TLS server name | `www.google.com` |
+| AMP Cache request User-Agent | `Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.116 Mobile Safari/537.36` |
+| AMP Cache request Accept | `application/font-woff2;q=1.0,application/font-woff;q=0.9,*/*;q=0.8` |
 | File resource encoding | Font only |
 | Font resource extension | `.ttf` |
-| Manifest format version | 1 |
+| Manifest format version | 2 |
 
 The origin server also enforces a maximum encoded resource body size. The configured maximum must include encryption overhead and font wrapper overhead, not only the raw symbol size.
 
@@ -104,6 +108,19 @@ For example:
 ```text
 https://hacksaw--hammer-exe-xyz.cdn.ampproject.org/r/s/hacksaw-hammer.exe.xyz/files/<token>.ttf
 ```
+
+## AMP Cache Request Defaults
+
+Clients that fetch AMP Cache URLs use HTTP GET and should send:
+
+```text
+Accept: application/font-woff2;q=1.0,application/font-woff;q=0.9,*/*;q=0.8
+User-Agent: Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.116 Mobile Safari/537.36
+```
+
+The `Accept` header is applied only to requests whose host is the configured AMP Cache domain or a subdomain of it. Origin-server API requests are not given this cache-specific `Accept` header.
+
+Outbound HTTPS requests to AMP Cache may use TLS domain fronting. In the current profile the URL and HTTP `Host` remain the AMP Cache host, while the TLS server name is `www.google.com`. Setting the TLS server name to an empty value disables domain fronting.
 
 ## Origin Server Resource Rules
 
@@ -194,11 +211,14 @@ Active resource responses use:
 ```text
 Content-Type: font/ttf
 Content-Length: <encoded font byte length>
-Cache-Control: public, max-age=31536000, immutable
+Cache-Control: public, max-age=31536000
+ETag: "ampcache-<server-keyed-path-tag>"
 Access-Control-Allow-Origin: *
 ```
 
-The CORS header is required for font resources.
+The CORS header is required for font resources. The `immutable` cache-control extension is intentionally not sent.
+
+The origin server generates an ETag from the request path and query using a server-local keyed hash. If a later cacheable resource request includes `If-None-Match` with the expected ETag, the origin returns `304 Not Modified` with the normal cache headers. This ETag-based 304 path works even when the resource is no longer active and backfill is disabled, because the resource content is immutable once published.
 
 ### Backfill on Origin Miss
 
@@ -218,7 +238,17 @@ Backfilled responses should include the normal resource headers plus:
 X-Ampcache-Backfill: hit
 ```
 
-If AMP Cache returns 404 or 410, the origin should return 404. Other fetch or decode failures should be treated as upstream failure, not as a definitive missing object.
+Backfill is skipped when the incoming user agent contains `Google-AMPHTML`. This avoids a revalidation loop where AMP Cache asks the origin, and the origin asks AMP Cache for the same resource.
+
+If backfill is disabled, skipped, returns 404 or 410, or otherwise fails for a syntactically cacheable resource URL with a known extension, the origin returns:
+
+```text
+503 Service Unavailable
+Cache-Control: no-store
+Retry-After: 60
+```
+
+Returning 503 instead of 404 tells AMP Cache that the origin is temporarily unavailable rather than proving that the object is gone, which helps stale cache entries remain eligible to be served. Non-cacheable paths still return normal 404 responses.
 
 Backfill can extend or refresh AMP Cache lifetime, so it should be disabled for idle-expiry experiments.
 
@@ -599,9 +629,12 @@ Verification checks whether a manifest URL is already recoverable from AMP Cache
    - Decode each font wrapper.
    - Decrypt each symbol with its symbol AAD.
    - Feed successful symbols into the FEC decoder.
-   - Continue through the symbol set so the result can report how many symbols succeeded or failed.
+   - Continue through the full first symbol set so the result can report how many symbols succeeded or failed.
+   - Retry only retryable failed symbol URLs after all other URLs have been tried. Successful symbols are retained and are not downloaded again.
    - Verify chunk SHA-256.
 8. Verify the final file SHA-256 by concatenating recovered chunks in order.
+
+Verification succeeds when every chunk recovers and the final file hash matches. It may still return warnings when some symbols failed to download, because FEC recovery only needs enough valid symbols. The default verification profile allows 6 failed-symbol retry rounds. Verification does not allow unlimited symbol retries.
 
 ## Repair Flow
 
@@ -626,6 +659,7 @@ Downloading is the same as verification, with output writing:
 3. For each recovered chunk:
    - Download symbols concurrently.
    - Stop downloading more symbols for that chunk once the chunk is recoverable.
+   - Retry only retryable failed symbol URLs between rounds. Successfully downloaded symbols are kept in the chunk decoder and are not fetched again.
    - Verify chunk SHA-256.
    - Append plaintext bytes to a temporary output file.
    - Update the full-file hash.
@@ -633,7 +667,9 @@ Downloading is the same as verification, with output writing:
    - Verify the full-file SHA-256 from the root manifest.
    - Atomically move the temporary file to the requested output path.
 
-Downloads may be retried. A retry is useful because AMP Cache may return 404 before a resource is fully propagated, or 429 when rate-limited.
+Completed chunks are not retried. If a later chunk cannot recover, the download fails at that chunk without re-downloading earlier chunks in the same process. The default downloader allows 6 failed-symbol retry rounds; an implementation may expose an unlimited mode that keeps retrying failed symbol URLs until the chunk recovers, the caller cancels, or a timeout expires.
+
+Manifest loading and symbol loading treat transient cache and network failures as retryable. Retryable cases include HTTP 404, 408, 429, 500, 502, 503, 504, timeouts, connection resets, unexpected EOF, and temporary network failures. AEAD authentication failures, FEC decode errors, hash mismatches, malformed manifests, and malformed font wrappers are not treated as successful downloads; authentication failures are not useful to retry because they indicate the wrong bytes for the requested logical object.
 
 ## Compatibility Requirements
 
@@ -678,7 +714,7 @@ An independent implementation can download URLs created by this project if it fo
 - AMP Cache retention is best-effort and may depend on size, access pattern, validation behavior, and cache policy.
 - Frequent access can refresh or extend cache lifetime. Idle-expiry testing should use separate URLs for each idle period and avoid backfill.
 - Backfill helps AMP stale revalidation but can contaminate cache lifetime measurements.
-- Outbound HTTPS requests to AMP Cache may use domain fronting. The current default keeps the HTTP Host header as the AMP Cache host but sends `www.google.com` as the TLS server name. Setting the TLS server name to an empty value disables this behavior.
+- Outbound HTTPS requests to AMP Cache may use domain fronting and should use the AMP Cache request headers described above.
 - Rate limiting is expected. Download and verification clients should classify 429 separately from 404 and may retry.
 - The resource size limit must be configured high enough for the encoded font body. A 512 KiB plaintext symbol grows after encryption and font wrapping.
 - The post-upload verification step is important. A publish command should not assume that an origin fetch means all resources are immediately usable from AMP Cache.
